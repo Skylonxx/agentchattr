@@ -7,6 +7,26 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+def _valid_relay_entry(relay_entry) -> bool:
+    """Minimal validation for an internally-built relay queue entry.
+
+    relay_entry is internal-only (built by session_relay.make_relay_queue_entry
+    and passed by the session engine), but we validate defensively so a
+    malformed entry never queues an MCP-disabled turn without the proper
+    sealed-prompt + relay_meta contract. On failure the caller falls back to
+    normal @mention entry construction.
+    """
+    if not isinstance(relay_entry, dict):
+        return False
+    prompt = relay_entry.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return False
+    meta = relay_entry.get("relay_meta")
+    if not isinstance(meta, dict):
+        return False
+    return bool(meta.get("relay_mode")) and bool(meta.get("disable_mcp"))
+
+
 class AgentTrigger:
     def __init__(self, registry, data_dir: str = "./data"):
         self._registry = registry
@@ -36,17 +56,22 @@ class AgentTrigger:
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
         import time
-        entry = {
-            "sender": message.split(":")[0].strip() if ":" in message else "?",
-            "text": message,
-            "time": time.strftime("%H:%M:%S"),
-            "channel": channel,
-        }
-        custom_prompt = kwargs.get("prompt", "")
-        if isinstance(custom_prompt, str) and custom_prompt.strip():
-            entry["prompt"] = custom_prompt.strip()
-        if job_id is not None:
-            entry["job_id"] = job_id
+
+        relay_entry = kwargs.get("relay_entry")
+        if _valid_relay_entry(relay_entry):
+            entry = dict(relay_entry)
+        else:
+            entry = {
+                "sender": message.split(":")[0].strip() if ":" in message else "?",
+                "text": message,
+                "time": time.strftime("%H:%M:%S"),
+                "channel": channel,
+            }
+            custom_prompt = kwargs.get("prompt", "")
+            if isinstance(custom_prompt, str) and custom_prompt.strip():
+                entry["prompt"] = custom_prompt.strip()
+            if job_id is not None:
+                entry["job_id"] = job_id
 
         with open(queue_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
@@ -60,17 +85,22 @@ class AgentTrigger:
         self._data_dir.mkdir(parents=True, exist_ok=True)
 
         import time
-        entry = {
-            "sender": message.split(":")[0].strip() if ":" in message else "?",
-            "text": message,
-            "time": time.strftime("%H:%M:%S"),
-            "channel": channel,
-        }
-        custom_prompt = kwargs.get("prompt", "")
-        if isinstance(custom_prompt, str) and custom_prompt.strip():
-            entry["prompt"] = custom_prompt.strip()
-        if job_id is not None:
-            entry["job_id"] = job_id
+
+        relay_entry = kwargs.get("relay_entry")
+        if _valid_relay_entry(relay_entry):
+            entry = dict(relay_entry)
+        else:
+            entry = {
+                "sender": message.split(":")[0].strip() if ":" in message else "?",
+                "text": message,
+                "time": time.strftime("%H:%M:%S"),
+                "channel": channel,
+            }
+            custom_prompt = kwargs.get("prompt", "")
+            if isinstance(custom_prompt, str) and custom_prompt.strip():
+                entry["prompt"] = custom_prompt.strip()
+            if job_id is not None:
+                entry["job_id"] = job_id
 
         with open(queue_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")

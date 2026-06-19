@@ -4,6 +4,14 @@ import logging
 import threading
 import time
 
+from session_relay import (
+    build_relay_prompt,
+    build_safety_gate_prompt,
+    is_relay_eligible,
+    make_relay_queue_entry,
+    parse_safety_verdict,
+)
+
 log = logging.getLogger(__name__)
 
 # Dissent mandate injected for review/critique roles
@@ -11,6 +19,9 @@ _DISSENT_LINE = "Provide your own independent analysis. Do not repeat or defer t
 
 # Roles that get the dissent mandate
 _DISSENT_ROLES = {"reviewer", "red_team", "critic", "challenger", "against"}
+
+# Roles treated as safety gates (CodexSafe)
+_SAFETY_GATE_ROLES = {"safety_gate", "safety", "gate", "review_gate"}
 
 
 class SessionEngine:
@@ -159,11 +170,9 @@ class SessionEngine:
             return
 
         if sender == expected_agent:
-            # Auto-resume if paused
             if session["state"] == "paused":
                 self._store.resume(session["id"])
-            # Defer advance slightly so the triggering message broadcasts
-            # before phase/completion banners are added
+            session["_last_msg"] = msg
             threading.Timer(0.3, self._advance, args=(session, msg["id"])).start()
             return
 
@@ -171,6 +180,76 @@ class SessionEngine:
         return
 
     # --- Engine core ---
+
+    def _check_safety_block(self, session: dict, msg: dict) -> bool:
+        """Check if a safety gate agent returned a BLOCK verdict.
+
+        Returns True if the session should be halted (BLOCK or malformed).
+        Returns False if the verdict is PASS and the session should continue.
+
+        Product contract: the safety gate is enforced when EITHER the current
+        role is a safety-gate role, OR the responding agent is the dedicated
+        CodexSafe base. CodexSafe's sole purpose is safety gating, so any BLOCK
+        it emits halts the session regardless of the role it was cast into.
+        This is the conservative choice — it can only ever add halts, never
+        suppress them.
+        """
+        expected_agent = self._get_expected_agent(session)
+        if not expected_agent:
+            return False
+
+        agent_base = self._get_agent_base(expected_agent)
+        if not is_relay_eligible(agent_base):
+            return False
+
+        tmpl = self._store.get_template(session["template_id"])
+        if not tmpl:
+            return False
+
+        phases = tmpl.get("phases", [])
+        phase_idx = session["current_phase"]
+        turn_idx = session["current_turn"]
+        if phase_idx >= len(phases):
+            return False
+
+        phase = phases[phase_idx]
+        participants = phase.get("participants", [])
+        if turn_idx >= len(participants):
+            return False
+
+        role = participants[turn_idx]
+        is_safety_role = role.lower() in _SAFETY_GATE_ROLES
+        is_safety_agent = agent_base.lower() == "codexsafe"
+        if not (is_safety_role or is_safety_agent):
+            return False
+
+        output = msg.get("text", "")
+        verdict = parse_safety_verdict(output)
+
+        if verdict.passed:
+            log.info("Session %d: safety gate PASS from %s", session["id"], expected_agent)
+            return False
+
+        log.warning("Session %d: safety gate BLOCK from %s: %s",
+                    session["id"], expected_agent, verdict.reason)
+
+        channel = session.get("channel", "general")
+        self._messages.add(
+            sender="system",
+            text=f"Safety gate BLOCK: {verdict.reason}",
+            msg_type="session_safety_block",
+            channel=channel,
+            metadata={
+                "session_id": session["id"],
+                "blocked_by": expected_agent,
+                "reason": verdict.reason,
+                "raw_output": verdict.raw_output[:500],
+            },
+        )
+
+        self._store.interrupt(session["id"],
+                              f"safety gate BLOCK: {verdict.reason}")
+        return True
 
     def _advance(self, session: dict, message_id: int):
         """Advance session after the expected agent has responded."""
@@ -190,17 +269,19 @@ class SessionEngine:
         phase = phases[phase_idx]
         participants = phase.get("participants", [])
 
+        # Check for safety gate BLOCK before advancing
+        if session.get("_last_msg"):
+            if self._check_safety_block(session, session["_last_msg"]):
+                return
+
         next_turn = turn_idx + 1
         if next_turn < len(participants):
-            # More turns in this phase
             session = self._store.advance_turn(session["id"], message_id)
             if session:
                 self._trigger_current(session)
         else:
-            # Phase complete
             next_phase = phase_idx + 1
             if next_phase < len(phases):
-                # More phases
                 session = self._store.advance_phase(session["id"], message_id)
                 if session:
                     next_phase_obj = phases[next_phase]
@@ -214,11 +295,18 @@ class SessionEngine:
                     )
                     self._trigger_current(session)
             else:
-                # Session complete - check if this was the output phase
                 is_output = phase.get("is_output", False)
                 self._store.complete(session["id"],
                                      message_id if is_output else None)
                 log.info("Session %d complete", session["id"])
+
+    def _get_agent_base(self, agent_name: str) -> str:
+        """Get the base family name for a registered agent."""
+        if self._registry:
+            inst = self._registry.get_instance(agent_name)
+            if inst:
+                return inst.get("base", agent_name)
+        return agent_name
 
     def _trigger_current(self, session: dict):
         """Trigger the agent whose turn it is."""
@@ -249,26 +337,90 @@ class SessionEngine:
             return
 
         if not self._is_agent(agent):
-            # Human's turn - just mark as waiting, don't trigger
             self._store.set_waiting(session["id"], agent)
             return
 
-        # Mark waiting
         self._store.set_waiting(session["id"], agent)
 
-        # Assemble the prompt
-        prompt = self._assemble_prompt(session, tmpl, phase, role)
-
-        # Trigger the agent
+        agent_base = self._get_agent_base(agent)
         channel = session.get("channel", "general")
-        log.info("Session %d: triggering %s (%s) for phase '%s'",
+
+        if is_relay_eligible(agent_base):
+            self._trigger_relay(session, tmpl, phase, phase_idx, turn_idx,
+                                role, agent, agent_base, channel)
+        else:
+            prompt = self._assemble_prompt(session, tmpl, phase, role)
+            log.info("Session %d: triggering %s (%s) for phase '%s'",
+                     session["id"], agent, role, phase["name"])
+            try:
+                self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            except Exception as exc:
+                log.error("Session %d: failed to trigger %s: %s",
+                          session["id"], agent, exc)
+
+    def _trigger_relay(self, session, tmpl, phase, phase_idx, turn_idx,
+                       role, agent, agent_base, channel):
+        """Trigger a relay-mode agent (Codex/CodexSafe) as text-in/text-out."""
+        is_safety = role.lower() in _SAFETY_GATE_ROLES
+
+        if is_safety:
+            content = self._get_last_turn_content(session, channel)
+            prompt = build_safety_gate_prompt(
+                session_name=tmpl.get("name", "?"),
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                content_to_review=content,
+                agent_base=agent_base,
+            )
+        else:
+            context_messages = self._get_recent_context(channel)
+            prompt = build_relay_prompt(
+                session_name=tmpl.get("name", "?"),
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                phase_index=phase_idx,
+                total_phases=len(tmpl.get("phases", [])),
+                role=role,
+                instruction=phase.get("prompt", ""),
+                context_messages=context_messages,
+                agent_base=agent_base,
+            )
+
+        relay_entry = make_relay_queue_entry(
+            prompt=prompt,
+            session_id=session["id"],
+            phase=phase_idx,
+            turn=turn_idx,
+            role=role,
+            channel=channel,
+        )
+
+        log.info("Session %d: relay-triggering %s (%s) for phase '%s' [relay_mode]",
                  session["id"], agent, role, phase["name"])
 
         try:
-            self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
         except Exception as exc:
-            log.error("Session %d: failed to trigger %s: %s",
+            log.error("Session %d: failed to relay-trigger %s: %s",
                       session["id"], agent, exc)
+
+    def _get_last_turn_content(self, session: dict, channel: str) -> str:
+        """Get the content from the last turn for safety gate review."""
+        try:
+            recent = self._messages.get_recent(channel=channel, limit=5)
+            for msg in reversed(recent):
+                if msg.get("sender") != "system" and msg.get("type", "chat") == "chat":
+                    return msg.get("text", "")
+        except Exception:
+            pass
+        return "(no content available for review)"
+
+    def _get_recent_context(self, channel: str) -> list[dict]:
+        """Get recent messages for relay prompt context."""
+        try:
+            return self._messages.get_recent(channel=channel, limit=10)
+        except Exception:
+            return []
 
     def _assemble_prompt(self, session: dict, tmpl: dict, phase: dict,
                          role: str) -> str:

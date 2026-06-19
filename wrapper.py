@@ -407,6 +407,14 @@ _IDENTITY_HINT = (
     "pill at the top.)"
 )
 
+# Exec-mode runs are stateless and the server/proxy has already fixed this
+# instance's identity, so claiming/joining is wrong and wasteful. Override the
+# MCP server's generic chat_claim guidance with an explicit directive.
+_EXEC_NO_CLAIM = (
+    " (Your chat identity is already set by the server — do NOT call chat_claim "
+    "or chat_join. Just read the channel and respond.)"
+)
+
 
 def _fetch_role(server_port: int, agent_name: str) -> str:
     """Fetch this agent's role from the server status endpoint."""
@@ -453,7 +461,7 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
 
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10):
+                   refresh_interval: int = 10, suppress_identity_hint: bool = False):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
@@ -504,12 +512,56 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         except json.JSONDecodeError:
                             pass
 
+                    # Check for relay-mode session turn (text-in/text-out, no MCP).
+                    # The structured relay_meta is authoritative — it carries the
+                    # full sealed-prompt + MCP-disable contract from the server.
+                    relay_meta, relay_prompt = _extract_relay_turn(lines)
+
+                    # Relay session turns are SEALED: the server (session_relay.py)
+                    # already built the complete prompt. Do NOT append role text,
+                    # active rules, _EXEC_NO_CLAIM, or the identity hint, and do NOT
+                    # flatten newlines (exec passes the prompt as an argv argument,
+                    # so multi-line is safe). Forward the prompt unmutated plus the
+                    # structured relay_meta so the exec runner can disable MCP.
+                    if relay_meta is not None and relay_prompt:
+                        inject_fn(relay_prompt, relay_meta=relay_meta)
+                        time.sleep(1)
+                        continue
+
                     if custom_prompt:
                         prompt = custom_prompt
+                    elif suppress_identity_hint:
+                        # Exec mode: embed the mention payload directly so the
+                        # agent does not need MCP chat_read for basic routing.
+                        original_texts = []
+                        for _line in lines:
+                            _line = _line.strip()
+                            if not _line:
+                                continue
+                            try:
+                                _data = json.loads(_line)
+                                if isinstance(_data, dict) and _data.get("text"):
+                                    original_texts.append(_data["text"])
+                            except json.JSONDecodeError:
+                                pass
+                        mention_payload = "\n".join(original_texts) if original_texts else "(no message text)"
+                        prompt = (
+                            f"You received a mention in agentchattr #{channel}.\n\n"
+                            f"Message:\n---\n{mention_payload}\n---\n\n"
+                            "Respond to this message. Output ONLY your reply text -- nothing else. "
+                            "Do not use MCP tools. Do not edit files. Do not run shell commands."
+                        )
                     elif job_id:
                         prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
                     else:
-                        prompt = f"use mcp to read #{channel} - you're mentioned, take appropriate action and respond"
+                        prompt = (
+                            f"You received an @mention in agentchattr #{channel}. "
+                            "Use only the agentchattr MCP tools already available in this session. "
+                            "Do not run shell commands. Do not run `mcp --help`. Do not use Bash/terminal commands. "
+                            f"Call `chat_read` to read the latest messages in #{channel}, then call `chat_send` to reply in #{channel}. "
+                            "Do not use Slack MCP. Do not request Target:*. Do not persist permissions. "
+                            "Do not spawn tasks or subagents."
+                        )
 
                     # Use current identity (may have changed via rename)
                     current_name, _ = get_identity_fn()
@@ -539,7 +591,9 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                             last_rules_epoch = rules_data["epoch"]
                             _report_rule_sync(server_port, current_name, rules_data["epoch"], _token)
 
-                    if first_mention and is_multi_instance:
+                    if suppress_identity_hint:
+                        prompt += _EXEC_NO_CLAIM
+                    elif first_mention and is_multi_instance:
                         prompt += _IDENTITY_HINT
                         first_mention = False
                     # Flatten to single line — multi-line text triggers paste
@@ -550,6 +604,452 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
             pass
 
         time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# Headless exec mode (e.g. codex)
+# ---------------------------------------------------------------------------
+
+def _build_codex_exec_args(agent_cfg: dict, data_dir: Path, instance_name: str) -> list[str]:
+    """CLI flags for ``codex exec`` headless runs.
+
+    Override entirely via agent_cfg['exec_args'] (a list). Defaults use
+    read-only sandbox so the agent can call MCP tools but cannot write
+    files. --skip-git-repo-check allows non-repo cwds.
+    """
+    custom = agent_cfg.get("exec_args")
+    if custom:
+        forbidden = (
+            "dangerously",
+            "bypass",
+            "yolo",
+            "skip-permissions",
+            "auto-approve",
+            "danger-full-access",
+            "workspace-write",
+        )
+        custom_args = list(custom)
+        lowered = " ".join(str(arg).lower() for arg in custom_args)
+        if any(flag in lowered for flag in forbidden):
+            raise SystemExit(
+                "Refusing unsafe Codex exec_args: dangerous/bypass/yolo/"
+                "skip-permissions/full-access style flag detected"
+            )
+        return custom_args
+    args = ["--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral"]
+    args += ["-o", str(data_dir / f"{instance_name}_exec_last.txt")]
+    return args
+
+
+def _relay_to_chat(server_port: int, token: str, text: str, channel: str = "general"):
+    """Send a message to agentchattr as the registered agent instance."""
+    import urllib.request
+    body = json.dumps({"text": text, "channel": channel}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{server_port}/api/send",
+        method="POST",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    urllib.request.urlopen(req, timeout=10)
+
+
+def _is_relay_prompt(prompt: str) -> bool:
+    """Detect if a prompt originated from a relay session turn.
+
+    SECONDARY / defensive only. Relay prompts contain the output contract
+    marker injected by session_relay.build_relay_prompt /
+    build_safety_gate_prompt. This substring check is a fallback used ONLY when
+    no structured relay_meta is available — see _should_disable_mcp().
+    """
+    return "Do not use MCP tools. Do not call chat_read or chat_send." in prompt
+
+
+def _should_disable_mcp(prompt: str, relay_meta: dict | None) -> bool:
+    """Decide whether an exec turn must run with MCP stripped (text-in/out).
+
+    PRIMARY, authoritative signal: structured ``relay_meta.disable_mcp``. When
+    relay_meta is present it is fully authoritative and the prompt text is not
+    consulted at all.
+
+    SECONDARY defensive fallback: the sealed-prompt marker via
+    _is_relay_prompt(), used ONLY when no structured relay_meta is present. The
+    fallback can only ADD the MCP-strip restriction (never remove it), so it
+    always fails safe.
+    """
+    if relay_meta is not None:
+        return bool(relay_meta.get("disable_mcp"))
+    return _is_relay_prompt(prompt)
+
+
+def _extract_relay_turn(lines: list[str]) -> tuple[dict | None, str]:
+    """Parse queue lines and return (relay_meta, sealed_prompt) for a relay turn.
+
+    Returns (None, "") when the batch is not a relay session turn. The sealed
+    prompt is returned exactly as the server built it — callers MUST NOT mutate
+    it (no role text, rules, identity hints, or newline flattening).
+    """
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        meta = data.get("relay_meta")
+        if (isinstance(meta, dict)
+                and meta.get("relay_mode")
+                and meta.get("disable_mcp")):
+            rp = data.get("prompt", "")
+            # Presence check only — `.strip()` here decides whether a prompt is
+            # present, but the returned value MUST be the exact prompt bytes the
+            # server queued. Sealed prompts preserve all leading/trailing
+            # whitespace and edge newlines; do NOT normalize prompt edges.
+            if isinstance(rp, str) and rp.strip():
+                return meta, rp
+    return None, ""
+
+
+def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
+                   exec_args=None, trigger_flag=None, running_flag=None,
+                   data_dir=None, no_restart=False,
+                   server_port=8300, get_token_fn=None):
+    """Headless run loop: on each @mention, invoke ``codex exec <prompt>``
+    instead of driving an interactive TUI.
+
+    Codex 0.140's TUI does not accept injected keystrokes reliably on Windows
+    (text enters but Enter never submits; focus-tracking escapes leak as literal
+    text). Running the prompt through ``codex exec`` sidesteps the whole console
+    keystroke path. The wrapper captures the output and relays it back to
+    agentchattr via the REST /api/send endpoint.
+    """
+    import queue as _queue
+    import subprocess
+
+    exec_args = list(exec_args or [])
+    # Each work item is a dict: {"prompt": str, "relay_meta": dict | None}.
+    work: "_queue.Queue[dict]" = _queue.Queue()
+
+    # Locate the -o output file path from exec_args
+    _output_file: Path | None = None
+    for _i, _arg in enumerate(exec_args):
+        if _arg == "-o" and _i + 1 < len(exec_args):
+            _output_file = Path(exec_args[_i + 1])
+            break
+
+    def _enqueue(text, relay_meta=None):
+        if running_flag is not None:
+            running_flag[0] = True
+        work.put({"prompt": text, "relay_meta": relay_meta})
+
+    start_watcher(_enqueue)
+
+    log_path = (data_dir / f"{agent}_exec.log") if data_dir else None
+    print(f"  === {agent.capitalize()} Exec Wrapper (headless, direct-relay) ===")
+    print(f"  @mentions run: {command} exec [opts] <prompt>")
+    if log_path:
+        print(f"  Exec log: {log_path}")
+    print("  Waiting for mentions...\n")
+
+    while True:
+        try:
+            item = work.get()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if running_flag is not None:
+            running_flag[0] = True
+
+        # Backward-compat: tolerate a bare string item (older callers).
+        if isinstance(item, dict):
+            prompt = item.get("prompt", "")
+            relay_meta = item.get("relay_meta")
+        else:
+            prompt = item
+            relay_meta = None
+
+        # Relay mode is METADATA-DRIVEN: structured relay_meta.disable_mcp is the
+        # authoritative signal to strip MCP args/env (see _should_disable_mcp).
+        relay = _should_disable_mcp(prompt, relay_meta)
+        if relay:
+            cmd = [command, "exec", *exec_args, prompt]
+            run_env = {k: v for k, v in env.items()
+                       if not k.startswith("MCP_") and k not in (
+                           "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
+                           "KILO_CONFIG_CONTENT",
+                       )}
+        else:
+            cmd = [command, "exec", *mcp_args, *exec_args, prompt]
+            run_env = env
+        print(f"  > {agent} exec triggered ({len(prompt)} chars){' [relay]' if relay else ''}")
+
+        proc = None
+        try:
+            proc = subprocess.run(
+                cmd, cwd=cwd, env=run_env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  > {agent} exec timed out (120s)")
+            if get_token_fn:
+                try:
+                    _relay_to_chat(server_port, get_token_fn(),
+                                   f"[codex exec timed out after 120s]")
+                except Exception:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            print(f"  > {agent} exec error: {exc}")
+
+        if proc is not None:
+            print(f"  > {agent} exec finished (exit {proc.returncode})")
+
+            # Log stdout/stderr for diagnostics
+            if log_path:
+                try:
+                    with open(log_path, "ab") as lf:
+                        header = f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} exec ===\n{prompt}\n"
+                        lf.write(header.encode("utf-8", "replace"))
+                        if proc.stdout:
+                            lf.write(proc.stdout)
+                        if proc.stderr:
+                            lf.write(b"\n--- stderr ---\n")
+                            lf.write(proc.stderr)
+                        lf.write(b"\n")
+                except Exception:
+                    pass
+
+            # Read -o output file (primary), fall back to stdout
+            reply = ""
+            if _output_file and _output_file.exists():
+                try:
+                    reply = _output_file.read_text("utf-8").strip()
+                except Exception:
+                    pass
+            if not reply and proc.stdout:
+                reply = proc.stdout.decode("utf-8", errors="replace").strip()
+
+            # Safety filters + relay
+            if reply and get_token_fn:
+                if reply.startswith("Traceback"):
+                    reply = f"[codex error: {reply[:100]}]"
+                full_len = len(reply)
+                if full_len > 2000:
+                    reply = reply[:2000] + f"... [truncated, {full_len} chars total]"
+                try:
+                    _relay_to_chat(server_port, get_token_fn(), reply)
+                    print(f"  > {agent} reply relayed ({len(reply)} chars)")
+                except Exception as exc:
+                    print(f"  > {agent} relay failed: {exc}")
+            elif not reply and proc.returncode != 0 and get_token_fn:
+                try:
+                    _relay_to_chat(server_port, get_token_fn(),
+                                   f"[codex exec failed (exit {proc.returncode})]")
+                except Exception:
+                    pass
+
+        # Stay "active" if more mentions are already queued.
+        if running_flag is not None and work.empty():
+            running_flag[0] = False
+        if no_restart:
+            break
+
+
+# ---------------------------------------------------------------------------
+# AGY store-relay exec mode
+# ---------------------------------------------------------------------------
+
+def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) -> str:
+    """Read the assistant reply from AGY's brain transcript after a --print run.
+
+    AGY 1.0.10 --print mode stores the model response in a JSONL transcript
+    rather than printing it to stdout.  The path is deterministic:
+      <agy_data_dir>/brain/<conv_id>/.system_generated/logs/transcript.jsonl
+
+    We look for the last step with source=MODEL and return its ``content``
+    field (the clean reply text, separate from chain-of-thought ``thinking``).
+    """
+    if agy_data_dir is None:
+        agy_data_dir = str(
+            Path.home() / ".gemini" / "antigravity-cli"
+        )
+    transcript = (
+        Path(agy_data_dir) / "brain" / conversation_id
+        / ".system_generated" / "logs" / "transcript.jsonl"
+    )
+    if not transcript.exists():
+        return ""
+    reply = ""
+    with open(transcript, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("source") == "MODEL" and "content" in entry:
+                reply = entry["content"]
+    return reply.strip()
+
+
+def _extract_conversation_id_from_log(log_dir: str | None = None) -> str:
+    """Parse the newest AGY CLI log to find the conversation UUID.
+
+    The log line pattern is:
+      printmode.go:...] Print mode: conversation=<UUID>, sending message
+    """
+    import re
+    if log_dir is None:
+        log_dir = str(
+            Path.home() / ".gemini" / "antigravity-cli" / "log"
+        )
+    log_path = Path(log_dir)
+    if not log_path.is_dir():
+        return ""
+    logs = sorted(log_path.glob("cli-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not logs:
+        return ""
+    pat = re.compile(r"Print mode: conversation=([0-9a-f-]{36}),")
+    with open(logs[0], "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = pat.search(line)
+            if m:
+                return m.group(1)
+    return ""
+
+
+def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
+                         trigger_flag=None, running_flag=None,
+                         data_dir=None, no_restart=False,
+                         server_port=8300, get_token_fn=None,
+                         print_timeout=120):
+    """AGY store-relay exec loop: run ``agy --print <prompt>``, then extract
+    the reply from AGY's local transcript JSONL and relay it to agentchattr.
+
+    AGY 1.0.10 --print mode exits 0 with zero stdout.  The model response
+    goes into brain/<conv>/...transcript.jsonl instead.  This function reads
+    it back deterministically using the conversation ID from the CLI log.
+    """
+    import queue as _queue
+    import subprocess
+
+    work: "_queue.Queue[str]" = _queue.Queue()
+
+    def _enqueue(text):
+        if running_flag is not None:
+            running_flag[0] = True
+        work.put(text)
+
+    start_watcher(_enqueue)
+
+    log_path = (data_dir / f"{agent}_store_exec.log") if data_dir else None
+    print(f"  === {agent.capitalize()} Store-Relay Exec Wrapper (headless, transcript extraction) ===")
+    print(f"  @mentions run: {command} --print <prompt>")
+    if log_path:
+        print(f"  Exec log: {log_path}")
+    print("  Waiting for mentions...\n")
+
+    while True:
+        try:
+            prompt = work.get()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if running_flag is not None:
+            running_flag[0] = True
+
+        cmd = [command, "--print", prompt, "--print-timeout", f"{print_timeout}s"]
+        print(f"  > {agent} store-exec triggered ({len(prompt)} chars)")
+
+        proc = None
+        try:
+            proc = subprocess.run(
+                cmd, cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=print_timeout + 30,
+            )
+        except subprocess.TimeoutExpired:
+            print(f"  > {agent} store-exec timed out ({print_timeout + 30}s)")
+            if get_token_fn:
+                try:
+                    _relay_to_chat(server_port, get_token_fn(),
+                                   f"[agy --print timed out after {print_timeout}s]")
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"  > {agent} store-exec error: {exc}")
+
+        if proc is not None:
+            print(f"  > {agent} store-exec finished (exit {proc.returncode})")
+
+            # Log for diagnostics
+            if log_path:
+                try:
+                    with open(log_path, "ab") as lf:
+                        header = f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} store-exec ===\n{prompt}\n"
+                        lf.write(header.encode("utf-8", "replace"))
+                        if proc.stdout:
+                            lf.write(b"stdout: ")
+                            lf.write(proc.stdout)
+                        if proc.stderr:
+                            lf.write(b"\nstderr: ")
+                            lf.write(proc.stderr)
+                        lf.write(b"\n")
+                except Exception:
+                    pass
+
+            # Try stdout first (in case a future AGY version fixes --print)
+            reply = ""
+            if proc.stdout:
+                reply = proc.stdout.decode("utf-8", errors="replace").strip()
+
+            # Fall back to transcript extraction
+            if not reply:
+                conv_id = _extract_conversation_id_from_log()
+                if conv_id:
+                    reply = _extract_agy_reply(conv_id)
+                    if reply:
+                        print(f"  > {agent} reply extracted from transcript (conv {conv_id[:8]}...)")
+                    else:
+                        print(f"  > {agent} transcript found but no MODEL reply (conv {conv_id[:8]}...)")
+                else:
+                    print(f"  > {agent} could not find conversation ID in log")
+
+            # Safety filters + relay
+            if reply and get_token_fn:
+                if reply.startswith("Traceback"):
+                    reply = f"[agy error: {reply[:100]}]"
+                full_len = len(reply)
+                if full_len > 2000:
+                    reply = reply[:2000] + f"... [truncated, {full_len} chars total]"
+                try:
+                    _relay_to_chat(server_port, get_token_fn(), reply)
+                    print(f"  > {agent} reply relayed ({len(reply)} chars)")
+                except Exception as exc:
+                    print(f"  > {agent} relay failed: {exc}")
+            elif not reply and proc.returncode == 0 and get_token_fn:
+                try:
+                    _relay_to_chat(server_port, get_token_fn(),
+                                   "[agy produced no reply]")
+                except Exception:
+                    pass
+            elif not reply and proc.returncode != 0 and get_token_fn:
+                try:
+                    _relay_to_chat(server_port, get_token_fn(),
+                                   f"[agy --print failed (exit {proc.returncode})]")
+                except Exception:
+                    pass
+
+        if running_flag is not None and work.empty():
+            running_flag[0] = False
+        if no_restart:
+            break
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +1279,10 @@ def main():
     _watcher_inject_fn = None
     _watcher_thread = None
     _is_multi_instance = registration.get("slot", 1) > 1
+    # Exec mode runs are stateless fresh contexts with proxy-assigned identity,
+    # so the "reclaim your previous identity" hint is never applicable and only
+    # provokes an unnecessary chat_claim. Suppress it.
+    _suppress_identity_hint = agent_cfg.get("run_mode", "tui") in ("exec", "store_exec")
     _trigger_flag = [False]  # shared: queue watcher sets True, activity checker reads
     _refresh_interval = 10  # default; overridden per-trigger by server settings
 
@@ -790,7 +1294,8 @@ def main():
             args=(get_identity, inject_fn),
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                     "server_port": server_port, "agent_name": assigned_name,
-                    "get_token_fn": get_token, "refresh_interval": _refresh_interval},
+                    "get_token_fn": get_token, "refresh_interval": _refresh_interval,
+                    "suppress_identity_hint": _suppress_identity_hint},
             daemon=True,
         )
         _watcher_thread.start()
@@ -805,7 +1310,8 @@ def main():
                     args=(get_identity, _watcher_inject_fn),
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                             "server_port": server_port, "agent_name": assigned_name,
-                            "get_token_fn": get_token, "refresh_interval": _refresh_interval},
+                            "get_token_fn": get_token, "refresh_interval": _refresh_interval,
+                            "suppress_identity_hint": _suppress_identity_hint},
                     daemon=True,
                 )
                 _watcher_thread.start()
@@ -860,39 +1366,81 @@ def main():
     threading.Thread(target=_activity_monitor, daemon=True).start()
 
     _agent_pid = [None]
+    run_mode = agent_cfg.get("run_mode", "tui")
+    unix_session_name = f"agentchattr-{assigned_name}"
+    _exec_running = [False]
 
-    if sys.platform == "win32":
-        from wrapper_windows import get_activity_checker, run_agent
+    if run_mode in ("exec", "store_exec"):
+        # Headless exec mode: activity = a run in flight.
+        _set_activity_checker(lambda: _exec_running[0])
+    elif sys.platform == "win32":
+        from wrapper_windows import get_activity_checker
 
         _set_activity_checker(get_activity_checker(_agent_pid, agent_name=assigned_name, trigger_flag=_trigger_flag))
     else:
-        from wrapper_unix import get_activity_checker, run_agent
+        from wrapper_unix import get_activity_checker
 
-        unix_session_name = f"agentchattr-{assigned_name}"
         _set_activity_checker(get_activity_checker(unix_session_name, trigger_flag=_trigger_flag))
 
-    run_kwargs = dict(
-        command=command,
-        extra_args=launch_args,
-        cwd=cwd,
-        env=env,
-        queue_file=queue_file,
-        agent=agent,
-        no_restart=args.no_restart,
-        start_watcher=start_watcher,
-        strip_env=list(strip_vars),
-        pid_holder=_agent_pid,
-        inject_env=inject_env,
-        inject_delay=agent_cfg.get("inject_delay", 0.3),
-    )
-    # Windows-only injection tuning (no-op on other platforms).
-    if sys.platform == "win32":
-        run_kwargs["enter_backend"] = agent_cfg.get("enter_backend", "console_input")
-    if sys.platform != "win32":
-        run_kwargs["session_name"] = unix_session_name
-
     try:
-        run_agent(**run_kwargs)
+        if run_mode == "exec":
+            run_agent_exec(
+                command=command,
+                mcp_args=launch_args,
+                cwd=cwd,
+                env={**env, **(inject_env or {})},
+                agent=agent,
+                start_watcher=start_watcher,
+                exec_args=_build_codex_exec_args(agent_cfg, data_dir, assigned_name),
+                trigger_flag=_trigger_flag,
+                running_flag=_exec_running,
+                data_dir=data_dir,
+                no_restart=args.no_restart,
+                server_port=server_port,
+                get_token_fn=get_token,
+            )
+        elif run_mode == "store_exec":
+            run_agent_store_exec(
+                command=command,
+                cwd=cwd,
+                env={**env, **(inject_env or {})},
+                agent=agent,
+                start_watcher=start_watcher,
+                trigger_flag=_trigger_flag,
+                running_flag=_exec_running,
+                data_dir=data_dir,
+                no_restart=args.no_restart,
+                server_port=server_port,
+                get_token_fn=get_token,
+                print_timeout=agent_cfg.get("print_timeout", 120),
+            )
+        else:
+            if sys.platform == "win32":
+                from wrapper_windows import run_agent
+            else:
+                from wrapper_unix import run_agent
+
+            run_kwargs = dict(
+                command=command,
+                extra_args=launch_args,
+                cwd=cwd,
+                env=env,
+                queue_file=queue_file,
+                agent=agent,
+                no_restart=args.no_restart,
+                start_watcher=start_watcher,
+                strip_env=list(strip_vars),
+                pid_holder=_agent_pid,
+                inject_env=inject_env,
+                inject_delay=agent_cfg.get("inject_delay", 0.3),
+            )
+            # Windows-only injection tuning (no-op on other platforms).
+            if sys.platform == "win32":
+                run_kwargs["enter_backend"] = agent_cfg.get("enter_backend", "console_input")
+                run_kwargs["skip_vt_input"] = agent_cfg.get("skip_vt_input", False)
+            else:
+                run_kwargs["session_name"] = unix_session_name
+            run_agent(**run_kwargs)
     finally:
         try:
             current_name, _ = get_identity()
