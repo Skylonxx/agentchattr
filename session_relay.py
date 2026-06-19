@@ -117,6 +117,10 @@ class RelayTurnMeta:
     phase: int = 0
     turn: int = 0
     role: str = ""
+    # The session's channel. Carried in the metadata so the wrapper can relay the
+    # agent's reply back to the SAME channel the session runs in (not a hardcoded
+    # default). Without this the reply path defaults to "general".
+    channel: str = "general"
     relay_mode: bool = True
     disable_mcp: bool = True
 
@@ -127,6 +131,7 @@ class RelayTurnMeta:
             "phase": self.phase,
             "turn": self.turn,
             "role": self.role,
+            "channel": self.channel,
             "relay_mode": self.relay_mode,
             "disable_mcp": self.disable_mcp,
         }
@@ -153,6 +158,7 @@ def make_relay_queue_entry(
         phase=phase,
         turn=turn,
         role=role,
+        channel=channel,
     )
 
     entry = {

@@ -17,6 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from session_relay import (
+    RelayTurnMeta,
     SafetyVerdict,
     build_relay_prompt,
     build_safety_gate_prompt,
@@ -465,6 +466,112 @@ class TestWrapperSealedPrompt(unittest.TestCase):
         self.assertTrue(captured["text"].startswith("\n   "))
         self.assertTrue(captured["text"].endswith("\t\n  "))
         self.assertNotIn("token_fetched", captured)
+
+
+# ---------------------------------------------------------------------------
+# 3b. Relay reply channel routing (CHANNEL-ROUTING-FIX-1)
+# ---------------------------------------------------------------------------
+
+class TestRelayReplyChannelRouting(unittest.TestCase):
+    """The relay reply must go back to the SESSION's channel, not a hardcoded
+    'general'. The channel is propagated: queue entry -> RelayTurnMeta ->
+    _extract_relay_turn -> run_agent_exec -> _relay_to_chat(channel=...)."""
+
+    def test_relay_meta_carries_channel(self):
+        meta = RelayTurnMeta(channel="relay-dryrun")
+        self.assertEqual(meta.to_dict()["channel"], "relay-dryrun")
+
+    def test_make_relay_queue_entry_preserves_channel(self):
+        entry = make_relay_queue_entry(
+            prompt="p", session_id=1, phase=0, turn=0, role="safety_gate",
+            channel="relay-dryrun",
+        )
+        # Both the top-level field and the structured metadata carry the channel.
+        self.assertEqual(entry["channel"], "relay-dryrun")
+        self.assertEqual(entry["relay_meta"]["channel"], "relay-dryrun")
+
+    def test_make_relay_queue_entry_channel_defaults_general(self):
+        entry = make_relay_queue_entry(
+            prompt="p", session_id=1, phase=0, turn=0, role="r",
+        )
+        self.assertEqual(entry["relay_meta"]["channel"], "general")
+
+    def test_extract_relay_turn_meta_carries_channel(self):
+        from wrapper import _extract_relay_turn
+        entry = make_relay_queue_entry(
+            prompt="sealed", session_id=2, phase=0, turn=0, role="safety_gate",
+            channel="relay-dryrun",
+        )
+        meta, prompt = _extract_relay_turn([json.dumps(entry)])
+        self.assertIsNotNone(meta)
+        self.assertEqual(meta["channel"], "relay-dryrun")
+
+    def test_wrapper_relays_reply_to_session_channel(self):
+        """End-to-end: a relay turn on #relay-dryrun forwards the agent reply to
+        #relay-dryrun via _relay_to_chat, NOT to 'general'."""
+        import wrapper
+
+        captured = {}
+
+        def fake_relay(server_port, token, text, channel="general"):
+            captured["channel"] = channel
+            captured["text"] = text
+
+        def fake_run(cmd, **kwargs):
+            class _P:
+                returncode = 0
+                stdout = b"PASS"
+                stderr = b""
+            return _P()
+
+        def start_watcher(enqueue):
+            # Simulate the queue watcher delivering one relay turn for relay-dryrun.
+            enqueue("sealed prompt", relay_meta={
+                "relay_mode": True, "disable_mcp": True, "channel": "relay-dryrun",
+            })
+
+        with patch.object(wrapper, "_relay_to_chat", fake_relay), \
+                patch("subprocess.run", fake_run):
+            wrapper.run_agent_exec(
+                command="codex", mcp_args=[], cwd=".", env={},
+                agent="codexsafe", start_watcher=start_watcher,
+                exec_args=[], no_restart=True, server_port=0,
+                get_token_fn=lambda: "tok",
+            )
+
+        self.assertEqual(captured.get("channel"), "relay-dryrun")
+        self.assertEqual(captured.get("text"), "PASS")
+
+    def test_wrapper_non_relay_reply_defaults_to_general(self):
+        """A bare (non-relay) item has no relay_meta -> reply preserves the
+        historical 'general' target (no behavior change for normal @mentions)."""
+        import wrapper
+
+        captured = {}
+
+        def fake_relay(server_port, token, text, channel="general"):
+            captured["channel"] = channel
+
+        def fake_run(cmd, **kwargs):
+            class _P:
+                returncode = 0
+                stdout = b"hello"
+                stderr = b""
+            return _P()
+
+        def start_watcher(enqueue):
+            enqueue("normal prompt")  # no relay_meta
+
+        with patch.object(wrapper, "_relay_to_chat", fake_relay), \
+                patch("subprocess.run", fake_run):
+            wrapper.run_agent_exec(
+                command="codex", mcp_args=["--mcp"], cwd=".", env={},
+                agent="codex", start_watcher=start_watcher,
+                exec_args=[], no_restart=True, server_port=0,
+                get_token_fn=lambda: "tok",
+            )
+
+        self.assertEqual(captured.get("channel"), "general")
 
 
 # ---------------------------------------------------------------------------

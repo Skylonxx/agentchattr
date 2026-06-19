@@ -773,6 +773,11 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             prompt = item
             relay_meta = None
 
+        # Relay replies must go back to the SESSION's channel, which the server
+        # carries in relay_meta.channel. Non-relay items have no relay_meta, so
+        # preserve the historical "general" target for normal @mention turns.
+        reply_channel = (relay_meta or {}).get("channel") or "general"
+
         # Relay mode is METADATA-DRIVEN: structured relay_meta.disable_mcp is the
         # authoritative signal to strip MCP args/env (see _should_disable_mcp).
         relay = _should_disable_mcp(prompt, relay_meta)
@@ -800,7 +805,8 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             if get_token_fn:
                 try:
                     _relay_to_chat(server_port, get_token_fn(),
-                                   f"[codex exec timed out after 120s]")
+                                   f"[codex exec timed out after 120s]",
+                                   channel=reply_channel)
                 except Exception:
                     pass
         except Exception as exc:  # noqa: BLE001
@@ -842,14 +848,16 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
                 if full_len > 2000:
                     reply = reply[:2000] + f"... [truncated, {full_len} chars total]"
                 try:
-                    _relay_to_chat(server_port, get_token_fn(), reply)
-                    print(f"  > {agent} reply relayed ({len(reply)} chars)")
+                    _relay_to_chat(server_port, get_token_fn(), reply,
+                                   channel=reply_channel)
+                    print(f"  > {agent} reply relayed ({len(reply)} chars) -> #{reply_channel}")
                 except Exception as exc:
                     print(f"  > {agent} relay failed: {exc}")
             elif not reply and proc.returncode != 0 and get_token_fn:
                 try:
                     _relay_to_chat(server_port, get_token_fn(),
-                                   f"[codex exec failed (exit {proc.returncode})]")
+                                   f"[codex exec failed (exit {proc.returncode})]",
+                                   channel=reply_channel)
                 except Exception:
                     pass
 
