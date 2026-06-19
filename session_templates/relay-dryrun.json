@@ -1,0 +1,23 @@
+{
+  "id": "relay-dryrun",
+  "name": "2-Turn Relay Validation",
+  "description": "2-turn relay-bridge validation: CodexSafe safety gate, then Codex coordinator synthesis.",
+  "roles": ["safety_gate", "coordinator"],
+  "user_required": false,
+  "phases": [
+    {
+      "name": "Safety Gate",
+      "participants": ["safety_gate"],
+      "prompt": "Review the seeded request below for policy violations and return a strict verdict.",
+      "turn_order": "sequential",
+      "is_output": false
+    },
+    {
+      "name": "Synthesis",
+      "participants": ["coordinator"],
+      "prompt": "In 2-3 sentences, summarise the seeded request and the gate outcome. Plain text only.",
+      "turn_order": "sequential",
+      "is_output": true
+    }
+  ]
+}
