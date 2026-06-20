@@ -782,7 +782,11 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
         # authoritative signal to strip MCP args/env (see _should_disable_mcp).
         relay = _should_disable_mcp(prompt, relay_meta)
         if relay:
-            cmd = [command, "exec", *exec_args, prompt]
+            # Relay prompts are piped via stdin — NOT passed as a CLI
+            # positional arg. Codex CLI truncates multi-line argv prompts
+            # at the first \n\n boundary, losing everything after the
+            # first paragraph. Stdin delivery is byte-exact.
+            cmd = [command, "exec", *exec_args]
             run_env = {k: v for k, v in env.items()
                        if not k.startswith("MCP_") and k not in (
                            "GEMINI_CLI_SYSTEM_SETTINGS_PATH",
@@ -797,6 +801,7 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
         try:
             proc = subprocess.run(
                 cmd, cwd=cwd, env=run_env,
+                input=prompt.encode("utf-8") if relay else None,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=120,
             )
