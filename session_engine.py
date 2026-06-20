@@ -407,19 +407,27 @@ class SessionEngine:
     def _get_last_turn_content(self, session: dict, channel: str) -> str:
         """Get the content from the last turn for safety gate review."""
         try:
-            recent = self._messages.get_recent(channel=channel, limit=5)
-            for msg in reversed(recent):
-                if msg.get("sender") != "system" and msg.get("type", "chat") == "chat":
-                    return msg.get("text", "")
+            recent = self._messages.get_recent(count=5, channel=channel)
         except Exception:
-            pass
+            # Do NOT swallow silently: an error here means the safety gate
+            # reviews empty content (a previous bug passed an invalid `limit=`
+            # kwarg, which was hidden by a bare except). Log it loudly.
+            log.exception(
+                "Session %s: failed to read recent messages in #%s for safety gate",
+                session.get("id"), channel,
+            )
+            return "(no content available for review)"
+        for msg in reversed(recent):
+            if msg.get("sender") != "system" and msg.get("type", "chat") == "chat":
+                return msg.get("text", "")
         return "(no content available for review)"
 
     def _get_recent_context(self, channel: str) -> list[dict]:
         """Get recent messages for relay prompt context."""
         try:
-            return self._messages.get_recent(channel=channel, limit=10)
+            return self._messages.get_recent(count=10, channel=channel)
         except Exception:
+            log.exception("Failed to read recent context messages in #%s", channel)
             return []
 
     def _assemble_prompt(self, session: dict, tmpl: dict, phase: dict,
