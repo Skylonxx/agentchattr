@@ -137,6 +137,39 @@ class TestSafetyGatePromptBuilder(unittest.TestCase):
         prompt = self._build(content_to_review="dangerous code here")
         self.assertIn("dangerous code here", prompt)
 
+    def test_output_contract_at_top(self):
+        """The strict output contract must appear before SESSION/GOAL/CONTENT."""
+        prompt = self._build()
+        contract_pos = prompt.index("OUTPUT CONTRACT")
+        session_pos = prompt.index("SESSION:")
+        self.assertLess(contract_pos, session_pos)
+
+    def test_anti_greeting_directive(self):
+        prompt = self._build()
+        self.assertIn("Do not greet", prompt)
+        self.assertIn("Do not confirm readiness", prompt)
+        self.assertIn("Return ONLY the strict verdict on the first line", prompt)
+
+    def test_example_block_forbidden_request(self):
+        prompt = self._build()
+        self.assertIn("BLOCK: unsafe request asks for prohibited tool, file, git, or shell access", prompt)
+
+    def test_example_pass_harmless_request(self):
+        prompt = self._build()
+        self.assertIn("PASS", prompt)
+        self.assertIn("harmless", prompt.lower())
+
+    def test_closing_verdict_reminder(self):
+        """Prompt must end with a final directive to return the verdict."""
+        prompt = self._build()
+        self.assertIn("Now return your verdict", prompt)
+
+    def test_malformed_warning(self):
+        """Prompt must warn that non-verdict first lines become BLOCK."""
+        prompt = self._build()
+        self.assertIn("malformed verdict", prompt)
+        self.assertIn("automatically becomes BLOCK", prompt)
+
 
 # ---------------------------------------------------------------------------
 # 2. Session turn queue metadata
