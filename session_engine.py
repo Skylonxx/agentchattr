@@ -218,9 +218,7 @@ class SessionEngine:
             return False
 
         role = participants[turn_idx]
-        is_safety_role = role.lower() in _SAFETY_GATE_ROLES
-        is_safety_agent = agent_base.lower() == "codexsafe"
-        if not (is_safety_role or is_safety_agent):
+        if role.lower() not in _SAFETY_GATE_ROLES:
             return False
 
         output = msg.get("text", "")

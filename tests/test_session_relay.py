@@ -1126,9 +1126,9 @@ class TestBlockHaltsDownstream(unittest.TestCase):
         self.assertTrue(len(store.interrupted) > 0)
         self.assertEqual(len(store.advanced_turns), 0)
 
-    def test_codexsafe_block_halts_regardless_of_role(self):
-        """Product contract: a BLOCK from the dedicated CodexSafe base halts the
-        session even when cast into a non-safety role."""
+    def test_codexsafe_non_safety_role_not_verdict_parsed(self):
+        """Role-scoping: codexsafe in a non-safety role (e.g. analyst) must NOT
+        have its output verdict-parsed — even if the text looks like BLOCK:."""
         template = {
             "id": "t1",
             "name": "Test",
@@ -1153,7 +1153,8 @@ class TestBlockHaltsDownstream(unittest.TestCase):
         session["_last_msg"] = {"text": "BLOCK: unsafe", "id": 1}
         engine._advance(session, 1)
 
-        self.assertTrue(len(store.interrupted) > 0)
+        self.assertEqual(len(store.interrupted), 0)
+        self.assertEqual(len(store.advanced_turns), 1)
 
     def test_codex_non_safety_role_not_verdict_parsed(self):
         """A plain Codex agent in a non-safety role is NOT verdict-parsed — a
@@ -1186,6 +1187,153 @@ class TestBlockHaltsDownstream(unittest.TestCase):
         # Must NOT halt — Codex in a non-safety role is not a safety gate.
         self.assertEqual(len(store.interrupted), 0)
         self.assertEqual(len(store.advanced_turns), 1)
+
+    def test_codexsafe_in_safety_gate_role_still_blocks_malformed(self):
+        """Codexsafe in safety_gate role: malformed output still auto-BLOCKs."""
+        template = {
+            "id": "t1",
+            "name": "Test",
+            "phases": [
+                {"name": "Gate", "participants": ["safety_gate"],
+                 "prompt": "check", "is_output": True},
+            ],
+        }
+        session = {
+            "id": 1, "template_id": "t1", "channel": "general",
+            "cast": {"safety_gate": "codexsafe"},
+            "state": "waiting", "current_phase": 0, "current_turn": 0,
+        }
+        registry_agents = {
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+        }
+        engine, store, messages, trigger = self._make_engine(
+            session, template, registry_agents,
+        )
+
+        session["_last_msg"] = {"text": "Ready for session!", "id": 1}
+        engine._advance(session, 1)
+
+        self.assertTrue(len(store.interrupted) > 0)
+        self.assertIn("malformed", store.interrupted[0]["reason"])
+
+    def test_codex_in_safety_gate_role_blocks_malformed(self):
+        """Any agent (including codex) in a safety_gate role must be strictly
+        verdict-parsed — malformed output auto-BLOCKs."""
+        template = {
+            "id": "t1",
+            "name": "Test",
+            "phases": [
+                {"name": "Gate", "participants": ["safety_gate"],
+                 "prompt": "check", "is_output": True},
+            ],
+        }
+        session = {
+            "id": 1, "template_id": "t1", "channel": "general",
+            "cast": {"safety_gate": "codex"},
+            "state": "waiting", "current_phase": 0, "current_turn": 0,
+        }
+        registry_agents = {
+            "codex": {"name": "codex", "base": "codex"},
+        }
+        engine, store, messages, trigger = self._make_engine(
+            session, template, registry_agents,
+        )
+
+        session["_last_msg"] = {"text": "Looks fine I guess", "id": 1}
+        engine._advance(session, 1)
+
+        self.assertTrue(len(store.interrupted) > 0)
+        self.assertIn("malformed", store.interrupted[0]["reason"])
+
+    def test_codexsafe_head_pastry_chef_recipe_advances(self):
+        """Bakery scenario: codexsafe as head_pastry_chef outputs a recipe.
+        Must NOT be verdict-parsed; session should advance normally."""
+        template = {
+            "id": "t1",
+            "name": "Creative Bakery",
+            "phases": [
+                {"name": "Recipe Creation", "participants": ["head_pastry_chef"],
+                 "prompt": "Create a recipe.", "is_output": False},
+                {"name": "Marketing Copy", "participants": ["social_media_manager"],
+                 "prompt": "Write a post.", "is_output": True},
+            ],
+        }
+        session = {
+            "id": 1, "template_id": "t1", "channel": "relay-dryrun",
+            "cast": {"head_pastry_chef": "codexsafe",
+                     "social_media_manager": "codex"},
+            "state": "waiting", "current_phase": 0, "current_turn": 0,
+        }
+        registry_agents = {
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+            "codex": {"name": "codex", "base": "codex"},
+        }
+        engine, store, messages, trigger = self._make_engine(
+            session, template, registry_agents,
+        )
+
+        recipe = (
+            "Summer Signature Cake: Golden Mango Chili Salt Cloud Cake\n\n"
+            "A light coconut chiffon layer cake filled with roasted mango curd,\n"
+            "fresh mango, lime cream, and Thai chili salt."
+        )
+        session["_last_msg"] = {"text": recipe, "id": 1}
+        engine._advance(session, 1)
+
+        self.assertEqual(len(store.interrupted), 0)
+        self.assertEqual(len(store.advanced_phases), 1)
+
+    def test_bakery_two_turn_full_simulation(self):
+        """Full bakery 2-turn simulation: chef outputs recipe (phase 0),
+        session advances to phase 1, marketing manager outputs post,
+        session completes."""
+        template = {
+            "id": "bakery",
+            "name": "Creative Bakery 2-Turn Handoff",
+            "phases": [
+                {"name": "Recipe Creation",
+                 "participants": ["head_pastry_chef"],
+                 "prompt": "Create a recipe.", "is_output": False},
+                {"name": "Marketing Copy",
+                 "participants": ["social_media_manager"],
+                 "prompt": "Write a post.", "is_output": True},
+            ],
+        }
+        session = {
+            "id": 1, "template_id": "bakery", "channel": "relay-dryrun",
+            "cast": {"head_pastry_chef": "codexsafe",
+                     "social_media_manager": "codex"},
+            "state": "waiting", "current_phase": 0, "current_turn": 0,
+        }
+        registry_agents = {
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+            "codex": {"name": "codex", "base": "codex"},
+        }
+        engine, store, messages, trigger = self._make_engine(
+            session, template, registry_agents,
+        )
+
+        # Turn 1: codexsafe (head_pastry_chef) outputs recipe
+        recipe = "Golden Mango Chili Salt Cloud Cake\n\nIngredients: ..."
+        session["_last_msg"] = {"text": recipe, "id": 1}
+        engine._advance(session, 1)
+
+        self.assertEqual(len(store.interrupted), 0,
+                         "Chef recipe must not trigger safety parser")
+        self.assertEqual(len(store.advanced_phases), 1,
+                         "Session must advance from phase 0 to phase 1")
+
+        # Refresh session state after phase advance
+        session = store._sessions[0]
+
+        # Turn 2: codex (social_media_manager) outputs marketing post
+        post = "NEW this summer! Golden Mango Chili Salt Cloud Cake..."
+        session["_last_msg"] = {"text": post, "id": 2}
+        engine._advance(session, 2)
+
+        self.assertEqual(len(store.interrupted), 0)
+        self.assertEqual(len(store.completed), 1,
+                         "Session must complete after final phase")
 
 
 # ---------------------------------------------------------------------------
