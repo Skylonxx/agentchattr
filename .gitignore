@@ -22,3 +22,7 @@ docs/
 goals.py
 pr-reviews/
 agentchattr-*.zip
+
+# Backup snapshots (working-tree scratch backups, never source)
+*.bak-*
+*.bak.*

@@ -31,7 +31,7 @@ WM_ACTIVATE = 0x0006
 WA_ACTIVE = 1
 
 
-def enable_vt_mode(verbose: bool = True):
+def enable_vt_mode(verbose: bool = True, skip_input: bool = False):
     """Enable virtual terminal processing on the underlying console.
 
     Newer TUI agents (codex, claude, etc.) emit ANSI escape sequences directly
@@ -67,12 +67,19 @@ def enable_vt_mode(verbose: bool = True):
     FILE_SHARE_WRITE = 0x00000002
     OPEN_EXISTING = 3
 
-    targets = (
+    targets = [
         ("CONOUT$", GENERIC_READ | GENERIC_WRITE,
          ENABLE_VIRTUAL_TERMINAL_PROCESSING | ENABLE_PROCESSED_OUTPUT, "stdout"),
-        ("CONIN$",  GENERIC_READ | GENERIC_WRITE,
-         ENABLE_VIRTUAL_TERMINAL_INPUT, "stdin"),
-    )
+    ]
+    # Per-agent: skip CONIN$ virtual-terminal input so the console does not inject
+    # focus-event escape sequences (ESC[I / ESC[O) that some TUIs (Codex/crossterm)
+    # render as literal text and that corrupt the injected prompt. CONOUT$ VT
+    # rendering is preserved either way.
+    if not skip_input:
+        targets.append(
+            ("CONIN$",  GENERIC_READ | GENERIC_WRITE,
+             ENABLE_VIRTUAL_TERMINAL_INPUT, "stdin"),
+        )
 
     for device, access, extra_bits, label in targets:
         handle = kernel32.CreateFileW(
@@ -402,12 +409,12 @@ def _vt_keepalive_thread():
     t.start()
 
 
-def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, start_watcher, strip_env=None, pid_holder=None, session_name=None, inject_env=None, inject_delay: float = 0.3, enter_backend: str = "console_input"):
+def run_agent(command, extra_args, cwd, env, queue_file, agent, no_restart, start_watcher, strip_env=None, pid_holder=None, session_name=None, inject_env=None, inject_delay: float = 0.3, enter_backend: str = "console_input", skip_vt_input: bool = False):
     """Run agent as a direct subprocess, inject via Win32 console."""
     # Newer codex/claude/etc TUIs require VT processing on the parent console;
     # without this, ANSI escape sequences leak as text into the terminal.
     # One-shot at startup (with diagnostic print) then a keepalive thread.
-    enable_vt_mode()
+    enable_vt_mode(skip_input=skip_vt_input)
     _vt_keepalive_thread()
 
     if inject_env:

@@ -32,7 +32,7 @@ if %errorlevel% neq 0 (
     goto :wait_server
 )
 
-python wrapper.py codex -- --model gpt-5.5
+python wrapper.py codexsafe -- --model gpt-5.5
 if %errorlevel% neq 0 (
     echo.
     echo   Agent exited unexpectedly. Check the output above.

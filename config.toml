@@ -15,9 +15,19 @@ label = "Claude"
 
 [agents.codex]
 command = "codex"
-cwd = ".."
+cwd = "C:/tools/agentchattr-scratch"
 color = "#10a37f"
 label = "Codex"
+# codex 0.140's TUI ignores injected keystrokes on Windows (text enters but
+# Enter never submits). Run headless via `codex exec` per @mention instead.
+run_mode = "exec"
+
+[agents.codexsafe]
+command = "codex"
+cwd = "C:/tools/agentchattr-scratch"
+color = "#00b894"
+label = "Codex safety"
+run_mode = "exec"
 
 [agents.gemini]
 command = "gemini"
@@ -131,3 +141,17 @@ max_size_mb = 10
 #   # system_prompt = "You are ..."   # optional: custom system prompt
 #
 # Then run: python wrapper_api.py qwen
+
+
+[agents.agy]
+name = "agy"
+tag = "@agy"
+description = "Antigravity CLI Agent"
+command = "agy"
+cwd = "C:/tools/agentchattr-scratch"
+color = "#ffcc00"
+label = "Agy"
+system_prompt = "You are agy, an autonomous AI engineering agent inside the agentchattr multi-agent swarm."
+# AGY 1.0.10 --print emits zero stdout; extract reply from brain transcript.
+run_mode = "store_exec"
+print_timeout = 120

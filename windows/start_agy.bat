@@ -1,5 +1,5 @@
 @echo off
-REM agentchattr — starts server (if not running) + Codex wrapper
+REM agentchattr — starts server (if not running) + agy wrapper
 cd /d "%~dp0.."
 
 REM Auto-create venv and install deps on first run
@@ -9,11 +9,11 @@ if not exist ".venv" (
 )
 call .venv\Scripts\activate.bat
 
-REM Pre-flight: check that codex CLI is installed
-where codex >nul 2>&1
+REM Pre-flight: check that agy CLI is installed
+where agy >nul 2>&1
 if %errorlevel% neq 0 (
     echo.
-    echo   Error: "codex" was not found on PATH.
+    echo   Error: "agy" was not found on PATH.
     echo   Install it first, then try again.
     echo.
     pause
@@ -32,7 +32,8 @@ if %errorlevel% neq 0 (
     goto :wait_server
 )
 
-python wrapper.py codex -- --model gpt-5.5
+REM Start the wrapper for agy
+python wrapper.py agy -- --model "Gemini 3.1 Pro (High)"
 if %errorlevel% neq 0 (
     echo.
     echo   Agent exited unexpectedly. Check the output above.
