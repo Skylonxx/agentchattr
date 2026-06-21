@@ -716,6 +716,67 @@ def _extract_relay_turn(lines: list[str]) -> tuple[dict | None, str]:
     return None, ""
 
 
+# ---------------------------------------------------------------------------
+# Relay outcome markers (fail-loud: a relay turn never silently posts nothing)
+# ---------------------------------------------------------------------------
+
+# Bounded exec runtime for a relay/exec turn. Used for both the subprocess
+# timeout and the "[timed out after Ns]" marker so the two never drift.
+EXEC_TIMEOUT_SECS = 120
+
+RELAY_NO_REPLY_MARKER = "[no reply]"
+
+
+def _format_relay_reply(text: str) -> str:
+    """Apply the existing codex relay safety filters to captured output.
+
+    Preserves prior behavior: Traceback dumps are summarized and over-long
+    output is truncated at 2000 chars with a char-count marker.
+    """
+    text = text.strip()
+    if text.startswith("Traceback"):
+        return f"[codex error: {text[:100]}]"
+    if len(text) > 2000:
+        return text[:2000] + f"... [truncated, {len(text)} chars total]"
+    return text
+
+
+def _resolve_relay_reply(*, timed_out: bool, errored: bool,
+                         returncode: int | None, captured: str,
+                         timeout_secs: int = EXEC_TIMEOUT_SECS) -> str:
+    """Decide the exact, always-non-empty text to relay for one exec turn.
+
+    Guarantees a non-empty result for EVERY outcome so a relay turn can never
+    silently post nothing — which previously stalled the session on a zero-exit
+    empty-output run (the relay branch required truthy output and the failure
+    branch required a nonzero exit, so zero-exit + empty fell through to no
+    message at all). Marker contract:
+
+      timeout       -> [timed out after Ns]
+      exec error    -> [failed (exec error)]
+      nonzero exit  -> captured output if present, else [failed (exit N)]
+      zero + empty  -> [no reply]
+      zero + output -> the formatted reply
+
+    Existing codex/codexsafe success behavior (relay captured output, with the
+    Traceback summary and 2000-char truncation filters) is preserved whenever
+    output is present, for both zero and nonzero exits.
+    """
+    if timed_out:
+        return f"[timed out after {timeout_secs}s]"
+    if errored:
+        return "[failed (exec error)]"
+    captured = (captured or "").strip()
+    if returncode is not None and returncode != 0:
+        if captured:
+            return _format_relay_reply(captured)
+        return f"[failed (exit {returncode})]"
+    # zero exit
+    if not captured:
+        return RELAY_NO_REPLY_MARKER
+    return _format_relay_reply(captured)
+
+
 def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
                    exec_args=None, trigger_flag=None, running_flag=None,
                    data_dir=None, no_restart=False,
@@ -797,27 +858,27 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             run_env = env
         print(f"  > {agent} exec triggered ({len(prompt)} chars){' [relay]' if relay else ''}")
 
+        timed_out = False
+        errored = False
         proc = None
         try:
             proc = subprocess.run(
                 cmd, cwd=cwd, env=run_env,
                 input=prompt.encode("utf-8") if relay else None,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=120,
+                timeout=EXEC_TIMEOUT_SECS,
             )
         except subprocess.TimeoutExpired:
-            print(f"  > {agent} exec timed out (120s)")
-            if get_token_fn:
-                try:
-                    _relay_to_chat(server_port, get_token_fn(),
-                                   f"[codex exec timed out after 120s]",
-                                   channel=reply_channel)
-                except Exception:
-                    pass
+            timed_out = True
+            print(f"  > {agent} exec timed out ({EXEC_TIMEOUT_SECS}s)")
         except Exception as exc:  # noqa: BLE001
+            errored = True
             print(f"  > {agent} exec error: {exc}")
 
+        returncode = None
+        captured = ""
         if proc is not None:
+            returncode = proc.returncode
             print(f"  > {agent} exec finished (exit {proc.returncode})")
 
             # Log stdout/stderr for diagnostics
@@ -836,35 +897,30 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
                     pass
 
             # Read -o output file (primary), fall back to stdout
-            reply = ""
             if _output_file and _output_file.exists():
                 try:
-                    reply = _output_file.read_text("utf-8").strip()
+                    captured = _output_file.read_text("utf-8").strip()
                 except Exception:
-                    pass
-            if not reply and proc.stdout:
-                reply = proc.stdout.decode("utf-8", errors="replace").strip()
+                    captured = ""
+            if not captured and proc.stdout:
+                captured = proc.stdout.decode("utf-8", errors="replace").strip()
 
-            # Safety filters + relay
-            if reply and get_token_fn:
-                if reply.startswith("Traceback"):
-                    reply = f"[codex error: {reply[:100]}]"
-                full_len = len(reply)
-                if full_len > 2000:
-                    reply = reply[:2000] + f"... [truncated, {full_len} chars total]"
-                try:
-                    _relay_to_chat(server_port, get_token_fn(), reply,
-                                   channel=reply_channel)
-                    print(f"  > {agent} reply relayed ({len(reply)} chars) -> #{reply_channel}")
-                except Exception as exc:
-                    print(f"  > {agent} relay failed: {exc}")
-            elif not reply and proc.returncode != 0 and get_token_fn:
-                try:
-                    _relay_to_chat(server_port, get_token_fn(),
-                                   f"[codex exec failed (exit {proc.returncode})]",
-                                   channel=reply_channel)
-                except Exception:
-                    pass
+        # Fail-loud relay: EVERY outcome posts exactly one non-empty message to
+        # the session's channel (relay_meta.channel, carried in reply_channel) —
+        # never silently nothing, and never #general in relay mode. This closes
+        # the zero-exit empty-output stall where no message was ever posted.
+        if get_token_fn:
+            reply = _resolve_relay_reply(
+                timed_out=timed_out, errored=errored,
+                returncode=returncode, captured=captured,
+                timeout_secs=EXEC_TIMEOUT_SECS,
+            )
+            try:
+                _relay_to_chat(server_port, get_token_fn(), reply,
+                               channel=reply_channel)
+                print(f"  > {agent} reply relayed ({len(reply)} chars) -> #{reply_channel}")
+            except Exception as exc:
+                print(f"  > {agent} relay failed: {exc}")
 
         # Stay "active" if more mentions are already queued.
         if running_flag is not None and work.empty():

@@ -5,6 +5,7 @@ Unit tests only — no live sessions, no paid APIs, no external connections.
 """
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1833,6 +1834,230 @@ class TestSdlcSafetyGateContentSelection(unittest.TestCase):
         ms.add("codex", "Review: the reviewed artifact", channel="sdlc-dryrun")
         content = eng._get_last_turn_content({"id": 1}, "sdlc-dryrun")
         self.assertEqual(content, "Review: the reviewed artifact")
+
+
+# ---------------------------------------------------------------------------
+# 10. Relay-runner no-output hardening (merged from tests/test_relay_runner.py)
+#
+# Fail-loud marker contract: a turn can never silently post nothing (which
+# previously stalled a session on a zero-exit empty-output run — the relay
+# branch required truthy output and the failure branch required a nonzero
+# exit, so zero-exit + empty fell through to no message at all). Marker
+# contract, applied to EVERY outcome:
+#
+#   zero exit + non-empty output -> relay the reply
+#   zero exit + empty output     -> [no reply]
+#   nonzero exit + empty         -> [failed (exit N)]
+#   nonzero exit + output        -> relay the reply        (behavior preserved)
+#   timeout                      -> [timed out after Ns]
+#   exec error                   -> [failed (exec error)]
+#
+# Routing is orthogonal to the marker decision: relay turns post to
+# relay_meta.channel (never #general); non-relay @mentions keep #general.
+# Unit + helper-level only — no live sessions, no paid APIs, no network.
+# ---------------------------------------------------------------------------
+
+class TestResolveRelayReply(unittest.TestCase):
+    """Helper-level: each outcome maps to its exact, always-non-empty marker."""
+
+    def _r(self, **kw):
+        import wrapper
+        defaults = dict(timed_out=False, errored=False, returncode=0,
+                        captured="", timeout_secs=120)
+        defaults.update(kw)
+        return wrapper._resolve_relay_reply(**defaults)
+
+    def test_zero_exit_empty_output_marker(self):
+        self.assertEqual(self._r(returncode=0, captured=""), "[no reply]")
+
+    def test_zero_exit_whitespace_only_marker(self):
+        self.assertEqual(self._r(returncode=0, captured="   \n  "), "[no reply]")
+
+    def test_zero_exit_with_output(self):
+        self.assertEqual(self._r(returncode=0, captured="hello"), "hello")
+
+    def test_nonzero_exit_empty_marker(self):
+        self.assertEqual(self._r(returncode=3, captured=""), "[failed (exit 3)]")
+
+    def test_nonzero_exit_with_output_preserved(self):
+        # Preserve prior behavior: relay captured output even on nonzero exit.
+        self.assertEqual(self._r(returncode=1, captured="partial result"),
+                         "partial result")
+
+    def test_timeout_marker(self):
+        self.assertEqual(self._r(timed_out=True, returncode=None),
+                         "[timed out after 120s]")
+
+    def test_timeout_marker_uses_configured_secs(self):
+        self.assertEqual(self._r(timed_out=True, returncode=None, timeout_secs=90),
+                         "[timed out after 90s]")
+
+    def test_exec_error_marker(self):
+        self.assertEqual(self._r(errored=True, returncode=None),
+                         "[failed (exec error)]")
+
+    def test_never_empty_for_any_outcome(self):
+        # Exhaustive guard: no combination of outcomes yields an empty string,
+        # so the runner can never relay nothing.
+        for timed_out in (True, False):
+            for errored in (True, False):
+                for rc in (None, 0, 1, 137):
+                    for cap in ("", "   ", "text"):
+                        out = self._r(timed_out=timed_out, errored=errored,
+                                      returncode=rc, captured=cap)
+                        self.assertTrue(out and out.strip(),
+                                        (timed_out, errored, rc, repr(cap)))
+
+
+class TestFormatRelayReply(unittest.TestCase):
+    """Existing codex safety filters (Traceback summary, 2000-char truncation)
+    are preserved by the extracted formatter."""
+
+    def test_traceback_summarized(self):
+        import wrapper
+        out = wrapper._format_relay_reply("Traceback (most recent call last):\n  File ...")
+        self.assertTrue(out.startswith("[codex error:"))
+
+    def test_truncation_at_2000(self):
+        import wrapper
+        out = wrapper._format_relay_reply("x" * 2500)
+        self.assertIn("[truncated, 2500 chars total]", out)
+
+    def test_short_passthrough_strips(self):
+        import wrapper
+        self.assertEqual(wrapper._format_relay_reply("  hi  "), "hi")
+
+
+_SEALED_PROMPT = (
+    "SESSION: t\n\nOUTPUT CONTRACT: Respond with plain text only. "
+    "Do not use MCP tools. Do not call chat_read or chat_send."
+)
+_RELAY_META = {"relay_mode": True, "disable_mcp": True, "channel": "relay-dryrun"}
+
+
+class _RunAgentExecHarness(unittest.TestCase):
+    """Drives one run_agent_exec turn with subprocess.run and _relay_to_chat
+    mocked, capturing every (text, channel) relayed."""
+
+    def _run_once(self, *, fake_proc=None, raise_exc=None, relay_meta=None,
+                  prompt=_SEALED_PROMPT):
+        import wrapper
+        relayed = []
+
+        def fake_relay(server_port, token, text, channel="general"):
+            relayed.append({"text": text, "channel": channel})
+
+        def fake_run(*args, **kwargs):
+            if raise_exc is not None:
+                raise raise_exc
+            return fake_proc
+
+        def start_watcher(inject_fn):
+            # Mimic the queue watcher: one turn enqueued (sealed for relay).
+            inject_fn(prompt, relay_meta=relay_meta)
+
+        with patch.object(wrapper, "_relay_to_chat", fake_relay), \
+                patch("subprocess.run", fake_run):
+            wrapper.run_agent_exec(
+                command="codex", mcp_args=[], cwd=".", env={}, agent="codex",
+                start_watcher=start_watcher, exec_args=[], data_dir=None,
+                no_restart=True, server_port=8300, get_token_fn=lambda: "tok",
+            )
+        return relayed
+
+
+class TestRelayOutcomeRouting(_RunAgentExecHarness):
+    """Relay mode: every outcome posts exactly one non-empty message to the
+    session's channel (relay_meta.channel) and never to #general."""
+
+    def test_success_routes_to_session_channel(self):
+        proc = MagicMock(returncode=0, stdout=b"the answer", stderr=b"")
+        relayed = self._run_once(fake_proc=proc, relay_meta=_RELAY_META)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+        self.assertNotEqual(relayed[0]["channel"], "general")
+        self.assertEqual(relayed[0]["text"], "the answer")
+
+    def test_zero_exit_empty_posts_no_reply_marker(self):
+        proc = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        relayed = self._run_once(fake_proc=proc, relay_meta=_RELAY_META)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[no reply]")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_nonzero_exit_empty_posts_failed_marker(self):
+        proc = MagicMock(returncode=2, stdout=b"", stderr=b"boom")
+        relayed = self._run_once(fake_proc=proc, relay_meta=_RELAY_META)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[failed (exit 2)]")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_timeout_posts_timed_out_marker(self):
+        relayed = self._run_once(
+            raise_exc=subprocess.TimeoutExpired(cmd="codex", timeout=120),
+            relay_meta=_RELAY_META,
+        )
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[timed out after 120s]")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_exec_error_posts_failed_marker(self):
+        relayed = self._run_once(
+            raise_exc=OSError("spawn failed"),
+            relay_meta=_RELAY_META,
+        )
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[failed (exec error)]")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+
+class TestNonRelayOutcomeRouting(_RunAgentExecHarness):
+    """Non-relay @mentions: the refactor now also posts a fail-loud marker for
+    the no-output/failure outcomes (previously a zero-exit empty mention posted
+    nothing). This is intentional — markers are diagnostic only and never alter
+    relay safety. Every non-relay outcome keeps the historical #general target.
+    """
+
+    _PLAIN = "plain mention reply please"
+
+    def test_success_keeps_general_default(self):
+        proc = MagicMock(returncode=0, stdout=b"hi there", stderr=b"")
+        relayed = self._run_once(fake_proc=proc, relay_meta=None, prompt=self._PLAIN)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["channel"], "general")
+        self.assertEqual(relayed[0]["text"], "hi there")
+
+    def test_zero_exit_empty_posts_no_reply_marker_to_general(self):
+        proc = MagicMock(returncode=0, stdout=b"", stderr=b"")
+        relayed = self._run_once(fake_proc=proc, relay_meta=None, prompt=self._PLAIN)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[no reply]")
+        self.assertEqual(relayed[0]["channel"], "general")
+
+    def test_nonzero_exit_empty_posts_failed_marker_to_general(self):
+        proc = MagicMock(returncode=2, stdout=b"", stderr=b"boom")
+        relayed = self._run_once(fake_proc=proc, relay_meta=None, prompt=self._PLAIN)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[failed (exit 2)]")
+        self.assertEqual(relayed[0]["channel"], "general")
+
+    def test_timeout_posts_timed_out_marker_to_general(self):
+        relayed = self._run_once(
+            raise_exc=subprocess.TimeoutExpired(cmd="codex", timeout=120),
+            relay_meta=None, prompt=self._PLAIN,
+        )
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[timed out after 120s]")
+        self.assertEqual(relayed[0]["channel"], "general")
+
+    def test_exec_error_posts_failed_marker_to_general(self):
+        relayed = self._run_once(
+            raise_exc=OSError("spawn failed"),
+            relay_meta=None, prompt=self._PLAIN,
+        )
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "[failed (exec error)]")
+        self.assertEqual(relayed[0]["channel"], "general")
 
 
 if __name__ == "__main__":
