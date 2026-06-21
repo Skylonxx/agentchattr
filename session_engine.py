@@ -23,6 +23,58 @@ _DISSENT_ROLES = {"reviewer", "red_team", "critic", "challenger", "against"}
 # Roles treated as safety gates (CodexSafe)
 _SAFETY_GATE_ROLES = {"safety_gate", "safety", "gate", "review_gate"}
 
+# Agents that are NEVER permitted to occupy a safety/verdict-parsed role. The
+# dry-run Claude responder (``claude_dryrun``) is a text-in/text-out RESPONDER
+# only; CodexSafe remains the sole permitted safety gate. Enforced centrally
+# (start_session refuses, and _check_safety_block refuses to verdict-parse) so a
+# miscast can never cause Claude output to be read as a PASS/BLOCK verdict.
+# Production ``claude`` is handled separately by relay eligibility (it is not in
+# RELAY_ELIGIBLE_AGENTS); this set only names the dry-run responder identity.
+_SAFETY_ROLE_RESTRICTED_AGENTS = frozenset({"claude_dryrun"})
+
+
+class RoleGuardResult:
+    """Result of :func:`validate_relay_participant_roles` (pure, fail-closed)."""
+
+    __slots__ = ("ok", "reason", "rejected_role", "rejected_agent")
+
+    def __init__(self, ok, reason="", rejected_role=None, rejected_agent=None):
+        self.ok = ok
+        self.reason = reason
+        self.rejected_role = rejected_role
+        self.rejected_agent = rejected_agent
+
+
+def validate_relay_participant_roles(role_to_agent, *,
+                                     restricted_agents=_SAFETY_ROLE_RESTRICTED_AGENTS,
+                                     safety_roles=_SAFETY_GATE_ROLES):
+    """Pure, fail-closed safety-role guard for relay participant casting.
+
+    Rejects any role->agent mapping that casts a restricted agent (e.g.
+    ``claude_dryrun``) into a safety/verdict-parsed role. ``role_to_agent`` maps a
+    role name to an agent identity (name or resolved base). Returns a
+    :class:`RoleGuardResult`; ``ok`` is False on the FIRST violation.
+
+    Allows ``safety_gate -> codexsafe`` and ``responder -> claude_dryrun``. Role
+    matching is case-insensitive and exact against ``safety_roles``, consistent
+    with :meth:`SessionEngine._check_safety_block`. This is the single central
+    helper that the session-start path (and, in future, template-load/
+    registration validation) call so the rule lives in exactly one place.
+    """
+    if not isinstance(role_to_agent, dict):
+        return RoleGuardResult(False, "cast must be a role->agent mapping")
+    for role, agent in role_to_agent.items():
+        if not isinstance(role, str):
+            return RoleGuardResult(False, f"invalid role key: {role!r}", role, agent)
+        if agent in restricted_agents and role.lower() in safety_roles:
+            return RoleGuardResult(
+                False,
+                f"agent '{agent}' may not occupy safety role '{role}' "
+                f"(CodexSafe is the only permitted safety gate)",
+                role, agent,
+            )
+    return RoleGuardResult(True, "")
+
 
 class SessionEngine:
     """Orchestrates session turn flow on top of existing chat infrastructure.
@@ -46,6 +98,17 @@ class SessionEngine:
     def start_session(self, template_id: str, channel: str, cast: dict,
                       started_by: str, goal: str = "") -> dict | None:
         """Start a new session. Returns the session dict or None on failure."""
+        # Central safety-role guard (fail-closed). A restricted dry-run agent
+        # (claude_dryrun) must never be cast into a safety/verdict-parsed role;
+        # refuse to even create the session. Bases are resolved so a renamed
+        # instance is still caught. CodexSafe remains the only safety gate.
+        role_to_id = {role: self._restricted_identity(agent)
+                      for role, agent in (cast or {}).items()}
+        guard = validate_relay_participant_roles(role_to_id)
+        if not guard.ok:
+            log.warning("Session start refused (safety-role guard): %s", guard.reason)
+            return None
+
         session = self._store.create(
             template_id=template_id,
             channel=channel,
@@ -227,6 +290,19 @@ class SessionEngine:
         if role.lower() not in _SAFETY_GATE_ROLES:
             return False
 
+        # Defense in depth: a restricted dry-run agent (claude_dryrun) must NEVER
+        # be verdict-parsed. start_session should already have refused such a
+        # cast; if one somehow reached here (e.g. a session created out-of-band),
+        # fail closed by HALTING rather than reading Claude output as a verdict.
+        if agent_base in _SAFETY_ROLE_RESTRICTED_AGENTS:
+            log.warning("Session %d: refusing to verdict-parse restricted agent "
+                        "%s in safety role '%s' — halting (CodexSafe is the only "
+                        "safety gate)", session["id"], expected_agent, role)
+            self._store.interrupt(
+                session["id"],
+                f"safety-role guard: {expected_agent} may not be a safety gate")
+            return True
+
         output = msg.get("text", "")
         verdict = parse_safety_verdict(output)
 
@@ -311,6 +387,20 @@ class SessionEngine:
             if inst:
                 return inst.get("base", agent_name)
         return agent_name
+
+    def _restricted_identity(self, agent_name: str) -> str:
+        """Resolve an agent to the identity used for safety-role restriction.
+
+        Prefers the resolved base so a renamed instance (base ``claude_dryrun``)
+        is still caught; falls back to matching the cast name itself. Returns the
+        restricted token when either matches, else the base.
+        """
+        base = self._get_agent_base(agent_name)
+        if base in _SAFETY_ROLE_RESTRICTED_AGENTS:
+            return base
+        if agent_name in _SAFETY_ROLE_RESTRICTED_AGENTS:
+            return agent_name
+        return base
 
     def _trigger_current(self, session: dict):
         """Trigger the agent whose turn it is."""

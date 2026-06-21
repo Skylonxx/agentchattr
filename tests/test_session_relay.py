@@ -2440,6 +2440,319 @@ class TestClaudeSafetyIsolation(unittest.TestCase):
 
 
 # ===========================================================================
+# Phase C — Dry-run implementation prep: claude_dryrun identity + central
+# safety-role guard + cwd evidence. Offline/mocked only; no live session, no
+# real Claude. claude_dryrun eligibility is test-scoped/mocked; production
+# "claude" stays ineligible and is NEVER added to RELAY_ELIGIBLE_AGENTS.
+# ===========================================================================
+
+# Reference fixture for the dry-run template concept. Validated offline only —
+# NOT registered into any store, NOT added to config. Responder is claude_dryrun
+# (never production "claude"); channel is relay-dryrun (never general).
+_DRYRUN_TEMPLATE_FIXTURE = {
+    "id": "claude-relay-dryrun",
+    "name": "Claude Relay Dry-Run",
+    "channel": "relay-dryrun",
+    "roles": ["safety_gate", "responder"],
+    "phases": [
+        {
+            "name": "Dry-Run",
+            "participants": ["safety_gate", "responder"],
+            "prompt": "Reply exactly: CLAUDE_RELAY_JSON_OK",
+            "is_output": True,
+        },
+    ],
+}
+_DRYRUN_CAST_FIXTURE = {"safety_gate": "codexsafe", "responder": "claude_dryrun"}
+_DRYRUN_RELAY_META = {"relay_mode": True, "disable_mcp": True, "channel": "relay-dryrun"}
+
+
+class _DryrunRecordingStore(_FakeSessionStore):
+    """Session store that records create() calls and returns a session dict so
+    the start_session guard wiring can be exercised offline."""
+
+    def __init__(self, templates=None):
+        super().__init__(sessions=[], templates=templates or {})
+        self.created = []
+
+    def create(self, template_id, channel, cast, started_by, goal=""):
+        self.created.append({"template_id": template_id, "channel": channel,
+                             "cast": cast, "started_by": started_by, "goal": goal})
+        session = {"id": len(self.created), "template_id": template_id,
+                   "template_name": template_id, "channel": channel, "cast": cast,
+                   "state": "active", "current_phase": 0, "current_turn": 0}
+        self._sessions.append(session)
+        return session
+
+
+class TestDryrunSafetyRoleGuard(unittest.TestCase):
+    """Central, pure, fail-closed guard: claude_dryrun may never occupy a
+    safety/verdict-parsed role; CodexSafe is the only permitted safety gate."""
+
+    def _guard(self):
+        from session_engine import validate_relay_participant_roles
+        return validate_relay_participant_roles
+
+    def test_valid_dryrun_mapping_passes(self):
+        self.assertTrue(self._guard()(dict(_DRYRUN_CAST_FIXTURE)).ok)
+
+    def test_codexsafe_as_safety_gate_allowed(self):
+        self.assertTrue(self._guard()({"safety_gate": "codexsafe"}).ok)
+
+    def test_responder_claude_dryrun_allowed(self):
+        self.assertTrue(self._guard()({"responder": "claude_dryrun"}).ok)
+
+    def test_claude_dryrun_as_safety_gate_rejected(self):
+        res = self._guard()({"safety_gate": "claude_dryrun"})
+        self.assertFalse(res.ok)
+        self.assertEqual(res.rejected_role, "safety_gate")
+        self.assertEqual(res.rejected_agent, "claude_dryrun")
+
+    def test_claude_dryrun_as_safety_rejected(self):
+        self.assertFalse(self._guard()({"safety": "claude_dryrun"}).ok)
+
+    def test_claude_dryrun_as_gate_rejected(self):
+        self.assertFalse(self._guard()({"gate": "claude_dryrun"}).ok)
+
+    def test_claude_dryrun_as_review_gate_rejected(self):
+        self.assertFalse(self._guard()({"review_gate": "claude_dryrun"}).ok)
+
+    def test_safety_role_match_is_case_insensitive(self):
+        self.assertFalse(self._guard()({"SAFETY_GATE": "claude_dryrun"}).ok)
+
+    def test_guard_covers_all_safety_gate_roles(self):
+        from session_engine import _SAFETY_GATE_ROLES
+        for role in _SAFETY_GATE_ROLES:
+            self.assertFalse(self._guard()({role: "claude_dryrun"}).ok,
+                             f"role '{role}' must reject claude_dryrun")
+
+    def test_guard_is_pure_no_mutation(self):
+        cast = {"safety_gate": "claude_dryrun"}
+        snapshot = dict(cast)
+        self._guard()(cast)
+        self.assertEqual(cast, snapshot)
+
+    def test_non_dict_fails_closed(self):
+        self.assertFalse(self._guard()(None).ok)
+
+
+class TestDryrunGuardSessionStart(unittest.TestCase):
+    """The guard is wired centrally into start_session: a session whose cast puts
+    claude_dryrun in a safety role is REFUSED (not created, nothing triggered)."""
+
+    def _engine(self, registry_agents=None):
+        from session_engine import SessionEngine
+        store = _DryrunRecordingStore(
+            templates={_DRYRUN_TEMPLATE_FIXTURE["id"]: _DRYRUN_TEMPLATE_FIXTURE})
+        messages = _FakeMessageStore()
+        trigger = _FakeAgentTrigger()
+        registry = _FakeRegistry(registry_agents or {
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+            "claude_dryrun": {"name": "claude_dryrun", "base": "claude_dryrun"},
+        })
+        engine = SessionEngine(store, messages, trigger, registry=registry)
+        return engine, store
+
+    def test_start_refused_when_claude_dryrun_is_safety_gate(self):
+        engine, store = self._engine()
+        with patch.object(engine, "_trigger_current") as mock_tc:
+            out = engine.start_session(
+                "claude-relay-dryrun", "relay-dryrun",
+                {"safety_gate": "claude_dryrun", "responder": "codexsafe"},
+                started_by="tester")
+        self.assertIsNone(out)
+        self.assertEqual(store.created, [])     # never created
+        mock_tc.assert_not_called()             # nothing triggered
+
+    def test_start_refused_for_renamed_claude_dryrun_instance(self):
+        # A renamed instance whose BASE is claude_dryrun must also be refused.
+        engine, store = self._engine(registry_agents={
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+            "claude_dryrun#2": {"name": "claude_dryrun#2", "base": "claude_dryrun"},
+        })
+        with patch.object(engine, "_trigger_current") as mock_tc:
+            out = engine.start_session(
+                "claude-relay-dryrun", "relay-dryrun",
+                {"safety_gate": "claude_dryrun#2", "responder": "codexsafe"},
+                started_by="tester")
+        self.assertIsNone(out)
+        self.assertEqual(store.created, [])
+        mock_tc.assert_not_called()
+
+    def test_start_allowed_for_valid_dryrun_cast(self):
+        engine, store = self._engine()
+        with patch.object(engine, "_trigger_current") as mock_tc:
+            out = engine.start_session(
+                "claude-relay-dryrun", "relay-dryrun",
+                dict(_DRYRUN_CAST_FIXTURE), started_by="tester")
+        self.assertIsNotNone(out)
+        self.assertEqual(len(store.created), 1)
+        mock_tc.assert_called_once()
+
+
+class TestDryrunGuardVerdictParseRefusal(TestBlockHaltsDownstream):
+    """Defense-in-depth: even if claude_dryrun is (test-scoped) relay-eligible and
+    somehow cast into a safety role, _check_safety_block must HALT and never read
+    its output as a PASS/BLOCK verdict."""
+
+    def test_claude_dryrun_safety_role_never_verdict_parsed(self):
+        template = {
+            "id": "t1", "name": "T",
+            "phases": [{"name": "Review",
+                        "participants": ["safety_gate", "writer"],
+                        "prompt": "r", "is_output": True}],
+        }
+        session = {
+            "id": 1, "template_id": "t1", "channel": "relay-dryrun",
+            "cast": {"safety_gate": "claude_dryrun", "writer": "codex"},
+            "state": "waiting", "current_phase": 0, "current_turn": 0,
+        }
+        registry_agents = {
+            "claude_dryrun": {"name": "claude_dryrun", "base": "claude_dryrun"},
+            "codex": {"name": "codex", "base": "codex"},
+        }
+        engine, store, messages, trigger = self._make_engine(
+            session, template, registry_agents)
+
+        import session_engine
+        # Test-scoped eligibility for claude_dryrun ONLY (never production claude).
+        with patch.object(session_engine, "is_relay_eligible",
+                          lambda base: base in {"codex", "codexsafe", "claude_dryrun"}), \
+             patch.object(session_engine, "parse_safety_verdict") as mock_parse:
+            # Even a 'PASS' from claude_dryrun must NOT advance the session.
+            session["_last_msg"] = {"text": "PASS", "id": 1}
+            engine._advance(session, 1)
+
+        mock_parse.assert_not_called()                 # never verdict-parsed
+        self.assertTrue(len(store.interrupted) > 0)    # halted (fail closed)
+        self.assertEqual(len(store.advanced_turns), 0)
+
+
+class TestDryrunIdentityIsolation(unittest.TestCase):
+    """Production claude stays ineligible/unreferenced; only claude_dryrun is the
+    dry-run identity (and only ever test-scoped, never in the production set)."""
+
+    def test_production_claude_still_ineligible(self):
+        self.assertFalse(is_relay_eligible("claude"))
+        self.assertFalse(is_relay_eligible("Claude"))
+
+    def test_relay_eligible_set_unchanged(self):
+        from session_relay import RELAY_ELIGIBLE_AGENTS
+        self.assertEqual(RELAY_ELIGIBLE_AGENTS, frozenset({"codex", "codexsafe"}))
+        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+        self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
+
+    def test_dryrun_fixture_does_not_reference_production_claude(self):
+        agents = set(_DRYRUN_CAST_FIXTURE.values())
+        self.assertIn("claude_dryrun", agents)
+        self.assertNotIn("claude", agents)
+        self.assertEqual(_DRYRUN_CAST_FIXTURE["responder"], "claude_dryrun")
+        self.assertEqual(_DRYRUN_CAST_FIXTURE["safety_gate"], "codexsafe")
+
+    def test_only_claude_dryrun_in_test_scoped_eligibility(self):
+        scoped = frozenset({"codex", "codexsafe", "claude_dryrun"})
+        self.assertIn("claude_dryrun", scoped)
+        self.assertNotIn("claude", scoped)
+
+
+class TestDryrunTemplateValidation(unittest.TestCase):
+    """Offline validation of the dry-run template/relay-meta concept."""
+
+    def test_template_channel_is_relay_dryrun_not_general(self):
+        self.assertEqual(_DRYRUN_TEMPLATE_FIXTURE["channel"], "relay-dryrun")
+        self.assertNotEqual(_DRYRUN_TEMPLATE_FIXTURE["channel"], "general")
+
+    def test_template_structure_valid(self):
+        from session_store import validate_session_template
+        self.assertEqual(validate_session_template(_DRYRUN_TEMPLATE_FIXTURE), [])
+
+    def test_template_cast_passes_safety_role_guard(self):
+        from session_engine import validate_relay_participant_roles
+        self.assertTrue(validate_relay_participant_roles(dict(_DRYRUN_CAST_FIXTURE)).ok)
+
+    def test_relay_meta_channel_validates(self):
+        import wrapper
+        self.assertEqual(wrapper._claude_relay_channel(_DRYRUN_RELAY_META), "relay-dryrun")
+
+    def test_general_channel_rejected(self):
+        import wrapper
+        self.assertIsNone(
+            wrapper._claude_relay_channel({**_DRYRUN_RELAY_META, "channel": "general"}))
+
+    def test_missing_channel_rejected(self):
+        import wrapper
+        meta = dict(_DRYRUN_RELAY_META)
+        meta.pop("channel")
+        self.assertIsNone(wrapper._claude_relay_channel(meta))
+
+    def test_relay_meta_requires_exact_bool_true(self):
+        import wrapper
+        self.assertTrue(wrapper._claude_relay_meta_ok(dict(_DRYRUN_RELAY_META)))
+
+    def test_relay_meta_truthy_nonbool_rejected(self):
+        import wrapper
+        self.assertFalse(
+            wrapper._claude_relay_meta_ok({**_DRYRUN_RELAY_META, "relay_mode": "true"}))
+        self.assertFalse(
+            wrapper._claude_relay_meta_ok({**_DRYRUN_RELAY_META, "disable_mcp": 1}))
+
+
+class TestDryrunScratchCwdEvidence(unittest.TestCase):
+    """Prove the planned Claude cwd lives under the dedicated scratch root and is
+    never under Twinpet/repo/home, exercising the explicit twinpet_path arg."""
+
+    def _mkdir(self, prefix="claude-dryrun-scratch-"):
+        import shutil
+        d = Path(tempfile.mkdtemp(prefix=prefix))
+        self.addCleanup(lambda: shutil.rmtree(d, ignore_errors=True))
+        return d
+
+    def test_planned_turn_dir_is_under_scratch_root(self):
+        import wrapper
+        from claude_relay import _is_relative_to
+        turn = wrapper.CLAUDE_SCRATCH_ROOT / "turn-deadbeef0000"
+        self.assertTrue(_is_relative_to(turn, wrapper.CLAUDE_SCRATCH_ROOT))
+
+    def test_scratch_root_not_under_twinpet_repo_or_home(self):
+        import wrapper
+        from claude_relay import _is_relative_to
+        root = wrapper.CLAUDE_SCRATCH_ROOT.resolve()
+        self.assertFalse(_is_relative_to(root, Path(r"C:\Users\Narachat\twinpet-pos")))
+        self.assertFalse(_is_relative_to(root, Path(r"C:\tools\agentchattr\repo")))
+        self.assertFalse(_is_relative_to(root, Path.home()))
+
+    def test_safe_scratch_passes_with_explicit_twinpet_path(self):
+        d = self._mkdir()
+        (d / ".agentchattr-relay-scratch").write_text("owned")
+        res = validate_scratch_cwd(
+            d,
+            repo_path=Path(r"C:\tools\agentchattr\repo"),
+            twinpet_path=Path(r"C:\Users\Narachat\twinpet-pos"),
+        )
+        self.assertTrue(res.ok)
+
+    def test_cwd_under_twinpet_rejected(self):
+        twin = self._mkdir()
+        child = twin / "scratch"
+        child.mkdir()
+        res = validate_scratch_cwd(child, twinpet_path=twin)
+        self.assertFalse(res.ok)
+        self.assertIn("twinpet", res.reason)
+
+    def test_cwd_under_repo_rejected(self):
+        repo = self._mkdir()
+        child = repo / "scratch"
+        child.mkdir()
+        self.assertFalse(validate_scratch_cwd(child, repo_path=repo).ok)
+
+    def test_cwd_under_home_rejected(self):
+        home = self._mkdir()
+        child = home / "scratch"
+        child.mkdir()
+        self.assertFalse(validate_scratch_cwd(child, home_path=home).ok)
+
+
+# ===========================================================================
 # Phase A — DORMANT Claude relay wrapper wiring (run_agent_claude_relay).
 # All subprocess + relay posting is mocked; no real Claude process is launched.
 # ===========================================================================
