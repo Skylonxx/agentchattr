@@ -1122,6 +1122,291 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
 
 
 # ---------------------------------------------------------------------------
+# DORMANT Claude relay runner (Phase A wiring — NOT activated)
+# ---------------------------------------------------------------------------
+#
+# This runner is unreachable in normal operation: it is selected only when an
+# agent is configured with run_mode == "claude_relay" (no such config exists)
+# AND the hard off-switch below is flipped. Claude is also NOT in
+# session_relay.RELAY_ELIGIBLE_AGENTS, so the engine will not even queue a relay
+# turn for it. All three gates (run_mode, off-switch, eligibility) must be opened
+# in a later, explicitly-authorized activation phase.
+#
+# Safety: CodexSafe remains the sole terminal safety gate. This runner never
+# parses Claude output as a PASS/BLOCK verdict — it maps output to a relay reply
+# or a fail-loud marker via claude_relay.resolve_claude_reply() only.
+
+# HARD OFF-SWITCH. Phase A leaves this False. Flipping it is part of the final
+# activation gate (alongside the RELAY_ELIGIBLE_AGENTS flip), not this phase.
+CLAUDE_RELAY_ACTIVATED = False
+
+# Dedicated, owned scratch root for per-turn Claude relay cwd. Never the repo,
+# Twinpet, or user home. Each turn gets a fresh owned child dir.
+CLAUDE_SCRATCH_ROOT = Path(r"C:\tools\agentchattr-relay-scratch\claude")
+CLAUDE_OWNERSHIP_MARKER = ".agentchattr-relay-scratch"
+
+# Bounded runtime for a Claude relay turn. Mirrors EXEC_TIMEOUT_SECS for now; a
+# Claude-specific value can be tuned at activation (Opus JSON turns may be slower).
+CLAUDE_EXEC_TIMEOUT_SECS = EXEC_TIMEOUT_SECS
+
+# Fail-closed markers specific to this runner (reuse the bracketed vocabulary).
+MARKER_CLAUDE_INACTIVE = "[failed (claude relay inactive)]"
+MARKER_CLAUDE_SCRATCH_UNSAFE = "[failed (scratch unsafe)]"
+
+
+class _ScratchResult:
+    """Tiny result holder for per-turn scratch acquisition (fail-closed)."""
+    __slots__ = ("ok", "path", "reason")
+
+    def __init__(self, ok: bool, path: "Path | None", reason: str = ""):
+        self.ok = ok
+        self.path = path
+        self.reason = reason
+
+
+def _make_claude_turn_dir(scratch_root) -> "Path":
+    """Create a fresh, owned per-turn scratch child dir under ``scratch_root``.
+
+    Writes the ownership marker so the validator accepts the (otherwise empty)
+    dir and so any future cleanup can confirm the dir is ours before deleting.
+    """
+    import uuid
+
+    root = Path(scratch_root)
+    root.mkdir(parents=True, exist_ok=True)
+    turn = root / f"turn-{uuid.uuid4().hex[:12]}"
+    turn.mkdir(parents=True, exist_ok=False)
+    (turn / CLAUDE_OWNERSHIP_MARKER).write_text("owned", encoding="utf-8")
+    return turn
+
+
+def _acquire_claude_scratch(scratch_root) -> _ScratchResult:
+    """Create + fail-closed-validate a per-turn Claude scratch cwd.
+
+    Any error or a failed validation yields ``ok=False`` and no path, so the
+    caller must NOT launch the subprocess. No broad deletion is ever performed.
+    """
+    from claude_relay import DEFAULT_OWNERSHIP_MARKER, validate_scratch_cwd
+
+    try:
+        turn = _make_claude_turn_dir(scratch_root)
+    except Exception as exc:  # noqa: BLE001
+        return _ScratchResult(False, None, f"scratch mkdir failed: {exc}")
+
+    check = validate_scratch_cwd(
+        turn,
+        repo_path=ROOT,
+        home_path=Path.home(),
+        ownership_marker=DEFAULT_OWNERSHIP_MARKER,
+    )
+    if not check.ok:
+        return _ScratchResult(False, None, check.reason)
+    return _ScratchResult(True, turn, "")
+
+
+def _is_claude_relay_mode(run_mode: str) -> bool:
+    """True only for the dormant Claude relay run mode. Used by main()'s dispatch
+    so the selection is a single, testable predicate."""
+    return run_mode == "claude_relay"
+
+
+def _claude_relay_channel(relay_meta: dict | None) -> "str | None":
+    """Return the relay turn's target channel, or None if invalid.
+
+    Fail-closed: the channel must be a present, non-empty string and must NOT be
+    'general' — this runner never relays a session turn to #general.
+    """
+    if not isinstance(relay_meta, dict):
+        return None
+    ch = relay_meta.get("channel")
+    if not isinstance(ch, str):
+        return None
+    ch = ch.strip()
+    if not ch or ch.lower() == "general":
+        return None
+    return ch
+
+
+def _claude_relay_meta_ok(relay_meta) -> bool:
+    """STRICT launch gate for the Claude relay runner.
+
+    This is intentionally STRICTER than the shared ``_should_disable_mcp`` helper:
+    that helper treats any truthy ``disable_mcp`` as sufficient and never inspects
+    ``relay_mode``, so a malformed item like ``{"disable_mcp": true, "channel": ..}``
+    would slip through (Codex BLOCKED finding). Launch permission for Claude must
+    require a fully-formed relay turn:
+
+      * relay_meta is a dict
+      * relay_meta["relay_mode"] is exactly True  (bool, not "true"/1/"yes")
+      * relay_meta["disable_mcp"] is exactly True  (bool, not "true"/1/"yes")
+      * a valid, non-empty, non-#general channel (via _claude_relay_channel)
+
+    ``is True`` rejects truthy non-bool variants (str/int), since ``1 is True`` is
+    False in Python. Any missing/false/non-bool field => refuse (no launch).
+    """
+    if not isinstance(relay_meta, dict):
+        return False
+    if relay_meta.get("relay_mode") is not True:
+        return False
+    if relay_meta.get("disable_mcp") is not True:
+        return False
+    return _claude_relay_channel(relay_meta) is not None
+
+
+def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
+                           trigger_flag=None, running_flag=None, data_dir=None,
+                           no_restart=False, server_port=8300, get_token_fn=None,
+                           scratch_root=CLAUDE_SCRATCH_ROOT):
+    """DORMANT headless Claude relay runner (text-in/text-out, no tools/MCP).
+
+    Each queued item must be a valid relay turn (relay_meta with disable_mcp and
+    a non-#general channel). The runner: hard-off-switch check -> channel check
+    -> scratch validate -> sealed ``claude -p ... --tools "" --strict-mcp-config``
+    via stdin (no argv prompt) with a stripped child env -> resolve JSON outcome
+    to reply/marker -> relay EXACTLY ONCE to relay_meta.channel. It never falls
+    back to #general and never parses Claude output as a safety verdict.
+
+    Not reachable unless run_mode == "claude_relay" AND CLAUDE_RELAY_ACTIVATED is
+    True AND the agent is relay-eligible — none of which hold in Phase A.
+    """
+    import queue as _queue
+    import subprocess
+
+    from claude_relay import (
+        build_claude_child_env,
+        build_claude_command,
+        resolve_claude_reply,
+    )
+
+    work: "_queue.Queue[dict]" = _queue.Queue()
+
+    def _enqueue(text, relay_meta=None):
+        if running_flag is not None:
+            running_flag[0] = True
+        work.put({"prompt": text, "relay_meta": relay_meta})
+
+    start_watcher(_enqueue)
+
+    log_path = (data_dir / f"{agent}_claude_relay.log") if data_dir else None
+    print(f"  === {agent.capitalize()} Claude Relay Runner (DORMANT, headless) ===")
+    print(f"  activated={CLAUDE_RELAY_ACTIVATED}")
+    print("  Waiting for relay turns...\n")
+
+    def _post(channel: str, text: str):
+        if not get_token_fn:
+            return
+        try:
+            _relay_to_chat(server_port, get_token_fn(), text, channel=channel)
+            print(f"  > {agent} claude reply relayed ({len(text)} chars) -> #{channel}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  > {agent} claude relay failed: {exc}")
+
+    def _process_item(prompt, relay_meta):
+        """Handle one queue item. Uses ``return`` (never ``continue``) so the
+        outer loop always reaches its no_restart check — a refusal must not
+        leave the loop blocked on an empty queue."""
+        # 1. STRICT relay gate (NOT _should_disable_mcp). A full relay turn is
+        #    required: relay_mode is True AND disable_mcp is True AND a valid
+        #    non-#general channel. Anything malformed/non-relay is refused with
+        #    NO launch and NO post (fail-closed; never #general).
+        if not _claude_relay_meta_ok(relay_meta):
+            print(f"  > {agent} claude refused: invalid/non-relay metadata "
+                  f"(no Claude launch, no #general fallback)")
+            return
+
+        # Channel is guaranteed valid (non-empty, non-#general) by the gate above.
+        channel = _claude_relay_channel(relay_meta)
+
+        # 2. HARD OFF-SWITCH. Dormant in Phase A: mark and never launch.
+        if not CLAUDE_RELAY_ACTIVATED:
+            _post(channel, MARKER_CLAUDE_INACTIVE)
+            return
+
+        # 4. Scratch must validate BEFORE any launch. Fail closed otherwise.
+        scratch = _acquire_claude_scratch(scratch_root)
+        if not scratch.ok:
+            print(f"  > {agent} claude scratch unsafe: {scratch.reason}")
+            _post(channel, MARKER_CLAUDE_SCRATCH_UNSAFE)
+            return
+
+        # 5. Sealed command + stripped child env. Prompt via STDIN only.
+        cmd = build_claude_command()
+        child_env = build_claude_child_env(env)
+
+        timed_out = False
+        errored = False
+        proc = None
+        try:
+            proc = subprocess.run(
+                cmd, cwd=str(scratch.path), env=child_env,
+                input=prompt.encode("utf-8"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=CLAUDE_EXEC_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            print(f"  > {agent} claude exec timed out ({CLAUDE_EXEC_TIMEOUT_SECS}s)")
+        except Exception as exc:  # noqa: BLE001
+            errored = True
+            print(f"  > {agent} claude exec error: {exc}")
+
+        returncode = None
+        stdout_text = ""
+        stderr_text = ""
+        if proc is not None:
+            returncode = proc.returncode
+            stdout_text = (proc.stdout or b"").decode("utf-8", errors="replace")
+            stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace")
+
+        # 6. Map to reply/marker. Claude output is NEVER a safety verdict.
+        outcome = resolve_claude_reply(
+            timed_out=timed_out, errored=errored, returncode=returncode,
+            stdout=stdout_text, stderr=stderr_text,
+            timeout_secs=CLAUDE_EXEC_TIMEOUT_SECS,
+        )
+
+        if log_path:
+            try:
+                with open(log_path, "ab") as lf:
+                    header = f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} claude relay ===\n"
+                    lf.write(header.encode("utf-8", "replace"))
+                    lf.write(f"channel={channel} ok={outcome.ok} "
+                             f"failure={outcome.failure_kind}\n".encode("utf-8", "replace"))
+                    lf.write(f"evidence={outcome.evidence}\n".encode("utf-8", "replace"))
+                    if outcome.stderr_warning:
+                        lf.write(f"stderr_warning={outcome.stderr_warning}\n".encode("utf-8", "replace"))
+            except Exception:
+                pass
+
+        # 7. Relay EXACTLY ONCE to the session channel (never #general).
+        _post(channel, outcome.text)
+
+    while True:
+        try:
+            item = work.get()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if running_flag is not None:
+            running_flag[0] = True
+
+        if isinstance(item, dict):
+            prompt = item.get("prompt", "")
+            relay_meta = item.get("relay_meta")
+        else:
+            prompt = item
+            relay_meta = None
+
+        try:
+            _process_item(prompt, relay_meta)
+        finally:
+            if running_flag is not None and work.empty():
+                running_flag[0] = False
+
+        if no_restart:
+            break
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1439,7 +1724,7 @@ def main():
     unix_session_name = f"agentchattr-{assigned_name}"
     _exec_running = [False]
 
-    if run_mode in ("exec", "store_exec"):
+    if run_mode in ("exec", "store_exec", "claude_relay"):
         # Headless exec mode: activity = a run in flight.
         _set_activity_checker(lambda: _exec_running[0])
     elif sys.platform == "win32":
@@ -1461,6 +1746,23 @@ def main():
                 agent=agent,
                 start_watcher=start_watcher,
                 exec_args=_build_codex_exec_args(agent_cfg, data_dir, assigned_name),
+                trigger_flag=_trigger_flag,
+                running_flag=_exec_running,
+                data_dir=data_dir,
+                no_restart=args.no_restart,
+                server_port=server_port,
+                get_token_fn=get_token,
+            )
+        elif _is_claude_relay_mode(run_mode):
+            # DORMANT Claude relay runner. Reachable only via this run_mode
+            # (no config uses it) AND CLAUDE_RELAY_ACTIVATED (False) AND
+            # relay eligibility (Claude absent from RELAY_ELIGIBLE_AGENTS).
+            run_agent_claude_relay(
+                command=command,
+                cwd=cwd,
+                env={**env, **(inject_env or {})},
+                agent=agent,
+                start_watcher=start_watcher,
                 trigger_flag=_trigger_flag,
                 running_flag=_exec_running,
                 data_dir=data_dir,

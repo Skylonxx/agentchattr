@@ -2439,5 +2439,372 @@ class TestClaudeSafetyIsolation(unittest.TestCase):
         self.assertTrue(out.text.startswith("[failed"))
 
 
+# ===========================================================================
+# Phase A — DORMANT Claude relay wrapper wiring (run_agent_claude_relay).
+# All subprocess + relay posting is mocked; no real Claude process is launched.
+# ===========================================================================
+
+class TestClaudeRelayDispatch(unittest.TestCase):
+    def test_claude_relay_mode_selected(self):
+        import wrapper
+        self.assertTrue(wrapper._is_claude_relay_mode("claude_relay"))
+
+    def test_other_run_modes_unchanged(self):
+        import wrapper
+        for mode in ("exec", "store_exec", "tui", "", "interactive"):
+            self.assertFalse(wrapper._is_claude_relay_mode(mode))
+
+    def test_main_dispatch_wires_claude_runner(self):
+        """main() routes run_mode == 'claude_relay' to run_agent_claude_relay,
+        and leaves exec/store_exec branches pointing at their own runners."""
+        import inspect
+        import wrapper
+        src = inspect.getsource(wrapper.main)
+        self.assertIn("_is_claude_relay_mode(run_mode)", src)
+        self.assertIn("run_agent_claude_relay(", src)
+        # other modes still dispatch to their original runners
+        self.assertIn("run_agent_exec(", src)
+        self.assertIn("run_agent_store_exec(", src)
+
+
+_CLAUDE_RELAY_META = {"relay_mode": True, "disable_mcp": True, "channel": "relay-dryrun"}
+_UNSET = object()  # sentinel so an explicit relay_meta=None is honored, not defaulted
+
+
+def _claude_success_stdout(result="hello from claude"):
+    return json.dumps({
+        "type": "result", "subtype": "success", "is_error": False,
+        "result": result, "permission_denials": [], "session_id": "s1",
+    }).encode("utf-8")
+
+
+class _RunClaudeRelayHarness(unittest.TestCase):
+    """Drives one run_agent_claude_relay turn with subprocess.run, _relay_to_chat,
+    and scratch acquisition mocked. Captures relayed messages and subprocess calls."""
+
+    def _run_once(self, *, activated=True, fake_proc=None, raise_exc=None,
+                  relay_meta=_UNSET, prompt=_SEALED_PROMPT,
+                  scratch_ok=True, env=None):
+        import wrapper
+        if relay_meta is _UNSET:
+            relay_meta = dict(_CLAUDE_RELAY_META)
+        relayed = []
+        sub_calls = []
+
+        def fake_relay(server_port, token, text, channel="general"):
+            relayed.append({"text": text, "channel": channel})
+
+        def fake_run(*args, **kwargs):
+            sub_calls.append({"args": args, "kwargs": kwargs})
+            if raise_exc is not None:
+                raise raise_exc
+            return fake_proc
+
+        def fake_scratch(scratch_root):
+            if scratch_ok:
+                return wrapper._ScratchResult(True, Path(tempfile.gettempdir()), "")
+            return wrapper._ScratchResult(False, None, "unsafe")
+
+        def start_watcher(inject_fn):
+            inject_fn(prompt, relay_meta=relay_meta)
+
+        run_env = env if env is not None else {
+            "PATH": "/bin", "MCP_SERVER_URL": "http://x", "ANTHROPIC_API_KEY": "sk-ant-x",
+        }
+
+        with patch.object(wrapper, "_relay_to_chat", fake_relay), \
+                patch.object(wrapper, "_acquire_claude_scratch", fake_scratch), \
+                patch.object(wrapper, "CLAUDE_RELAY_ACTIVATED", activated), \
+                patch("subprocess.run", fake_run):
+            wrapper.run_agent_claude_relay(
+                command="claude", cwd=".", env=run_env, agent="claude",
+                start_watcher=start_watcher, data_dir=None, no_restart=True,
+                server_port=8300, get_token_fn=lambda: "tok",
+            )
+        return relayed, sub_calls
+
+
+class TestClaudeRelayRunner(_RunClaudeRelayHarness):
+    def test_off_switch_prevents_subprocess(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(activated=False, fake_proc=proc)
+        self.assertEqual(len(sub_calls), 0)  # subprocess NOT called
+        self.assertEqual(len(relayed), 1)
+        import wrapper
+        self.assertEqual(relayed[0]["text"], wrapper.MARKER_CLAUDE_INACTIVE)
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_uses_sealed_command(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        _, sub_calls = self._run_once(activated=True, fake_proc=proc)
+        self.assertEqual(len(sub_calls), 1)
+        cmd = sub_calls[0]["args"][0]
+        self.assertEqual(cmd, build_claude_command())
+        self.assertEqual(cmd[-1], "--strict-mcp-config")
+
+    def test_prompt_via_stdin_not_argv(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        _, sub_calls = self._run_once(activated=True, fake_proc=proc)
+        kwargs = sub_calls[0]["kwargs"]
+        self.assertEqual(kwargs["input"], _SEALED_PROMPT.encode("utf-8"))
+        cmd = sub_calls[0]["args"][0]
+        self.assertNotIn(_SEALED_PROMPT, cmd)  # prompt never in argv
+
+    def test_child_env_is_stripped(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        _, sub_calls = self._run_once(activated=True, fake_proc=proc)
+        child_env = sub_calls[0]["kwargs"]["env"]
+        self.assertIn("PATH", child_env)
+        self.assertNotIn("MCP_SERVER_URL", child_env)
+        self.assertNotIn("ANTHROPIC_API_KEY", child_env)
+
+    def test_scratch_validator_called_before_launch(self):
+        """Real _acquire path: validate_scratch_cwd is invoked before subprocess."""
+        import claude_relay
+        import wrapper
+        tmp = Path(tempfile.mkdtemp(prefix="claude-turn-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        order = []
+
+        def spy_validate(path, **kw):
+            # Record the call ordering only; the validator's own accept/reject
+            # logic is covered by TestClaudeScratchValidator. (A real temp dir
+            # lives under the user home, which the real validator would reject.)
+            order.append("validate")
+            return claude_relay.ScratchCheck(True, "")
+
+        def fake_make(scratch_root):
+            (tmp / ".agentchattr-relay-scratch").write_text("owned")
+            return tmp
+
+        def fake_run(*a, **k):
+            order.append("subprocess")
+            return MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+
+        def start_watcher(inject_fn):
+            inject_fn(_SEALED_PROMPT, relay_meta=dict(_CLAUDE_RELAY_META))
+
+        with patch.object(wrapper, "_relay_to_chat", lambda *a, **k: None), \
+                patch.object(wrapper, "_make_claude_turn_dir", fake_make), \
+                patch.object(claude_relay, "validate_scratch_cwd", spy_validate), \
+                patch.object(wrapper, "CLAUDE_RELAY_ACTIVATED", True), \
+                patch("subprocess.run", fake_run):
+            wrapper.run_agent_claude_relay(
+                command="claude", cwd=".", env={"PATH": "/b"}, agent="claude",
+                start_watcher=start_watcher, data_dir=None, no_restart=True,
+                server_port=8300, get_token_fn=lambda: "tok",
+            )
+        self.assertEqual(order, ["validate", "subprocess"])
+
+    def test_unsafe_scratch_aborts_without_subprocess(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=proc, scratch_ok=False)
+        self.assertEqual(len(sub_calls), 0)  # never launched
+        import wrapper
+        self.assertEqual(relayed[0]["text"], wrapper.MARKER_CLAUDE_SCRATCH_UNSAFE)
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_json_success_routes_result_to_channel(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout("the answer"), stderr=b"")
+        relayed, _ = self._run_once(activated=True, fake_proc=proc)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "the answer")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+        self.assertNotEqual(relayed[0]["channel"], "general")
+
+    def test_failure_marker_routes_to_channel(self):
+        proc = MagicMock(returncode=0, stdout=b"not json", stderr=b"")
+        relayed, _ = self._run_once(activated=True, fake_proc=proc)
+        self.assertEqual(relayed[0]["text"], "[failed (invalid json)]")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_missing_channel_fails_closed_no_general(self):
+        meta = {"relay_mode": True, "disable_mcp": True}  # no channel
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=proc, relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+        self.assertEqual(relayed, [])  # nothing posted, definitely not #general
+        self.assertFalse(any(r["channel"] == "general" for r in relayed))
+
+    def test_general_channel_rejected_no_fallback(self):
+        meta = {"relay_mode": True, "disable_mcp": True, "channel": "general"}
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=proc, relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+        self.assertEqual(relayed, [])
+
+    def test_empty_channel_fails_closed(self):
+        meta = {"relay_mode": True, "disable_mcp": True, "channel": "   "}
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=proc, relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+        self.assertEqual(relayed, [])
+
+    def test_non_relay_item_refused(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(
+            activated=True, fake_proc=proc, relay_meta=None, prompt="plain hello")
+        self.assertEqual(len(sub_calls), 0)
+        self.assertEqual(relayed, [])
+
+    def test_relay_meta_without_disable_mcp_refused(self):
+        meta = {"relay_mode": True, "disable_mcp": False, "channel": "relay-dryrun"}
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+        relayed, sub_calls = self._run_once(
+            activated=True, fake_proc=proc, relay_meta=meta, prompt="plain hello")
+        self.assertEqual(len(sub_calls), 0)
+        self.assertEqual(relayed, [])
+
+    def test_posts_exactly_once(self):
+        proc = MagicMock(returncode=0, stdout=_claude_success_stdout("ok"), stderr=b"")
+        relayed, _ = self._run_once(activated=True, fake_proc=proc)
+        self.assertEqual(len(relayed), 1)
+
+    def test_claude_output_never_verdict_parsed(self):
+        """A Claude reply that literally says 'BLOCK: ...' is relayed verbatim as
+        text — never interpreted as a safety verdict by this runner."""
+        proc = MagicMock(returncode=0,
+                         stdout=_claude_success_stdout("BLOCK: this is just text"),
+                         stderr=b"")
+        relayed, _ = self._run_once(activated=True, fake_proc=proc)
+        self.assertEqual(relayed[0]["text"], "BLOCK: this is just text")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    def test_claude_not_relay_eligible(self):
+        self.assertFalse(is_relay_eligible("claude"))
+
+
+class TestClaudeRelayMetaGate(_RunClaudeRelayHarness):
+    """Codex BLOCKER fix: the Claude runner launch gate requires a FULL relay
+    turn (relay_mode is True AND disable_mcp is True AND valid channel), not just
+    a truthy disable_mcp. Malformed/non-relay metadata must never launch Claude."""
+
+    _PROC = None  # set per-test
+
+    def _proc(self):
+        return MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+
+    def test_disable_mcp_true_alone_does_not_launch(self):
+        # No relay_mode -> Codex's exact malformed example.
+        meta = {"disable_mcp": True, "channel": "relay-dryrun"}
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=self._proc(),
+                                            relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+        self.assertFalse(any(r["channel"] == "general" for r in relayed))
+
+    def test_relay_mode_false_does_not_launch(self):
+        meta = {"relay_mode": False, "disable_mcp": True, "channel": "relay-dryrun"}
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=self._proc(),
+                                            relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+        self.assertFalse(any(r["channel"] == "general" for r in relayed))
+
+    def test_relay_mode_truthy_nonbool_string_does_not_launch(self):
+        meta = {"relay_mode": "true", "disable_mcp": True, "channel": "relay-dryrun"}
+        _, sub_calls = self._run_once(activated=True, fake_proc=self._proc(), relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+
+    def test_relay_mode_truthy_nonbool_int_does_not_launch(self):
+        meta = {"relay_mode": 1, "disable_mcp": True, "channel": "relay-dryrun"}
+        _, sub_calls = self._run_once(activated=True, fake_proc=self._proc(), relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+
+    def test_disable_mcp_truthy_nonbool_string_does_not_launch(self):
+        meta = {"relay_mode": True, "disable_mcp": "true", "channel": "relay-dryrun"}
+        _, sub_calls = self._run_once(activated=True, fake_proc=self._proc(), relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+
+    def test_disable_mcp_truthy_nonbool_int_does_not_launch(self):
+        meta = {"relay_mode": True, "disable_mcp": 1, "channel": "relay-dryrun"}
+        _, sub_calls = self._run_once(activated=True, fake_proc=self._proc(), relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+
+    def test_disable_mcp_missing_does_not_launch(self):
+        meta = {"relay_mode": True, "channel": "relay-dryrun"}
+        _, sub_calls = self._run_once(activated=True, fake_proc=self._proc(), relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+
+    def test_invalid_meta_with_valid_channel_does_not_post_general(self):
+        meta = {"disable_mcp": True, "channel": "relay-dryrun"}  # no relay_mode
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=self._proc(),
+                                            relay_meta=meta)
+        self.assertEqual(len(sub_calls), 0)
+        self.assertFalse(any(r["channel"] == "general" for r in relayed))
+
+    def test_valid_meta_follows_normal_flow(self):
+        meta = {"relay_mode": True, "disable_mcp": True, "channel": "relay-dryrun"}
+        relayed, sub_calls = self._run_once(
+            activated=True,
+            fake_proc=MagicMock(returncode=0, stdout=_claude_success_stdout("ok"), stderr=b""),
+            relay_meta=meta)
+        self.assertEqual(len(sub_calls), 1)  # launched
+        self.assertEqual(relayed[0]["text"], "ok")
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+
+    # Direct unit tests of the strict validator.
+    def test_validator_requires_exact_true_booleans(self):
+        import wrapper
+        ok = {"relay_mode": True, "disable_mcp": True, "channel": "relay-dryrun"}
+        self.assertTrue(wrapper._claude_relay_meta_ok(ok))
+        for bad in (
+            None,
+            "notadict",
+            {"disable_mcp": True, "channel": "relay-dryrun"},          # no relay_mode
+            {"relay_mode": True, "channel": "relay-dryrun"},           # no disable_mcp
+            {"relay_mode": False, "disable_mcp": True, "channel": "c"},
+            {"relay_mode": True, "disable_mcp": False, "channel": "c"},
+            {"relay_mode": "true", "disable_mcp": True, "channel": "c"},
+            {"relay_mode": 1, "disable_mcp": True, "channel": "c"},
+            {"relay_mode": True, "disable_mcp": "true", "channel": "c"},
+            {"relay_mode": True, "disable_mcp": 1, "channel": "c"},
+            {"relay_mode": True, "disable_mcp": True, "channel": "general"},
+            {"relay_mode": True, "disable_mcp": True, "channel": "   "},
+            {"relay_mode": True, "disable_mcp": True},                 # no channel
+        ):
+            self.assertFalse(wrapper._claude_relay_meta_ok(bad), bad)
+
+
+class TestCodexSafeBlockPreventsClaudeDispatch(TestBlockHaltsDownstream):
+    """CodexSafe BLOCK must halt before any downstream Claude turn is triggered."""
+
+    def test_block_prevents_claude_writer_trigger(self):
+        template = {
+            "id": "tcl",
+            "name": "Claude Relay Template",
+            "phases": [
+                {
+                    "name": "Review",
+                    "participants": ["safety_gate", "writer"],
+                    "prompt": "Review content",
+                    "is_output": True,
+                },
+            ],
+        }
+        session = {
+            "id": 1,
+            "template_id": "tcl",
+            "channel": "relay-dryrun",
+            "cast": {"safety_gate": "codexsafe", "writer": "claude"},
+            "state": "waiting",
+            "current_phase": 0,
+            "current_turn": 0,
+        }
+        registry_agents = {
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+            "claude": {"name": "claude", "base": "claude"},
+        }
+        engine, store, messages, trigger = self._make_engine(
+            session, template, registry_agents,
+        )
+
+        session["_last_msg"] = {"text": "BLOCK: unsafe content detected", "id": 1}
+        engine._advance(session, 1)
+
+        # Session interrupted, no turn advanced, and Claude was never triggered.
+        self.assertTrue(len(store.interrupted) > 0)
+        self.assertEqual(len(store.advanced_turns), 0)
+        self.assertFalse(any("claude" in (t.get("agent") or "") for t in trigger.triggered))
+
+
 if __name__ == "__main__":
     unittest.main()
