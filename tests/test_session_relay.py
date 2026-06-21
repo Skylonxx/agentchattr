@@ -1539,5 +1539,301 @@ class TestContentSelection(unittest.TestCase):
         self.assertNotIn("(no content available for review)", prompt)
 
 
+# ---------------------------------------------------------------------------
+# 9. SDLC Todo Widget macro-flow template (MACRO-FLOW-IMPLEMENTATION-1)
+# ---------------------------------------------------------------------------
+
+_SDLC_TEMPLATE_PATH = ROOT / "session_templates" / "sdlc-todo-widget.json"
+
+# The approved relay-only cast for the 4-agent macro-flow. codex performs the
+# three productive roles; codexsafe is the dedicated terminal safety gate.
+_SDLC_CAST = {
+    "planner": "codex",
+    "developer": "codex",
+    "reviewer": "codex",
+    "safety_gate": "codexsafe",
+}
+
+
+def _load_sdlc_template() -> dict:
+    return json.loads(_SDLC_TEMPLATE_PATH.read_text("utf-8"))
+
+
+class _RecordingSessionStore(_FakeSessionStore):
+    """Fake store that also records the output_message_id passed to complete()."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completed_output_ids = []
+
+    def complete(self, session_id, output_message_id=None):
+        self.completed_output_ids.append(output_message_id)
+        return super().complete(session_id, output_message_id)
+
+
+class TestSdlcTemplateShape(unittest.TestCase):
+    """Static shape/validation of the new dry-run template."""
+
+    def test_template_file_exists(self):
+        self.assertTrue(_SDLC_TEMPLATE_PATH.exists())
+
+    def test_template_id_is_sdlc_todo_widget(self):
+        self.assertEqual(_load_sdlc_template()["id"], "sdlc-todo-widget")
+
+    def test_template_passes_validate_session_template(self):
+        from session_store import validate_session_template
+        self.assertEqual(validate_session_template(_load_sdlc_template()), [])
+
+    def test_roles_match_pipeline(self):
+        self.assertEqual(
+            _load_sdlc_template()["roles"],
+            ["planner", "developer", "reviewer", "safety_gate"],
+        )
+
+    def test_phase_names(self):
+        names = [p["name"] for p in _load_sdlc_template()["phases"]]
+        self.assertEqual(names, ["Plan", "Build", "Review", "Safety Gate"])
+
+    def test_sequential_role_order(self):
+        seq = [p["participants"][0] for p in _load_sdlc_template()["phases"]]
+        self.assertEqual(seq, ["planner", "developer", "reviewer", "safety_gate"])
+
+    def test_one_participant_per_phase(self):
+        for phase in _load_sdlc_template()["phases"]:
+            self.assertEqual(len(phase["participants"]), 1)
+
+    def test_final_phase_is_output(self):
+        phases = _load_sdlc_template()["phases"]
+        self.assertTrue(phases[-1].get("is_output"))
+        outputs = [p for p in phases if p.get("is_output")]
+        self.assertEqual(len(outputs), 1, "exactly one is_output phase expected")
+
+    def test_final_phase_role_is_exact_safety_gate(self):
+        from session_engine import _SAFETY_GATE_ROLES
+        final = _load_sdlc_template()["phases"][-1]
+        role = final["participants"][0]
+        self.assertEqual(role, "safety_gate")
+        self.assertIn(role.lower(), _SAFETY_GATE_ROLES)
+
+    def test_gate_role_typo_is_not_recognized(self):
+        """Guard: hyphenated / squashed near-misses are NOT safety-gate roles, so
+        the template MUST use the exact recognized spelling (covers the silent
+        gate-disable failure mode)."""
+        from session_engine import _SAFETY_GATE_ROLES
+        self.assertNotIn("safety-gate", _SAFETY_GATE_ROLES)
+        self.assertNotIn("safetygate", _SAFETY_GATE_ROLES)
+        self.assertNotIn("safety_gates", _SAFETY_GATE_ROLES)
+        # And the shipped template avoids those traps.
+        gate_role = _load_sdlc_template()["phases"][-1]["participants"][0]
+        self.assertIn(gate_role.lower(), _SAFETY_GATE_ROLES)
+
+    def test_prompts_within_validator_limit(self):
+        for phase in _load_sdlc_template()["phases"]:
+            self.assertLessEqual(len(phase.get("prompt", "")), 200)
+
+
+class TestSdlcTemplateCast(unittest.TestCase):
+    """The cast may only map roles to relay-eligible agents."""
+
+    def test_cast_covers_all_roles(self):
+        self.assertEqual(set(_SDLC_CAST), set(_load_sdlc_template()["roles"]))
+
+    def test_cast_maps_only_relay_eligible_agents(self):
+        for role, agent in _SDLC_CAST.items():
+            self.assertTrue(is_relay_eligible(agent),
+                            f"role {role!r} cast to non-relay agent {agent!r}")
+
+    def test_excluded_agents_are_not_relay_eligible(self):
+        # Claude and AGY remain excluded from relay operations.
+        self.assertFalse(is_relay_eligible("claude"))
+        self.assertFalse(is_relay_eligible("agy"))
+
+    def test_gate_role_cast_to_codexsafe(self):
+        self.assertEqual(_SDLC_CAST["safety_gate"], "codexsafe")
+
+
+class TestSdlcReviewerDissentPrompt(unittest.TestCase):
+    """The reviewer phase must carry an explicit independent/dissent instruction
+    that survives into the relay prompt the reviewer actually receives."""
+
+    def _review_phase(self):
+        return next(p for p in _load_sdlc_template()["phases"]
+                    if p["name"] == "Review")
+
+    def test_review_phase_prompt_contains_dissent(self):
+        prompt = self._review_phase()["prompt"].lower()
+        self.assertIn("independ", prompt)
+        self.assertIn("do not defer", prompt)
+
+    def test_reviewer_relay_prompt_contains_dissent(self):
+        tmpl = _load_sdlc_template()
+        phase = self._review_phase()
+        relay_prompt = build_relay_prompt(
+            session_name=tmpl["name"],
+            goal="dry-run the macro-flow",
+            phase_name=phase["name"],
+            phase_index=2,
+            total_phases=len(tmpl["phases"]),
+            role=phase["participants"][0],
+            instruction=phase["prompt"],
+            agent_base="codex",
+        )
+        low = relay_prompt.lower()
+        self.assertIn("independ", low)
+        self.assertIn("do not defer", low)
+
+
+class TestSdlcTemplateChannelIsolation(unittest.TestCase):
+    """Channel isolation: one active session per channel. Loads the real
+    template from disk via SessionStore."""
+
+    def _store(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        from session_store import SessionStore
+        return SessionStore(
+            str(Path(tmp.name) / "sessions.json"),
+            templates_dir=str(ROOT / "session_templates"),
+        )
+
+    def test_template_loads_from_disk(self):
+        store = self._store()
+        self.assertIsNotNone(store.get_template("sdlc-todo-widget"))
+
+    def test_one_active_session_per_channel(self):
+        store = self._store()
+        s1 = store.create("sdlc-todo-widget", "sdlc-dryrun", dict(_SDLC_CAST),
+                          started_by="user", goal="dry-run")
+        self.assertIsNotNone(s1)
+        # Second session on the SAME channel is refused.
+        s2 = store.create("sdlc-todo-widget", "sdlc-dryrun", dict(_SDLC_CAST),
+                          started_by="user", goal="dry-run")
+        self.assertIsNone(s2)
+        # A different channel is independently allowed.
+        s3 = store.create("sdlc-todo-widget", "sdlc-dryrun-2", dict(_SDLC_CAST),
+                          started_by="user", goal="dry-run")
+        self.assertIsNotNone(s3)
+
+
+class TestSdlcTemplateEngineFlow(unittest.TestCase):
+    """Drive the real SessionEngine through the 4-phase template using the
+    actual template dict (loaded from disk)."""
+
+    CHANNEL = "sdlc-dryrun"
+
+    def _make_engine(self):
+        from session_engine import SessionEngine
+        tmpl = _load_sdlc_template()
+        session = {
+            "id": 1,
+            "template_id": tmpl["id"],
+            "channel": self.CHANNEL,
+            "cast": dict(_SDLC_CAST),
+            "state": "waiting",
+            "current_phase": 0,
+            "current_turn": 0,
+        }
+        store = _RecordingSessionStore(
+            sessions=[session], templates={tmpl["id"]: tmpl},
+        )
+        messages = _FakeMessageStore()
+        trigger = _FakeAgentTrigger()
+        registry = _FakeRegistry({
+            "codex": {"name": "codex", "base": "codex"},
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+        })
+        engine = SessionEngine(store, messages, trigger, registry=registry)
+        return engine, store, messages, trigger
+
+    def _advance_with(self, engine, store, text, message_id):
+        session = store._sessions[0]
+        session["_last_msg"] = {"text": text, "id": message_id}
+        engine._advance(session, message_id)
+
+    def test_pass_completes_and_records_output_message_id(self):
+        engine, store, messages, trigger = self._make_engine()
+        # Phase 0 planner -> 1 build -> 2 review (productive, never verdict-parsed)
+        self._advance_with(engine, store, "Plan: steps + acceptance criteria", 10)
+        self._advance_with(engine, store, "Build: pseudo-code for the widget", 11)
+        self._advance_with(engine, store, "Review: looks complete, minor notes", 12)
+        # Phase 3 safety gate PASS
+        self._advance_with(engine, store, "PASS", 13)
+
+        self.assertEqual(len(store.interrupted), 0)
+        self.assertEqual(len(store.completed), 1)
+        # The gate phase is is_output -> the gate message id is recorded.
+        self.assertEqual(store.completed_output_ids[-1], 13)
+
+    def test_block_interrupts_and_posts_session_safety_block(self):
+        engine, store, messages, trigger = self._make_engine()
+        self._advance_with(engine, store, "Plan: steps", 10)
+        self._advance_with(engine, store, "Build: pseudo-code", 11)
+        self._advance_with(engine, store, "Review: notes", 12)
+        # Phase 3 safety gate BLOCK
+        self._advance_with(engine, store, "BLOCK: unsafe request", 13)
+
+        self.assertTrue(len(store.interrupted) > 0)
+        self.assertIn("BLOCK", store.interrupted[0]["reason"])
+        self.assertEqual(len(store.completed), 0)
+        block_msgs = [m for m in messages.added
+                      if m.get("type") == "session_safety_block"]
+        self.assertEqual(len(block_msgs), 1)
+
+    def test_productive_review_block_text_does_not_halt(self):
+        """codex in the reviewer (non-safety) role emitting text that looks like
+        a BLOCK must NOT halt — only the gate role is verdict-parsed."""
+        engine, store, messages, trigger = self._make_engine()
+        self._advance_with(engine, store, "Plan: steps", 10)
+        self._advance_with(engine, store, "Build: pseudo-code", 11)
+        # Reviewer prose that superficially looks like a verdict.
+        self._advance_with(engine, store, "BLOCK: my review prose, just analysis", 12)
+        # Should have advanced into the safety-gate phase, not interrupted.
+        self.assertEqual(len(store.interrupted), 0)
+        self.assertEqual(store._sessions[0]["current_phase"], 3)
+
+    def test_no_general_channel_leakage(self):
+        """Every message the engine posts during the flow stays on the session
+        channel — nothing leaks to #general."""
+        engine, store, messages, trigger = self._make_engine()
+        self._advance_with(engine, store, "Plan: steps", 10)
+        self._advance_with(engine, store, "Build: pseudo-code", 11)
+        self._advance_with(engine, store, "Review: notes", 12)
+        self._advance_with(engine, store, "BLOCK: unsafe request", 13)
+
+        self.assertTrue(len(messages.added) > 0)
+        for m in messages.added:
+            self.assertEqual(m.get("channel"), self.CHANNEL)
+            self.assertNotEqual(m.get("channel"), "general")
+
+
+class TestSdlcSafetyGateContentSelection(unittest.TestCase):
+    """The safety gate must review the immediately-preceding (reviewer) output,
+    scoped to the session channel — using the real MessageStore."""
+
+    def _make_engine(self):
+        from store import MessageStore
+        from session_engine import SessionEngine
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ms = MessageStore(str(Path(tmp.name) / "log.jsonl"))
+        eng = SessionEngine(MagicMock(), ms, MagicMock(), registry=None)
+        return eng, ms
+
+    def test_gate_reviews_reviewer_output(self):
+        eng, ms = self._make_engine()
+        ms.add("codex", "Plan: ordered steps", channel="sdlc-dryrun")
+        ms.add("codex", "Build: pseudo-code", channel="sdlc-dryrun")
+        ms.add("codex", "Review: required changes A and B", channel="sdlc-dryrun")
+        content = eng._get_last_turn_content({"id": 1}, "sdlc-dryrun")
+        self.assertEqual(content, "Review: required changes A and B")
+
+    def test_gate_content_is_channel_scoped(self):
+        eng, ms = self._make_engine()
+        ms.add("user", "general chatter", channel="general")
+        ms.add("codex", "Review: the reviewed artifact", channel="sdlc-dryrun")
+        content = eng._get_last_turn_content({"id": 1}, "sdlc-dryrun")
+        self.assertEqual(content, "Review: the reviewed artifact")
+
+
 if __name__ == "__main__":
     unittest.main()

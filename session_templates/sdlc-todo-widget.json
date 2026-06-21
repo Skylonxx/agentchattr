@@ -1,0 +1,34 @@
+{
+  "id": "sdlc-todo-widget",
+  "name": "SDLC Todo Widget (dry-run)",
+  "description": "Hypothetical Todo Widget SDLC dry-run: plan -> build -> review -> safety gate. Text only; no real repository, file, or tool is involved.",
+  "roles": ["planner", "developer", "reviewer", "safety_gate"],
+  "user_required": false,
+  "phases": [
+    {
+      "name": "Plan",
+      "participants": ["planner"],
+      "prompt": "Plan the hypothetical Todo Widget (add, complete, delete, persist). List ordered steps and acceptance criteria. Text only.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Build",
+      "participants": ["developer"],
+      "prompt": "Describe a hypothetical implementation of the planner's steps for the Todo Widget. Pseudo-code allowed. Text only; do not edit files.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Review",
+      "participants": ["reviewer"],
+      "prompt": "Independently review the developer output. Find gaps, risks, and required changes. Do not defer.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Safety Gate",
+      "participants": ["safety_gate"],
+      "prompt": "Boundary-check the reviewed artifact. First non-empty line must be exactly PASS or BLOCK: <reason>.",
+      "turn_order": "sequential",
+      "is_output": true
+    }
+  ]
+}

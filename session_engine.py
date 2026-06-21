@@ -187,12 +187,18 @@ class SessionEngine:
         Returns True if the session should be halted (BLOCK or malformed).
         Returns False if the verdict is PASS and the session should continue.
 
-        Product contract: the safety gate is enforced when EITHER the current
-        role is a safety-gate role, OR the responding agent is the dedicated
-        CodexSafe base. CodexSafe's sole purpose is safety gating, so any BLOCK
-        it emits halts the session regardless of the role it was cast into.
-        This is the conservative choice — it can only ever add halts, never
-        suppress them.
+        Product contract (role-scoped): the safety gate is enforced ONLY when
+        the current cast role is a safety-gate role (see _SAFETY_GATE_ROLES).
+        Enforcement follows the assigned ROLE, never the agent's identity:
+          - Any agent cast into a safety-gate role IS strictly verdict-parsed
+            (malformed/empty/mixed output auto-BLOCKs).
+          - CodexSafe cast into a NON-safety role is NOT verdict-parsed; its
+            output flows through as ordinary content.
+        The responding agent must still be relay-eligible for a relay verdict
+        to be parsed. Role-string matching is exact (case-insensitive): a role
+        name outside _SAFETY_GATE_ROLES — including near-misses such as
+        'safety-gate' — is NOT treated as a gate, so name the gate role
+        exactly (e.g. 'safety_gate').
         """
         expected_agent = self._get_expected_agent(session)
         if not expected_agent:
