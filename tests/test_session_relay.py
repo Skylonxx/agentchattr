@@ -3119,5 +3119,112 @@ class TestCodexSafeBlockPreventsClaudeDispatch(TestBlockHaltsDownstream):
         self.assertFalse(any("claude" in (t.get("agent") or "") for t in trigger.triggered))
 
 
+# ===========================================================================
+# Phase C — Canonical offline/mock dry-run validation. Ties the dry-run template
+# fixture's downstream prompt ("Reply exactly: CLAUDE_RELAY_JSON_OK") to a fully
+# mocked PASS path whose final relayed reply equals CLAUDE_RELAY_JSON_OK and
+# routes exactly once to relay-dryrun. No real Claude, no live session, no
+# subprocess, no activation. Closes the literal canonical-marker gap on top of
+# the existing TestClaudeRelay* / TestDryrun* coverage.
+# ===========================================================================
+
+_CANONICAL_DRYRUN_REPLY = "CLAUDE_RELAY_JSON_OK"
+
+
+class TestCanonicalDryrunPassPath(_RunClaudeRelayHarness):
+    """Mocked end-to-end: responder (claude_dryrun identity) returns the canonical
+    CLAUDE_RELAY_JSON_OK envelope; final reply is relayed verbatim, once, to
+    relay-dryrun only — never #general, never a real subprocess."""
+
+    def _canonical_proc(self):
+        return MagicMock(returncode=0,
+                         stdout=_claude_success_stdout(_CANONICAL_DRYRUN_REPLY),
+                         stderr=b"")
+
+    def test_downstream_prompt_matches_canonical_marker(self):
+        # The fixture's downstream prompt instructs the exact canonical reply.
+        phase = _DRYRUN_TEMPLATE_FIXTURE["phases"][0]
+        self.assertEqual(phase["prompt"], f"Reply exactly: {_CANONICAL_DRYRUN_REPLY}")
+
+    def test_final_reply_equals_canonical_marker(self):
+        relayed, sub_calls = self._run_once(activated=True, fake_proc=self._canonical_proc())
+        self.assertEqual(len(sub_calls), 1)              # mocked subprocess only
+        self.assertEqual(len(relayed), 1)               # routed exactly once
+        self.assertEqual(relayed[0]["text"], _CANONICAL_DRYRUN_REPLY)
+        self.assertEqual(relayed[0]["channel"], "relay-dryrun")
+        self.assertNotEqual(relayed[0]["channel"], "general")
+
+    def test_no_post_to_general_on_canonical_path(self):
+        relayed, _ = self._run_once(activated=True, fake_proc=self._canonical_proc())
+        self.assertFalse(any(r["channel"] == "general" for r in relayed))
+
+    def test_resolve_parses_result_strictly_to_canonical(self):
+        # resolve_claude_reply forwards .result ONLY (not the raw envelope).
+        out = resolve_claude_reply(
+            returncode=0, stdout=_success_envelope(_CANONICAL_DRYRUN_REPLY))
+        self.assertTrue(out.ok)
+        self.assertEqual(out.text, _CANONICAL_DRYRUN_REPLY)
+        self.assertNotIn("subtype", out.text)
+
+    def test_codexsafe_pass_verdict_would_advance_to_responder(self):
+        # The PASS leg: a clean CodexSafe verdict passes, and the fixture's
+        # safety gate is codexsafe (the sole verdict authority), so the session
+        # would advance to the claude_dryrun responder.
+        verdict = parse_safety_verdict("PASS")
+        self.assertTrue(verdict.passed)
+        self.assertEqual(_DRYRUN_CAST_FIXTURE["safety_gate"], "codexsafe")
+        self.assertEqual(_DRYRUN_CAST_FIXTURE["responder"], "claude_dryrun")
+
+
+class TestCanonicalDryrunFixtureSafety(unittest.TestCase):
+    """Explicit fixture-safety assertions required by the mock-harness gate:
+    the dry-run template/cast carry no file/git/shell/MCP/Target:* intent and no
+    Twinpet path; channel is relay-dryrun only."""
+
+    def test_fixture_prompt_has_no_unsafe_intent(self):
+        blob = " ".join([
+            _DRYRUN_TEMPLATE_FIXTURE["phases"][0]["prompt"],
+            _DRYRUN_TEMPLATE_FIXTURE["channel"],
+            _DRYRUN_TEMPLATE_FIXTURE["id"],
+            " ".join(_DRYRUN_CAST_FIXTURE.values()),
+        ]).lower()
+        for token in ("chat_send", "chat_read", "git", "shell", "subprocess",
+                      "--mcp", "mcp_config", "target:*", "--tools",
+                      "--dangerously", "rm -rf", "del "):
+            self.assertNotIn(token, blob, f"unsafe token leaked: {token}")
+
+    def test_fixture_has_no_twinpet_or_repo_path(self):
+        blob = " ".join([
+            str(_DRYRUN_TEMPLATE_FIXTURE), str(_DRYRUN_CAST_FIXTURE),
+        ]).lower()
+        self.assertNotIn("twinpet", blob)
+        self.assertNotIn("agentchattr\\repo", blob)
+        self.assertNotIn("agentchattr/repo", blob)
+
+    def test_channel_is_relay_dryrun_only(self):
+        self.assertEqual(_DRYRUN_TEMPLATE_FIXTURE["channel"], "relay-dryrun")
+        self.assertEqual(_DRYRUN_RELAY_META["channel"], "relay-dryrun")
+
+
+class TestDryrunRuntimeDormancyInvariants(unittest.TestCase):
+    """Production runtime stays dormant and the scratch root is the dedicated,
+    out-of-tree path the design specifies."""
+
+    def test_activation_default_is_false(self):
+        import wrapper
+        self.assertFalse(wrapper.CLAUDE_RELAY_ACTIVATED)
+
+    def test_scratch_root_is_exact_dedicated_path(self):
+        import wrapper
+        self.assertEqual(wrapper.CLAUDE_SCRATCH_ROOT,
+                         Path(r"C:\tools\agentchattr-relay-scratch\claude"))
+
+    def test_production_set_excludes_both_claude_identities(self):
+        from session_relay import RELAY_ELIGIBLE_AGENTS
+        self.assertEqual(RELAY_ELIGIBLE_AGENTS, frozenset({"codex", "codexsafe"}))
+        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+        self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
+
+
 if __name__ == "__main__":
     unittest.main()
