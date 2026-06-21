@@ -2060,5 +2060,384 @@ class TestNonRelayOutcomeRouting(_RunAgentExecHarness):
         self.assertEqual(relayed[0]["channel"], "general")
 
 
+# ===========================================================================
+# DORMANT Claude relay runner helpers (claude_relay.py) — pure unit tests.
+# Claude is NOT relay-eligible; these test the isolated helper contracts only.
+# No Claude process is spawned. No live sessions.
+# ===========================================================================
+
+from claude_relay import (
+    FORBIDDEN_CLAUDE_FLAGS,
+    MARKER_CLAUDE_ERROR,
+    MARKER_EXEC_ERROR,
+    MARKER_INVALID_JSON,
+    MARKER_NO_REPLY,
+    MARKER_PERMISSION_DENIED,
+    build_claude_child_env,
+    build_claude_command,
+    resolve_claude_reply,
+    scrub_evidence,
+    validate_scratch_cwd,
+)
+
+
+def _success_envelope(result="hello from claude", **over):
+    env = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": result,
+        "permission_denials": [],
+        "session_id": "abc-123",
+        "total_cost_usd": 0.01,
+    }
+    env.update(over)
+    return json.dumps(env)
+
+
+class TestClaudeCommandConstruction(unittest.TestCase):
+    def test_default_command_is_exactly_sealed(self):
+        cmd = build_claude_command()
+        self.assertEqual(cmd, [
+            "claude",
+            "-p",
+            "--output-format", "json",
+            "--input-format", "text",
+            "--tools", "",
+            "--strict-mcp-config",
+        ])
+
+    def test_includes_required_flags(self):
+        cmd = build_claude_command()
+        self.assertEqual(cmd[0], "claude")
+        self.assertIn("-p", cmd)
+        # paired flags
+        self.assertIn("--output-format", cmd)
+        self.assertEqual(cmd[cmd.index("--output-format") + 1], "json")
+        self.assertIn("--input-format", cmd)
+        self.assertEqual(cmd[cmd.index("--input-format") + 1], "text")
+        self.assertIn("--tools", cmd)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")  # empty tools value
+        self.assertIn("--strict-mcp-config", cmd)
+
+    def test_only_one_tools_flag(self):
+        """No repeated --tools is possible — sealed builder, single occurrence."""
+        cmd = build_claude_command()
+        self.assertEqual(cmd.count("--tools"), 1)
+        # the single --tools value is empty (no tools enabled)
+        self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+
+    def test_excludes_forbidden_flags(self):
+        cmd = build_claude_command()
+        for bad in ("--bare", "--mcp-config",
+                    "--dangerously-skip-permissions",
+                    "--allow-dangerously-skip-permissions"):
+            self.assertNotIn(bad, cmd)
+        # no prompt is ever appended as argv (delivered via stdin)
+        self.assertEqual(cmd[-1], "--strict-mcp-config")
+
+    def test_no_forbidden_or_targeting_token_anywhere(self):
+        """Belt-and-suspenders: no MCP/auth/permission/Target token in argv."""
+        cmd = build_claude_command()
+        joined = " ".join(cmd)
+        for token in ("--bare", "--mcp-config", "--dangerously-skip-permissions",
+                      "--allow-dangerously-skip-permissions", "Target:*",
+                      "ANTHROPIC_API_KEY", "--add-dir", "--allowedTools",
+                      "--permission-mode", "--settings", "--agents"):
+            self.assertNotIn(token, joined)
+
+    def test_builder_takes_no_arguments(self):
+        """The sealed builder has NO extension point. Passing any arg must fail
+        with TypeError — a caller cannot smuggle in extra argv at all."""
+        forbidden_attempts = (
+            ["--tools", "Bash"],            # re-enable tools
+            ["--tools", "Bash", "--tools", "Edit"],  # repeated --tools
+            ["--allowedTools", "Bash Edit"],  # tool alias
+            ["--mcp-config", "x.json"],     # MCP config
+            ["--bare"],                     # paid-API route
+            ["--dangerously-skip-permissions"],
+            ["--allow-dangerously-skip-permissions"],
+            ["--allowedTools", "Target:*"], # broad target
+            ["--settings", "ANTHROPIC_API_KEY=sk-ant-x"],  # auth-like arg
+            ["--add-dir", "C:/tools/agentchattr/repo"],    # cwd/project escape
+        )
+        for attempt in forbidden_attempts:
+            with self.subTest(attempt=attempt):
+                with self.assertRaises(TypeError):
+                    build_claude_command(extra_args=attempt)  # type: ignore[call-arg]
+                with self.assertRaises(TypeError):
+                    build_claude_command(*attempt)  # type: ignore[misc]
+
+    def test_returns_fresh_list_each_call(self):
+        """Mutating the returned list must not affect later calls."""
+        a = build_claude_command()
+        a.append("--tools")
+        a.append("Bash")
+        b = build_claude_command()
+        self.assertNotIn("Bash", b)
+        self.assertEqual(b.count("--tools"), 1)
+
+    def test_forbidden_set_contents(self):
+        self.assertIn("--bare", FORBIDDEN_CLAUDE_FLAGS)
+        self.assertIn("--mcp-config", FORBIDDEN_CLAUDE_FLAGS)
+
+
+class TestClaudeJsonCaptureMapping(unittest.TestCase):
+    def test_valid_success_forwards_result_only(self):
+        out = resolve_claude_reply(returncode=0, stdout=_success_envelope("the answer"))
+        self.assertTrue(out.ok)
+        self.assertEqual(out.text, "the answer")
+        # raw envelope kept as evidence but NOT as the reply
+        self.assertIn("subtype", out.evidence)
+        self.assertNotIn("subtype", out.text)
+
+    def test_invalid_json(self):
+        out = resolve_claude_reply(returncode=0, stdout="not json {{{")
+        self.assertFalse(out.ok)
+        self.assertEqual(out.text, MARKER_INVALID_JSON)
+        self.assertEqual(out.failure_kind, "invalid_json")
+
+    def test_non_object_json(self):
+        out = resolve_claude_reply(returncode=0, stdout="[1, 2, 3]")
+        self.assertEqual(out.text, MARKER_INVALID_JSON)
+
+    def test_empty_result(self):
+        out = resolve_claude_reply(returncode=0, stdout=_success_envelope(""))
+        self.assertEqual(out.text, MARKER_NO_REPLY)
+        self.assertEqual(out.failure_kind, "empty_result")
+
+    def test_whitespace_result_is_no_reply(self):
+        out = resolve_claude_reply(returncode=0, stdout=_success_envelope("   \n  "))
+        self.assertEqual(out.text, MARKER_NO_REPLY)
+
+    def test_missing_result_key(self):
+        env = json.dumps({"subtype": "success", "is_error": False})
+        out = resolve_claude_reply(returncode=0, stdout=env)
+        self.assertEqual(out.text, MARKER_NO_REPLY)
+
+    def test_is_error_true(self):
+        out = resolve_claude_reply(returncode=0, stdout=_success_envelope(is_error=True))
+        self.assertEqual(out.text, MARKER_CLAUDE_ERROR)
+        self.assertEqual(out.failure_kind, "claude_error")
+
+    def test_bad_subtype(self):
+        out = resolve_claude_reply(
+            returncode=0, stdout=_success_envelope(subtype="error_max_turns"))
+        self.assertEqual(out.text, MARKER_CLAUDE_ERROR)
+        self.assertEqual(out.failure_kind, "bad_subtype")
+
+    def test_permission_denials_non_empty(self):
+        out = resolve_claude_reply(
+            returncode=0,
+            stdout=_success_envelope(permission_denials=[{"tool": "Bash"}]))
+        self.assertEqual(out.text, MARKER_PERMISSION_DENIED)
+        self.assertEqual(out.failure_kind, "permission_denied")
+
+    def test_nonzero_exit(self):
+        out = resolve_claude_reply(returncode=2, stdout=_success_envelope())
+        self.assertEqual(out.text, "[failed (exit 2)]")
+        self.assertEqual(out.failure_kind, "nonzero_exit")
+
+    def test_timeout(self):
+        out = resolve_claude_reply(timed_out=True, timeout_secs=120)
+        self.assertEqual(out.text, "[timed out after 120s]")
+        self.assertEqual(out.failure_kind, "timeout")
+
+    def test_exec_error(self):
+        out = resolve_claude_reply(errored=True)
+        self.assertEqual(out.text, MARKER_EXEC_ERROR)
+        self.assertEqual(out.failure_kind, "exec_error")
+
+    def test_stderr_with_success_preserves_reply_and_warns(self):
+        out = resolve_claude_reply(
+            returncode=0, stdout=_success_envelope("ok"), stderr="some warning")
+        self.assertTrue(out.ok)
+        self.assertEqual(out.text, "ok")
+        self.assertIsNotNone(out.stderr_warning)
+        self.assertIn("some warning", out.stderr_warning)
+
+    def test_precedence_timeout_beats_nonzero_and_json(self):
+        out = resolve_claude_reply(
+            timed_out=True, returncode=2, stdout="not json", timeout_secs=30)
+        self.assertEqual(out.text, "[timed out after 30s]")
+
+    def test_evidence_is_bounded_and_scrubs_secret(self):
+        leaky = json.dumps({"subtype": "success", "is_error": False,
+                            "result": "x", "note": "sk-ant-SECRETKEY123"})
+        out = resolve_claude_reply(returncode=0, stdout=leaky)
+        self.assertNotIn("sk-ant-SECRETKEY123", out.evidence)
+        self.assertIn("[REDACTED]", out.evidence)
+
+    def test_scrub_evidence_bounds_length(self):
+        big = "a" * 5000
+        ev = scrub_evidence(big, bound=100)
+        self.assertLess(len(ev), 200)
+        self.assertIn("truncated", ev)
+
+    def test_traceback_result_is_neutral_not_codex(self):
+        out = resolve_claude_reply(
+            returncode=0, stdout=_success_envelope("Traceback (most recent call last): boom"))
+        self.assertTrue(out.text.startswith("[claude error:"))
+        self.assertNotIn("codex", out.text.lower())
+
+
+class TestClaudeChildEnvStripping(unittest.TestCase):
+    def test_strips_mcp_and_anthropic(self):
+        base = {
+            "PATH": "/usr/bin",
+            "MCP_SERVER_URL": "http://127.0.0.1:8201/sse",
+            "MCP_TOKEN": "secret",
+            "ANTHROPIC_API_KEY": "sk-ant-xxx",
+            "ANTHROPIC_BASE_URL": "https://api",
+            "HOME": "/home/u",
+        }
+        env = build_claude_child_env(base)
+        self.assertIn("PATH", env)
+        self.assertIn("HOME", env)
+        self.assertNotIn("MCP_SERVER_URL", env)
+        self.assertNotIn("MCP_TOKEN", env)
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertNotIn("ANTHROPIC_BASE_URL", env)
+
+    def test_strips_known_server_auth_vars(self):
+        base = {
+            "GEMINI_CLI_SYSTEM_SETTINGS_PATH": "/x",
+            "KILO_CONFIG_CONTENT": "{}",
+            "SOMETHING_MCP_PROXY": "http://x",
+            "KEEP_ME": "1",
+        }
+        env = build_claude_child_env(base)
+        self.assertNotIn("GEMINI_CLI_SYSTEM_SETTINGS_PATH", env)
+        self.assertNotIn("KILO_CONFIG_CONTENT", env)
+        self.assertNotIn("SOMETHING_MCP_PROXY", env)  # contains MCP
+        self.assertIn("KEEP_ME", env)
+
+    def test_does_not_mutate_input(self):
+        base = {"MCP_X": "1", "PATH": "/bin"}
+        build_claude_child_env(base)
+        self.assertIn("MCP_X", base)  # original untouched
+
+    def test_never_injects_api_key(self):
+        env = build_claude_child_env({"PATH": "/bin"})
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+
+class TestClaudeScratchValidator(unittest.TestCase):
+    def _mkdir(self):
+        d = Path(tempfile.mkdtemp(prefix="claude-scratch-"))
+        self.addCleanup(self._rm, d)
+        return d
+
+    @staticmethod
+    def _rm(d):
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+    def test_empty_dir_passes(self):
+        d = self._mkdir()
+        self.assertTrue(validate_scratch_cwd(d).ok)
+
+    def test_only_ownership_marker_passes(self):
+        d = self._mkdir()
+        (d / ".agentchattr-relay-scratch").write_text("owned")
+        self.assertTrue(validate_scratch_cwd(d).ok)
+
+    def test_rejects_mcp_json(self):
+        d = self._mkdir()
+        (d / ".mcp.json").write_text("{}")
+        res = validate_scratch_cwd(d)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.rejected_entry, ".mcp.json")
+
+    def test_rejects_dot_claude(self):
+        d = self._mkdir()
+        (d / ".claude").mkdir()
+        res = validate_scratch_cwd(d)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.rejected_entry, ".claude")
+
+    def test_rejects_dot_git(self):
+        d = self._mkdir()
+        (d / ".git").mkdir()
+        res = validate_scratch_cwd(d)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.rejected_entry, ".git")
+
+    def test_rejects_repo_path(self):
+        d = self._mkdir()
+        res = validate_scratch_cwd(d, repo_path=d)
+        self.assertFalse(res.ok)
+        self.assertIn("agentchattr repo", res.reason)
+
+    def test_rejects_twinpet_path(self):
+        d = self._mkdir()
+        res = validate_scratch_cwd(d, twinpet_path=d)
+        self.assertFalse(res.ok)
+        self.assertIn("twinpet", res.reason)
+
+    def test_rejects_user_home(self):
+        d = self._mkdir()
+        res = validate_scratch_cwd(d, home_path=d)
+        self.assertFalse(res.ok)
+        self.assertIn("home", res.reason)
+
+    def test_rejects_dir_inside_repo(self):
+        repo = self._mkdir()
+        child = repo / "scratch"
+        child.mkdir()
+        res = validate_scratch_cwd(child, repo_path=repo)
+        self.assertFalse(res.ok)
+
+    def test_rejects_polluted_dir(self):
+        d = self._mkdir()
+        (d / "stale_output.txt").write_text("junk")
+        res = validate_scratch_cwd(d)
+        self.assertFalse(res.ok)
+        self.assertIn("polluted", res.reason)
+
+    def test_rejects_log_artifact(self):
+        d = self._mkdir()
+        (d / "run.log").write_text("x")
+        res = validate_scratch_cwd(d)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.rejected_entry, "run.log")
+
+    def test_rejects_config_toml(self):
+        d = self._mkdir()
+        (d / "config.toml").write_text("x")
+        res = validate_scratch_cwd(d)
+        self.assertFalse(res.ok)
+
+    def test_rejects_missing_path(self):
+        res = validate_scratch_cwd(Path(tempfile.gettempdir()) / "no-such-dir-xyz-123")
+        self.assertFalse(res.ok)
+
+
+class TestClaudeSafetyIsolation(unittest.TestCase):
+    def test_claude_not_relay_eligible(self):
+        self.assertFalse(is_relay_eligible("claude"))
+        self.assertFalse(is_relay_eligible("Claude"))
+
+    def test_relay_eligible_set_unchanged(self):
+        from session_relay import RELAY_ELIGIBLE_AGENTS
+        self.assertEqual(RELAY_ELIGIBLE_AGENTS, frozenset({"codex", "codexsafe"}))
+
+    def test_claude_reply_is_not_a_safety_verdict(self):
+        """A Claude success reply of 'PASS' must NOT be interpretable as a gate
+        verdict by anything in claude_relay — it is just reply text."""
+        out = resolve_claude_reply(returncode=0, stdout=_success_envelope("PASS"))
+        self.assertTrue(out.ok)
+        self.assertEqual(out.text, "PASS")
+        # claude_relay exposes no verdict parser; safety stays in session_relay.
+        import claude_relay
+        self.assertFalse(hasattr(claude_relay, "parse_safety_verdict"))
+
+    def test_claude_error_does_not_become_pass(self):
+        """A malformed Claude turn fails closed; it can never read as PASS."""
+        out = resolve_claude_reply(returncode=0, stdout="garbage")
+        self.assertFalse(out.ok)
+        self.assertTrue(out.text.startswith("[failed"))
+
+
 if __name__ == "__main__":
     unittest.main()
