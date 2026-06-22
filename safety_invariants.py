@@ -574,6 +574,44 @@ def resolve_role_agent(role, roster):
     return agent
 
 
+# Authoring roles that must never share an identity with the reviewer role
+# (self-review collapse). Covers the coordinator family, the external "developer"
+# role, and the shipped session-template authoring roles ("builder", "implementer").
+# These are matched (case-insensitive) against the reviewer family by the session
+# cast guard.
+AUTHORING_ROLES = frozenset({
+    "coordinator", "codex_coordinator", "workflow_coordinator",
+    "developer", "builder", "implementer",
+})
+# Backward-compatible alias (subset retained for any external reference).
+DEVELOPER_ROLES = frozenset({"developer"})
+
+
+def check_session_cast(cast, role_to_identity=None) -> InvariantResult:
+    """Fail-closed RBAC guard for a session cast (INV-003 + INV-007).
+
+    Enforces, vocabulary-agnostically (no roster lookup, so it never conflates
+    external roster roles with session-template casting):
+      * no safety-mechanism identity (codexsafe) may occupy a non-safety-gate role
+        (INV-003); and
+      * no single identity may hold both an authoring role (coordinator family,
+        developer, or a shipped session-template authoring role such as ``builder``)
+        and the reviewer role — self-review collapse (INV-007).
+
+    ``cast`` is a role->agent mapping (used base-resolved for the codexsafe check).
+    ``role_to_identity`` (role->stable identity) is used for the self-review check;
+    it defaults to ``cast`` when not supplied.
+    """
+    cb = check_codexsafe_boundary_only(cast if isinstance(cast, dict) else {})
+    if not cb.ok:
+        return cb
+    rti = role_to_identity if role_to_identity is not None else cast
+    sr = validate_no_self_review(rti, coordinator_roles=AUTHORING_ROLES)
+    if not sr.ok:
+        return _fail("INV-007", sr.reason, (getattr(sr, "identity", None),))
+    return _ok("INV-007")
+
+
 def check_role_capability(role, capability, agent=None) -> InvariantResult:
     """Capability = f(role, agent) with role evaluated first (INV-019).
 

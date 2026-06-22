@@ -169,16 +169,28 @@ class SessionEngine:
             log.warning("Session start refused (safety-role guard): %s", guard.reason)
             return None
 
-        # Anti-self-review guard (fail-closed): the workflow coordinator and the
-        # independent reviewer must be SEPARATE runtime identities. Resolve each
-        # cast agent to a stable identity token so the same live instance (or the
-        # legacy ``codex`` base used twice) cannot occupy both roles.
+        # RBAC cast guard (fail-closed). Delegates to the centralized validators in
+        # safety_invariants (lazy import avoids the module import cycle). Enforces:
+        #   * codexsafe stays boundary-only — it may never be cast into a non-safety
+        #     workflow role (INV-003); and
+        #   * no agent may be both an authoring role and the reviewer role —
+        #     self-review collapse (INV-007). Authoring roles are centralized in
+        #     safety_invariants.AUTHORING_ROLES (coordinator family, developer,
+        #     and shipped session-template roles such as builder and implementer),
+        #     covering the legacy single-``codex`` reuse.
+        # Bases are resolved for the codexsafe check and stable identities for the
+        # self-review check, so renamed instances are still caught. This is
+        # vocabulary-agnostic: it does NOT map session roles to the external roster,
+        # so the internal codex_coordinator/codex_reviewer split is preserved.
+        role_to_base = {role: self._get_agent_base(agent)
+                        for role, agent in (cast or {}).items()}
         role_to_identity = {role: self._self_review_identity(agent)
                             for role, agent in (cast or {}).items()}
-        sr_guard = validate_no_self_review(role_to_identity)
-        if not sr_guard.ok:
-            log.warning("Session start refused (anti-self-review guard): %s",
-                        sr_guard.reason)
+        from safety_invariants import check_session_cast
+        cast_guard = check_session_cast(role_to_base, role_to_identity=role_to_identity)
+        if not cast_guard.ok:
+            log.warning("Session start refused (RBAC cast guard %s): %s",
+                        cast_guard.code, cast_guard.reason)
             return None
 
         session = self._store.create(

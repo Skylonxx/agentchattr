@@ -243,6 +243,74 @@ class AntiSelfReviewSessionTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 4b-RBAC. Session-engine RBAC cast guard adoption (INV-003 + INV-007)
+# ---------------------------------------------------------------------------
+
+class SessionEngineRbacCastGuardTests(unittest.TestCase):
+    def _engine(self):
+        store = _FakeStore()
+        engine = SessionEngine(store, _FakeMessages(), _FakeTrigger(), registry=None)
+        return engine, store
+
+    def test_codexsafe_as_reviewer_refused(self):
+        # codexsafe (safety mechanism) must never be cast into a workflow role.
+        engine, store = self._engine()
+        result = engine.start_session(
+            template_id="t", channel="general",
+            cast={"reviewer": "codexsafe"}, started_by="ben",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(store.created, [])
+
+    def test_codexsafe_in_safety_gate_role_allowed(self):
+        engine, store = self._engine()
+        result = engine.start_session(
+            template_id="t", channel="general",
+            cast={"safety_gate": "codexsafe", "coordinator": "codex_coordinator"},
+            started_by="ben",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(store.created), 1)
+
+    def test_developer_reviewer_collapse_refused(self):
+        engine, store = self._engine()
+        result = engine.start_session(
+            template_id="t", channel="general",
+            cast={"developer": "codex", "reviewer": "codex"}, started_by="ben",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(store.created, [])
+
+    def test_builder_reviewer_collapse_refused(self):
+        # code-review.json vocabulary: builder (authoring) + reviewer same identity.
+        engine, store = self._engine()
+        result = engine.start_session(
+            template_id="t", channel="general",
+            cast={"builder": "codex", "reviewer": "codex"}, started_by="ben",
+        )
+        self.assertIsNone(result)
+        self.assertEqual(store.created, [])
+
+    def test_builder_and_reviewer_distinct_allowed(self):
+        engine, store = self._engine()
+        result = engine.start_session(
+            template_id="t", channel="general",
+            cast={"builder": "claude", "reviewer": "codex"}, started_by="ben",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(store.created), 1)
+
+    def test_developer_and_reviewer_distinct_allowed(self):
+        engine, store = self._engine()
+        result = engine.start_session(
+            template_id="t", channel="general",
+            cast={"developer": "claude", "reviewer": "codex"}, started_by="ben",
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(len(store.created), 1)
+
+
+# ---------------------------------------------------------------------------
 # 4c. Reviewer PASS is not commit authorization
 # ---------------------------------------------------------------------------
 

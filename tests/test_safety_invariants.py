@@ -468,5 +468,63 @@ class RolePromptTests(unittest.TestCase):
         self.assertFalse(si.check_immutable_role_prompt(good, "overlord").ok)
 
 
+# INV-003 + INV-007 (session cast guard)
+class SessionCastGuardTests(unittest.TestCase):
+    def test_clean_cast_passes(self):
+        self.assertTrue(si.check_session_cast(
+            {"coordinator": "codex_coordinator", "reviewer": "codex_reviewer",
+             "developer": "claude"}).ok)
+
+    def test_codexsafe_as_workflow_role_rejected(self):
+        r = si.check_session_cast({"reviewer": "codexsafe"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-003")
+
+    def test_codexsafe_in_safety_gate_role_allowed(self):
+        self.assertTrue(si.check_session_cast({"safety_gate": "codexsafe"}).ok)
+
+    def test_coordinator_reviewer_collapse_rejected(self):
+        r = si.check_session_cast({"coordinator": "codex", "reviewer": "codex"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-007")
+
+    def test_developer_reviewer_collapse_rejected(self):
+        r = si.check_session_cast({"developer": "claude", "reviewer": "claude"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-007")
+
+    def test_developer_and_reviewer_distinct_allowed(self):
+        self.assertTrue(si.check_session_cast(
+            {"developer": "claude", "reviewer": "codex"}).ok)
+
+    def test_builder_reviewer_collapse_rejected(self):
+        # code-review.json uses builder as the authoring role and reviewer as review.
+        r = si.check_session_cast({"builder": "codex", "reviewer": "codex"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-007")
+
+    def test_builder_and_reviewer_distinct_allowed(self):
+        self.assertTrue(si.check_session_cast(
+            {"builder": "claude", "reviewer": "codex"}).ok)
+
+    def test_builder_synthesiser_sharing_allowed(self):
+        # Non-review authoring/output roles may share an identity.
+        self.assertTrue(si.check_session_cast(
+            {"builder": "codex", "synthesiser": "codex"}).ok)
+
+    def test_implementer_reviewer_collapse_rejected(self):
+        r = si.check_session_cast({"implementer": "codex", "reviewer": "codex"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-007")
+
+    def test_separate_role_to_identity_used_for_self_review(self):
+        # cast names differ but resolved identities collide -> rejected.
+        r = si.check_session_cast(
+            {"developer": "claude-1", "reviewer": "claude-2"},
+            role_to_identity={"developer": "id-x", "reviewer": "id-x"})
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-007")
+
+
 if __name__ == "__main__":
     unittest.main()
