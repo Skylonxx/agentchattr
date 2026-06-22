@@ -437,10 +437,7 @@ class WrapperStartupGuardTests(unittest.TestCase):
         self.assertTrue(si.check_run_mode_known("tui").ok)
 
     def test_secret_like_run_mode_not_echoed_in_error(self):
-        import io
-        import contextlib
-        # Simulate the exact error path wrapper.main() uses: generic safe wording,
-        # never the raw run_mode value. A secret-like value must not appear in output.
+        from wrapper import format_run_mode_guard_error
         secrets = [
             "ghp_FAKE_SECRET_TOKEN_1234567890",
             "sk-FAKESECRET1234567890",
@@ -450,16 +447,19 @@ class WrapperStartupGuardTests(unittest.TestCase):
             with self.subTest(secret_mode=secret_mode):
                 guard = si.check_run_mode_known(secret_mode)
                 self.assertFalse(guard.ok, "secret-like run_mode must fail closed")
-                # Reproduce the wrapper error output (same two lines as wrapper.main)
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    print(f"  Error ({guard.code}): invalid or unknown run_mode")
-                    print(f"  Valid run modes: {', '.join(sorted(si.KNOWN_RUN_MODES))}")
-                output = buf.getvalue()
+                output = format_run_mode_guard_error(guard.code)
                 self.assertIn("INV-011", output)
                 self.assertIn("invalid or unknown run_mode", output)
                 self.assertNotIn(secret_mode, output,
                                  f"raw secret-like value must not appear in error output")
+
+    def test_format_run_mode_guard_error_matches_runtime(self):
+        from wrapper import format_run_mode_guard_error
+        output = format_run_mode_guard_error("INV-011")
+        self.assertIn("INV-011", output)
+        self.assertIn("invalid or unknown run_mode", output)
+        for mode in sorted(si.KNOWN_RUN_MODES):
+            self.assertIn(mode, output)
 
 
 if __name__ == "__main__":

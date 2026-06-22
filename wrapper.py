@@ -32,6 +32,23 @@ SERVER_NAME = "agentchattr"
 
 
 # ---------------------------------------------------------------------------
+# run_mode guard error formatter (INV-011, secret-safe)
+# ---------------------------------------------------------------------------
+
+def format_run_mode_guard_error(code: str) -> str:
+    """Format the secret-safe error message for a failed run_mode guard.
+
+    Used by wrapper.main() and tests so both call the same formatter.
+    Never includes the raw configured value.
+    """
+    from safety_invariants import KNOWN_RUN_MODES
+    return (
+        f"  Error ({code}): invalid or unknown run_mode\n"
+        f"  Valid run modes: {', '.join(sorted(KNOWN_RUN_MODES))}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Per-instance provider config
 # ---------------------------------------------------------------------------
 
@@ -1807,11 +1824,10 @@ def main():
     # INV-011: unknown run_mode must fail closed — never silently fall through
     # to an unintended dispatch path. Missing run_mode defaults to "tui" above
     # (least-privilege); an explicit but unrecognised value is rejected here.
-    from safety_invariants import check_run_mode_known, KNOWN_RUN_MODES
+    from safety_invariants import check_run_mode_known
     _rm_guard = check_run_mode_known(run_mode)
     if not _rm_guard.ok:
-        print(f"  Error ({_rm_guard.code}): invalid or unknown run_mode")
-        print(f"  Valid run modes: {', '.join(sorted(KNOWN_RUN_MODES))}")
+        print(format_run_mode_guard_error(_rm_guard.code))
         sys.exit(1)
     unix_session_name = f"agentchattr-{assigned_name}"
     _exec_running = [False]
