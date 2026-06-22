@@ -1493,6 +1493,17 @@ def main():
     apply_cli_overrides()
     config = load_config(ROOT)
 
+    # INV-017: validate roster integrity at startup (fail closed on invalid).
+    # Deferred from load_config (shared startup path) to the wrapper boundary.
+    _roster = config.get("roster")
+    if _roster:
+        from safety_invariants import check_roster_roles
+        _roster_guard = check_roster_roles(
+            _roster, known_agents=set(config.get("agents", {}).keys()))
+        if not _roster_guard.ok:
+            print(f"  Error ({_roster_guard.code}): {_roster_guard.reason}")
+            sys.exit(1)
+
     agent_names = list(config.get("agents", {}).keys())
 
     parser = argparse.ArgumentParser(description="Agent wrapper with chat auto-trigger")
@@ -1793,6 +1804,15 @@ def main():
 
     _agent_pid = [None]
     run_mode = agent_cfg.get("run_mode", "tui")
+    # INV-011: unknown run_mode must fail closed — never silently fall through
+    # to an unintended dispatch path. Missing run_mode defaults to "tui" above
+    # (least-privilege); an explicit but unrecognised value is rejected here.
+    from safety_invariants import check_run_mode_known, KNOWN_RUN_MODES
+    _rm_guard = check_run_mode_known(run_mode)
+    if not _rm_guard.ok:
+        print(f"  Error ({_rm_guard.code}): invalid or unknown run_mode")
+        print(f"  Valid run modes: {', '.join(sorted(KNOWN_RUN_MODES))}")
+        sys.exit(1)
     unix_session_name = f"agentchattr-{assigned_name}"
     _exec_running = [False]
 

@@ -396,5 +396,71 @@ class QueueWatcherDirectMentionContractTests(unittest.TestCase):
         self.assertNotIn("[IMMUTABLE ROLE:", relay)
 
 
+# ---------------------------------------------------------------------------
+# Wrapper startup guard wiring (INV-011 + INV-017)
+# ---------------------------------------------------------------------------
+
+class WrapperStartupGuardTests(unittest.TestCase):
+    """Verify wrapper startup guards are wired and real config conforms."""
+
+    def test_wrapper_source_has_run_mode_guard(self):
+        src = (ROOT / "wrapper.py").read_text("utf-8")
+        self.assertIn("check_run_mode_known", src,
+                       "wrapper.py must call check_run_mode_known (INV-011)")
+
+    def test_wrapper_source_has_roster_guard(self):
+        src = (ROOT / "wrapper.py").read_text("utf-8")
+        self.assertIn("check_roster_roles", src,
+                       "wrapper.py must call check_roster_roles (INV-017)")
+
+    def test_all_agents_pass_run_mode_startup_guard(self):
+        config = _load_config()
+        for name, cfg in config["agents"].items():
+            run_mode = cfg.get("run_mode", "tui")
+            with self.subTest(agent=name, run_mode=run_mode):
+                self.assertTrue(si.check_run_mode_known(run_mode).ok)
+
+    def test_roster_passes_startup_guard(self):
+        config = _load_config()
+        roster = config.get("roster")
+        self.assertIsNotNone(roster, "config.toml must have a [roster] block")
+        agents = set(config["agents"].keys())
+        r = si.check_roster_roles(roster, known_agents=agents)
+        self.assertTrue(r.ok, getattr(r, "reason", ""))
+
+    def test_unknown_run_mode_rejected_at_startup(self):
+        self.assertFalse(si.check_run_mode_known("yolo_full_access").ok)
+        self.assertFalse(si.check_run_mode_known("daemon").ok)
+        self.assertFalse(si.check_run_mode_known("full_access").ok)
+
+    def test_missing_run_mode_defaults_to_tui_and_passes(self):
+        self.assertTrue(si.check_run_mode_known("tui").ok)
+
+    def test_secret_like_run_mode_not_echoed_in_error(self):
+        import io
+        import contextlib
+        # Simulate the exact error path wrapper.main() uses: generic safe wording,
+        # never the raw run_mode value. A secret-like value must not appear in output.
+        secrets = [
+            "ghp_FAKE_SECRET_TOKEN_1234567890",
+            "sk-FAKESECRET1234567890",
+            "PAT_FAKE_SECRET_VALUE",
+        ]
+        for secret_mode in secrets:
+            with self.subTest(secret_mode=secret_mode):
+                guard = si.check_run_mode_known(secret_mode)
+                self.assertFalse(guard.ok, "secret-like run_mode must fail closed")
+                # Reproduce the wrapper error output (same two lines as wrapper.main)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    print(f"  Error ({guard.code}): invalid or unknown run_mode")
+                    print(f"  Valid run modes: {', '.join(sorted(si.KNOWN_RUN_MODES))}")
+                output = buf.getvalue()
+                self.assertIn("INV-011", output)
+                self.assertIn("invalid or unknown run_mode", output)
+                self.assertNotIn(secret_mode, output,
+                                 f"raw secret-like value must not appear in error output")
+
+
 if __name__ == "__main__":
     unittest.main()
