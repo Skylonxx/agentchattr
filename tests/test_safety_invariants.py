@@ -287,5 +287,186 @@ class PushPreconditionTests(unittest.TestCase):
         self.assertFalse(si.check_push_preconditions(clean_tree=True, fast_forward=True, behind=2).ok)
 
 
+# INV-016
+class CodexExecArgsTests(unittest.TestCase):
+    def test_none_ok(self):
+        self.assertTrue(si.validate_codex_exec_args(None).ok)
+
+    def test_default_safe_args_pass(self):
+        self.assertTrue(si.validate_codex_exec_args(
+            ["--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "-o", "out.txt"]).ok)
+
+    def test_sandbox_workspace_write_rejected(self):
+        r = si.validate_codex_exec_args(["--sandbox", "workspace-write"])
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-016")
+
+    def test_novel_unknown_flag_rejected(self):
+        # Not in any denylist, but not allowlisted -> must fail closed.
+        for novel in (["--new-flag"], ["--experimental"], ["--cd", "/etc"]):
+            with self.subTest(novel=novel):
+                r = si.validate_codex_exec_args(novel)
+                self.assertFalse(r.ok)
+                self.assertEqual(r.code, "INV-016")
+
+    def test_dangerous_flags_rejected(self):
+        for bad in (["--dangerously-bypass-approvals-and-sandbox"], ["--danger-full-access"],
+                    ["--yolo"], ["--skip-permissions"], ["--auto-approve"], ["--workspace-write"]):
+            with self.subTest(bad=bad):
+                self.assertFalse(si.validate_codex_exec_args(bad).ok)
+
+    def test_value_flag_without_value_fails(self):
+        self.assertFalse(si.validate_codex_exec_args(["--sandbox"]).ok)
+
+    def test_non_list_fails_closed(self):
+        self.assertFalse(si.validate_codex_exec_args("--sandbox read-only").ok)
+
+
+# INV-017
+class RosterTests(unittest.TestCase):
+    KNOWN = {"claude", "codex", "agy", "codex_coordinator", "codex_reviewer", "codexsafe"}
+
+    def _valid(self):
+        return {
+            "developer": "claude", "reviewer": "codex", "ui_lead": "agy",
+            "runtime_coordinator": "codex_coordinator",
+            "runtime_reviewer": "codex_reviewer", "safety_guard": "codexsafe",
+        }
+
+    def test_valid_roster_passes(self):
+        self.assertTrue(si.check_roster_roles(self._valid(), known_agents=self.KNOWN).ok)
+
+    def test_empty_roster_fails(self):
+        self.assertFalse(si.check_roster_roles({}, known_agents=self.KNOWN).ok)
+
+    def test_unknown_role_fails(self):
+        r = si.check_roster_roles({"overlord": "claude"}, known_agents=self.KNOWN)
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-017")
+
+    def test_missing_agent_fails(self):
+        roster = self._valid()
+        roster["developer"] = "ghostmodel"
+        self.assertFalse(si.check_roster_roles(roster, known_agents=self.KNOWN).ok)
+
+    def test_safety_guard_must_be_codexsafe(self):
+        roster = self._valid()
+        roster["safety_guard"] = "codex"
+        r = si.check_roster_roles(roster, known_agents=self.KNOWN)
+        self.assertFalse(r.ok)
+
+    def test_codexsafe_as_developer_rejected(self):
+        roster = self._valid()
+        roster["developer"] = "codexsafe"
+        r = si.check_roster_roles(roster, known_agents=self.KNOWN)
+        self.assertFalse(r.ok)
+        # external drift OR persona — both are violations; assert it fails.
+        self.assertIn(r.code, ("INV-003", "INV-017"))
+
+    def test_external_role_drift_rejected(self):
+        roster = self._valid()
+        roster["developer"] = "codex"  # developer must be claude
+        self.assertFalse(si.check_roster_roles(roster, known_agents=self.KNOWN).ok)
+
+    def test_developer_reviewer_collapse_rejected(self):
+        roster = {"developer": "claude", "reviewer": "claude"}
+        # reviewer must be codex anyway; this also trips the self-review guard
+        self.assertFalse(si.check_roster_roles(roster).ok)
+
+    def test_resolve_role_agent(self):
+        roster = self._valid()
+        self.assertEqual(si.resolve_role_agent("developer", roster), "claude")
+        self.assertEqual(si.resolve_role_agent("reviewer", roster), "codex")
+        self.assertIsNone(si.resolve_role_agent("overlord", roster))
+        self.assertIsNone(si.resolve_role_agent("developer", {}))
+
+
+# INV-019
+class RoleCapabilityTests(unittest.TestCase):
+    def test_developer_can_implement_commit_push(self):
+        for cap in ("implement", "commit", "push", "edit_files"):
+            self.assertTrue(si.check_role_capability("developer", cap).ok)
+
+    def test_developer_cannot_review(self):
+        # Developer must not hold FORMAL review authority (no self-review).
+        r = si.check_role_capability("developer", "review")
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-019")
+
+    def test_developer_can_prepare_review_package(self):
+        # Non-authoritative package preparation is allowed.
+        self.assertTrue(si.check_role_capability("developer", "prepare_review_package").ok)
+
+    def test_reviewer_cannot_implement_commit_push(self):
+        for cap in ("implement", "commit", "push", "edit_files", "shell"):
+            with self.subTest(cap=cap):
+                r = si.check_role_capability("reviewer", cap)
+                self.assertFalse(r.ok)
+                self.assertEqual(r.code, "INV-019")
+
+    def test_reviewer_can_review(self):
+        self.assertTrue(si.check_role_capability("reviewer", "review").ok)
+
+    def test_reviewer_is_only_role_with_formal_review(self):
+        # Formal "review" authority belongs to reviewer ONLY.
+        for role in ("developer", "ui_lead", "safety_guard",
+                     "runtime_coordinator", "runtime_reviewer"):
+            with self.subTest(role=role):
+                self.assertFalse(si.check_role_capability(role, "review").ok)
+        self.assertTrue(si.check_role_capability("reviewer", "review").ok)
+
+    def test_ui_lead_can_ui_review_but_not_formal_review(self):
+        self.assertTrue(si.check_role_capability("ui_lead", "ui_review").ok)
+        self.assertFalse(si.check_role_capability("ui_lead", "review").ok)
+
+    def test_ui_lead_cannot_shell_mcp_subagent(self):
+        for cap in ("shell", "mcp", "subagent", "edit_files", "commit"):
+            with self.subTest(cap=cap):
+                self.assertFalse(si.check_role_capability("ui_lead", cap).ok)
+
+    def test_safety_guard_only_verdict(self):
+        self.assertTrue(si.check_role_capability("safety_guard", "safety_verdict", agent="codexsafe").ok)
+        self.assertFalse(si.check_role_capability("safety_guard", "implement").ok)
+
+    def test_safety_verdict_requires_safety_mechanism_agent(self):
+        r = si.check_role_capability("safety_guard", "safety_verdict", agent="codex")
+        self.assertFalse(r.ok)
+
+    def test_unknown_role_and_capability_fail_closed(self):
+        self.assertFalse(si.check_role_capability("overlord", "review").ok)
+        self.assertFalse(si.check_role_capability("developer", "launch_missiles").ok)
+
+
+# INV-018
+class RolePromptTests(unittest.TestCase):
+    def test_build_known_roles(self):
+        for role in ("developer", "reviewer", "ui_lead", "safety_guard"):
+            p = si.build_immutable_role_prompt(role)
+            self.assertIn(f"[IMMUTABLE ROLE: {role}]", p)
+            self.assertIn("FORBIDDEN:", p)
+            self.assertIn("IMMUTABLE", p)
+
+    def test_build_unknown_role_raises(self):
+        with self.assertRaises(ValueError):
+            si.build_immutable_role_prompt("overlord")
+
+    def test_reviewer_prompt_forbids_implementation(self):
+        p = si.build_immutable_role_prompt("reviewer").lower()
+        self.assertIn("review only", p)
+        self.assertTrue("implementing" in p or "implement" in p)
+        self.assertIn("not commit/merge authorization", p)
+
+    def test_ui_lead_prompt_forbids_shell_mcp_subagents(self):
+        p = si.build_immutable_role_prompt("ui_lead").lower()
+        for token in ("shell", "mcp", "subagent"):
+            self.assertIn(token, p)
+
+    def test_check_immutable_role_prompt_detects_stripping(self):
+        good = si.build_immutable_role_prompt("developer")
+        self.assertTrue(si.check_immutable_role_prompt(good, "developer").ok)
+        self.assertFalse(si.check_immutable_role_prompt("just an agent prompt", "developer").ok)
+        self.assertFalse(si.check_immutable_role_prompt(good, "overlord").ok)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -470,14 +470,29 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
 
 
 def _build_direct_mention_prompt(channel: str, mention_payload: str, *,
-                                 exec_prompt_suffix: str = "") -> str:
-    """Build the no-MCP prompt used by headless direct-mention wrappers."""
-    prompt = (
+                                 exec_prompt_suffix: str = "", role: str = "") -> str:
+    """Build the no-MCP prompt used by headless direct-mention wrappers.
+
+    When ``role`` is a known role, its IMMUTABLE role prompt (INV-018) is
+    prepended FIRST so it precedes — and cannot be overridden by — the base
+    contract or the agent-specific ``exec_prompt_suffix`` that follow. ``role``
+    defaults to empty for full backward compatibility with existing callers.
+    """
+    base = (
         f"You received a mention in agentchattr #{channel}.\n\n"
         f"Message:\n---\n{mention_payload}\n---\n\n"
         "Respond to this message. Output ONLY your reply text -- nothing else. "
         "Do not use MCP tools. Do not edit files. Do not run shell commands."
     )
+    role_prompt = ""
+    if isinstance(role, str) and role:
+        try:
+            from safety_invariants import build_immutable_role_prompt
+            role_prompt = build_immutable_role_prompt(role)
+        except ValueError:
+            # Unknown role -> fail closed: do not emit an unbounded prompt.
+            raise SystemExit(f"Refusing unknown role for prompt construction: {role!r}")
+    prompt = f"{role_prompt}\n\n{base}" if role_prompt else base
     suffix = exec_prompt_suffix.strip() if isinstance(exec_prompt_suffix, str) else ""
     if suffix:
         prompt += f"\n\n{suffix}"
@@ -554,6 +569,16 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         time.sleep(1)
                         continue
 
+                    # Resolve role BEFORE prompt construction so the exec
+                    # direct-mention path can prepend the IMMUTABLE role prompt
+                    # (INV-018). Use current identity (may have changed via rename),
+                    # falling back to the base name.
+                    current_name, _ = get_identity_fn()
+                    role = _fetch_role(server_port, current_name)
+                    if not role and current_name != agent_name:
+                        role = _fetch_role(server_port, agent_name)
+
+                    immutable_role_applied = False
                     if custom_prompt:
                         prompt = custom_prompt
                     elif suppress_identity_hint:
@@ -571,10 +596,18 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                             except json.JSONDecodeError:
                                 pass
                         mention_payload = "\n".join(original_texts) if original_texts else "(no message text)"
+                        # Prepend the IMMUTABLE role prompt when the resolved role is
+                        # a known RBAC role (INV-018). A free-form/unknown role is not
+                        # passed through as immutable (no fabricated prompt); the
+                        # builder itself still fails closed on an unknown role.
+                        from safety_invariants import has_immutable_role_prompt
+                        rbac_role = role if has_immutable_role_prompt(role) else ""
                         prompt = _build_direct_mention_prompt(
                             channel, mention_payload,
                             exec_prompt_suffix=exec_prompt_suffix,
+                            role=rbac_role,
                         )
+                        immutable_role_applied = bool(rbac_role)
                     elif job_id:
                         prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
                     else:
@@ -587,13 +620,10 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                             "Do not spawn tasks or subagents."
                         )
 
-                    # Use current identity (may have changed via rename)
-                    current_name, _ = get_identity_fn()
-                    # Append role if set — check both current name and base name
-                    role = _fetch_role(server_port, current_name)
-                    if not role and current_name != agent_name:
-                        role = _fetch_role(server_port, agent_name)
-                    if role:
+                    # Append the legacy mutable ROLE line ONLY when an immutable role
+                    # prompt was not already prepended — avoids the weaker, redundant
+                    # "ROLE: {role}" line on the exec direct-mention path.
+                    if role and not immutable_role_applied:
                         prompt += f"\n\nROLE: {role}"
 
                     # Smart rules injection: first trigger, epoch change, or periodic refresh
@@ -643,22 +673,14 @@ def _build_codex_exec_args(agent_cfg: dict, data_dir: Path, instance_name: str) 
     """
     custom = agent_cfg.get("exec_args")
     if custom:
-        forbidden = (
-            "dangerously",
-            "bypass",
-            "yolo",
-            "skip-permissions",
-            "auto-approve",
-            "danger-full-access",
-            "workspace-write",
-        )
+        # INV-016: validate against the centralized explicit allowlist (not a
+        # denylist). Unknown flags — including novel unsafe ones no denylist would
+        # name — fail closed. Preserves the previously-approved safe flag set.
+        from safety_invariants import validate_codex_exec_args
         custom_args = list(custom)
-        lowered = " ".join(str(arg).lower() for arg in custom_args)
-        if any(flag in lowered for flag in forbidden):
-            raise SystemExit(
-                "Refusing unsafe Codex exec_args: dangerous/bypass/yolo/"
-                "skip-permissions/full-access style flag detected"
-            )
+        result = validate_codex_exec_args(custom_args)
+        if not result.ok:
+            raise SystemExit(f"Refusing unsafe Codex exec_args ({result.code}): {result.reason}")
         return custom_args
     args = ["--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral"]
     args += ["-o", str(data_dir / f"{instance_name}_exec_last.txt")]

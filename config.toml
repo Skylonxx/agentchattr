@@ -114,6 +114,20 @@ temperature = 1.0
 default = "none"
 max_agent_hops = 4
 
+# Daily roster — the SINGLE SOURCE OF TRUTH for role-to-agent resolution.
+# ROLE > AGENT IDENTITY: workflow authority is bound to the role, not the model.
+# External workflow roles are fixed: developer=claude, reviewer=codex, ui_lead=agy.
+# Internal runtime roles below map to existing internal agentchattr identities and
+# are NOT external workflow personas. safety_guard maps ONLY to codexsafe (a
+# boundary guard / safety mechanism, never a workflow persona).
+[roster]
+developer = "claude"
+reviewer = "codex"
+ui_lead = "agy"
+runtime_coordinator = "codex_coordinator"
+runtime_reviewer = "codex_reviewer"
+safety_guard = "codexsafe"
+
 [mcp]
 http_port = 8200
 sse_port = 8201
