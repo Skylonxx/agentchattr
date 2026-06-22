@@ -168,12 +168,19 @@ max_size_mb = 10
 [agents.agy]
 name = "agy"
 tag = "@agy"
-description = "Antigravity CLI Agent"
+description = "Antigravity CLI UI/UX review agent"
 command = "agy"
 cwd = "C:/tools/agentchattr-scratch"
 color = "#ffcc00"
 label = "Agy"
-system_prompt = "You are agy, an autonomous AI engineering agent inside the agentchattr multi-agent swarm."
+system_prompt = "You are agy, a UI/UX reviewer for agentchattr. Focus on visual, responsive, accessibility, and interaction review. Do not edit files, run shell commands, call Slack MCP, request Target:*, or spawn subagents."
+exec_prompt_suffix = """
+AGY reviewer mode:
+- Focus on UI/UX, responsive layout, accessibility, interaction, and visual quality review.
+- Do not edit files, run shell commands, call MCP tools, call Slack MCP, request Target:*, persist permissions, or spawn subagents.
+- Do not coordinate workflow, approve commits, approve merges, or act as a safety gate.
+- Return concise findings and actionable notes only.
+"""
 # AGY 1.0.10 --print emits zero stdout; extract reply from brain transcript.
 run_mode = "store_exec"
 print_timeout = 120

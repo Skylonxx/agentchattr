@@ -469,9 +469,25 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
         pass
 
 
+def _build_direct_mention_prompt(channel: str, mention_payload: str, *,
+                                 exec_prompt_suffix: str = "") -> str:
+    """Build the no-MCP prompt used by headless direct-mention wrappers."""
+    prompt = (
+        f"You received a mention in agentchattr #{channel}.\n\n"
+        f"Message:\n---\n{mention_payload}\n---\n\n"
+        "Respond to this message. Output ONLY your reply text -- nothing else. "
+        "Do not use MCP tools. Do not edit files. Do not run shell commands."
+    )
+    suffix = exec_prompt_suffix.strip() if isinstance(exec_prompt_suffix, str) else ""
+    if suffix:
+        prompt += f"\n\n{suffix}"
+    return prompt
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
-                   refresh_interval: int = 10, suppress_identity_hint: bool = False):
+                   refresh_interval: int = 10, suppress_identity_hint: bool = False,
+                   exec_prompt_suffix: str = ""):
     """Poll queue file and inject an MCP read task when triggered."""
     first_mention = True
     last_rules_epoch = 0  # 0 = unknown/cold start — will inject on first trigger
@@ -555,11 +571,9 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                             except json.JSONDecodeError:
                                 pass
                         mention_payload = "\n".join(original_texts) if original_texts else "(no message text)"
-                        prompt = (
-                            f"You received a mention in agentchattr #{channel}.\n\n"
-                            f"Message:\n---\n{mention_payload}\n---\n\n"
-                            "Respond to this message. Output ONLY your reply text -- nothing else. "
-                            "Do not use MCP tools. Do not edit files. Do not run shell commands."
+                        prompt = _build_direct_mention_prompt(
+                            channel, mention_payload,
+                            exec_prompt_suffix=exec_prompt_suffix,
                         )
                     elif job_id:
                         prompt = f"use mcp to read job_id={job_id} - you're mentioned in a job thread, take appropriate action and respond"
@@ -1004,11 +1018,34 @@ def _extract_conversation_id_from_log(log_dir: str | None = None) -> str:
     return ""
 
 
+def _build_agy_store_command(command: str, prompt: str, print_timeout: int, *,
+                             store_args=None) -> list[str]:
+    """Build a bounded AGY print-mode command without shell invocation."""
+    args = [str(arg) for arg in (store_args or [])]
+    allowed_value_flags = {"--model"}
+    allowed_bool_flags = set()
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in allowed_value_flags:
+            if i + 1 >= len(args) or args[i + 1].startswith("-"):
+                raise SystemExit(f"Refusing unsafe AGY args: {arg} requires a value")
+            i += 2
+            continue
+        if arg in allowed_bool_flags:
+            i += 1
+            continue
+        raise SystemExit(
+            f"Refusing unsafe AGY args: unsupported argument {arg!r}"
+        )
+    return [command, *args, "--print", prompt, "--print-timeout", f"{print_timeout}s"]
+
+
 def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
                          trigger_flag=None, running_flag=None,
                          data_dir=None, no_restart=False,
                          server_port=8300, get_token_fn=None,
-                         print_timeout=120):
+                         print_timeout=120, store_args=None):
     """AGY store-relay exec loop: run ``agy --print <prompt>``, then extract
     the reply from AGY's local transcript JSONL and relay it to agentchattr.
 
@@ -1043,7 +1080,8 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
         if running_flag is not None:
             running_flag[0] = True
 
-        cmd = [command, "--print", prompt, "--print-timeout", f"{print_timeout}s"]
+        cmd = _build_agy_store_command(
+            command, prompt, print_timeout, store_args=store_args)
         print(f"  > {agent} store-exec triggered ({len(prompt)} chars)")
 
         proc = None
@@ -1659,7 +1697,8 @@ def main():
             kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                     "server_port": server_port, "agent_name": assigned_name,
                     "get_token_fn": get_token, "refresh_interval": _refresh_interval,
-                    "suppress_identity_hint": _suppress_identity_hint},
+                    "suppress_identity_hint": _suppress_identity_hint,
+                    "exec_prompt_suffix": agent_cfg.get("exec_prompt_suffix", "")},
             daemon=True,
         )
         _watcher_thread.start()
@@ -1675,7 +1714,8 @@ def main():
                     kwargs={"is_multi_instance": _is_multi_instance, "trigger_flag": _trigger_flag,
                             "server_port": server_port, "agent_name": assigned_name,
                             "get_token_fn": get_token, "refresh_interval": _refresh_interval,
-                            "suppress_identity_hint": _suppress_identity_hint},
+                            "suppress_identity_hint": _suppress_identity_hint,
+                            "exec_prompt_suffix": agent_cfg.get("exec_prompt_suffix", "")},
                     daemon=True,
                 )
                 _watcher_thread.start()
@@ -1794,6 +1834,7 @@ def main():
                 server_port=server_port,
                 get_token_fn=get_token,
                 print_timeout=agent_cfg.get("print_timeout", 120),
+                store_args=launch_args,
             )
         else:
             if sys.platform == "win32":
