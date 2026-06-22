@@ -12,8 +12,24 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
-# Agents authorized for relay-mode session execution
-RELAY_ELIGIBLE_AGENTS = frozenset({"codex", "codexsafe"})
+# Agents authorized for relay-mode session execution.
+#
+# codex_coordinator and codex_reviewer are the split Codex workflow identities
+# (Workflow Coordinator / Independent Reviewer). They are relay-eligible because
+# this same package ships the session-engine anti-self-review guard
+# (validate_no_self_review) that refuses to cast one identity as both coordinator
+# and reviewer — eligibility for the pair must never be enabled without that guard.
+#
+# Production "claude" is intentionally ABSENT (it remains relay-ineligible unless a
+# separate Gemini-approved production activation gate authorizes it). "agy" is
+# ABSENT (AGY relay is not enabled). Branch-only dry-run identities such as
+# "claude_dryrun" must never appear here on main.
+RELAY_ELIGIBLE_AGENTS = frozenset({
+    "codex",
+    "codexsafe",
+    "codex_coordinator",
+    "codex_reviewer",
+})
 
 
 # ---------------------------------------------------------------------------

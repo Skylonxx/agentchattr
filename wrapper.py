@@ -164,12 +164,22 @@ _VALID_INJECT_MODES = {"settings_file", "env", "flag", "proxy_flag", "env_conten
 
 
 def _resolve_mcp_inject(agent: str, agent_cfg: dict) -> dict:
-    """Resolve MCP injection config: explicit agent_cfg > built-in defaults > None."""
+    """Resolve MCP injection config: explicit agent_cfg > built-in defaults > None.
+
+    Built-in defaults are keyed first by the agent's config-key name, then by its
+    canonical base command (``agent_cfg["command"]``). The command fallback lets
+    Codex-derived identity keys (e.g. ``codex_coordinator``, ``codex_reviewer``)
+    inherit exactly the same defaults as the base ``codex`` provider without
+    duplicating MCP config. Keys whose name already matches a built-in default
+    keep their current behaviour (name lookup wins), so existing agents are
+    unaffected.
+    """
     inject_mode = agent_cfg.get("mcp_inject")
     if inject_mode:
         return dict(agent_cfg)
-    if agent in _BUILTIN_DEFAULTS:
-        merged = dict(_BUILTIN_DEFAULTS[agent])
+    default_key = agent if agent in _BUILTIN_DEFAULTS else agent_cfg.get("command")
+    if default_key in _BUILTIN_DEFAULTS:
+        merged = dict(_BUILTIN_DEFAULTS[default_key])
         merged.update({k: v for k, v in agent_cfg.items() if k.startswith("mcp_")})
         return merged
     return {}

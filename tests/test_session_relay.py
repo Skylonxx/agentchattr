@@ -2420,7 +2420,15 @@ class TestClaudeSafetyIsolation(unittest.TestCase):
 
     def test_relay_eligible_set_unchanged(self):
         from session_relay import RELAY_ELIGIBLE_AGENTS
-        self.assertEqual(RELAY_ELIGIBLE_AGENTS, frozenset({"codex", "codexsafe"}))
+        # Authorized Codex identity split (feat/codex-identity-split) added the
+        # coordinator/reviewer workflow identities alongside the same-package
+        # anti-self-review guard. Production "claude" stays excluded — that
+        # exclusion is the invariant this test protects.
+        self.assertEqual(
+            RELAY_ELIGIBLE_AGENTS,
+            frozenset({"codex", "codexsafe", "codex_coordinator", "codex_reviewer"}),
+        )
+        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
 
     def test_claude_reply_is_not_a_safety_verdict(self):
         """A Claude success reply of 'PASS' must NOT be interpretable as a gate
@@ -2638,7 +2646,12 @@ class TestDryrunIdentityIsolation(unittest.TestCase):
 
     def test_relay_eligible_set_unchanged(self):
         from session_relay import RELAY_ELIGIBLE_AGENTS
-        self.assertEqual(RELAY_ELIGIBLE_AGENTS, frozenset({"codex", "codexsafe"}))
+        # Authorized Codex identity split added coordinator/reviewer identities;
+        # the dry-run isolation invariant is that claude and claude_dryrun stay out.
+        self.assertEqual(
+            RELAY_ELIGIBLE_AGENTS,
+            frozenset({"codex", "codexsafe", "codex_coordinator", "codex_reviewer"}),
+        )
         self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
         self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
 
@@ -3221,7 +3234,12 @@ class TestDryrunRuntimeDormancyInvariants(unittest.TestCase):
 
     def test_production_set_excludes_both_claude_identities(self):
         from session_relay import RELAY_ELIGIBLE_AGENTS
-        self.assertEqual(RELAY_ELIGIBLE_AGENTS, frozenset({"codex", "codexsafe"}))
+        # Authorized Codex identity split added coordinator/reviewer identities;
+        # both Claude identities (production + dry-run) remain excluded.
+        self.assertEqual(
+            RELAY_ELIGIBLE_AGENTS,
+            frozenset({"codex", "codexsafe", "codex_coordinator", "codex_reviewer"}),
+        )
         self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
         self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
 

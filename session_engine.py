@@ -32,6 +32,66 @@ _SAFETY_GATE_ROLES = {"safety_gate", "safety", "gate", "review_gate"}
 # RELAY_ELIGIBLE_AGENTS); this set only names the dry-run responder identity.
 _SAFETY_ROLE_RESTRICTED_AGENTS = frozenset({"claude_dryrun"})
 
+# Anti-self-review: the workflow coordinator and the independent reviewer must be
+# SEPARATE runtime identities. These role-name families are matched (case-
+# insensitive) when guarding a cast so a single identity can never be assigned to
+# both a coordinator role and a reviewer role in the same session — which would
+# collapse the two-Codex separation into single-Codex self-review.
+_COORDINATOR_ROLES = {"coordinator", "codex_coordinator", "workflow_coordinator"}
+_REVIEWER_ROLES = {"reviewer", "codex_reviewer", "independent_reviewer"}
+
+
+class SelfReviewGuardResult:
+    """Result of :func:`validate_no_self_review` (pure, fail-closed)."""
+
+    __slots__ = ("ok", "reason", "identity")
+
+    def __init__(self, ok, reason="", identity=None):
+        self.ok = ok
+        self.reason = reason
+        self.identity = identity
+
+
+def validate_no_self_review(role_to_identity, *,
+                            coordinator_roles=_COORDINATOR_ROLES,
+                            reviewer_roles=_REVIEWER_ROLES):
+    """Pure, fail-closed anti-self-review guard.
+
+    Rejects any cast where a coordinator role and a reviewer role resolve to the
+    SAME runtime identity/instance. ``role_to_identity`` maps a role name to a
+    stable identity token (instance name, identity_id, or resolved base). Role
+    matching is case-insensitive and exact against the role-name families.
+    Returns a :class:`SelfReviewGuardResult`; ``ok`` is False on the first
+    coordinator/reviewer identity collision.
+
+    Legacy ``codex`` used for both roles is rejected the same way (both roles
+    resolve to the one ``codex`` identity), so the split coordinator/reviewer
+    identities cannot be quietly bypassed by re-using the base key.
+    """
+    if not isinstance(role_to_identity, dict):
+        return SelfReviewGuardResult(False, "cast must be a role->identity mapping")
+    coord_ids: dict = {}
+    rev_ids: dict = {}
+    for role, identity in role_to_identity.items():
+        if not isinstance(role, str):
+            return SelfReviewGuardResult(False, f"invalid role key: {role!r}")
+        rl = role.lower()
+        if rl in coordinator_roles:
+            coord_ids[identity] = role
+        elif rl in reviewer_roles:
+            rev_ids[identity] = role
+    for identity, crole in coord_ids.items():
+        if identity in rev_ids:
+            return SelfReviewGuardResult(
+                False,
+                f"anti-self-review: identity '{identity}' cast as both "
+                f"coordinator role '{crole}' and reviewer role "
+                f"'{rev_ids[identity]}' (coordinator and reviewer must be "
+                f"separate identities)",
+                identity,
+            )
+    return SelfReviewGuardResult(True, "")
+
 
 class RoleGuardResult:
     """Result of :func:`validate_relay_participant_roles` (pure, fail-closed)."""
@@ -107,6 +167,18 @@ class SessionEngine:
         guard = validate_relay_participant_roles(role_to_id)
         if not guard.ok:
             log.warning("Session start refused (safety-role guard): %s", guard.reason)
+            return None
+
+        # Anti-self-review guard (fail-closed): the workflow coordinator and the
+        # independent reviewer must be SEPARATE runtime identities. Resolve each
+        # cast agent to a stable identity token so the same live instance (or the
+        # legacy ``codex`` base used twice) cannot occupy both roles.
+        role_to_identity = {role: self._self_review_identity(agent)
+                            for role, agent in (cast or {}).items()}
+        sr_guard = validate_no_self_review(role_to_identity)
+        if not sr_guard.ok:
+            log.warning("Session start refused (anti-self-review guard): %s",
+                        sr_guard.reason)
             return None
 
         session = self._store.create(
@@ -401,6 +473,22 @@ class SessionEngine:
         if agent_name in _SAFETY_ROLE_RESTRICTED_AGENTS:
             return agent_name
         return base
+
+    def _self_review_identity(self, agent_name: str) -> str:
+        """Resolve an agent to a stable identity token for the anti-self-review guard.
+
+        Prefers the registry instance ``identity_id`` so two cast names that point
+        at the SAME live instance collide (and a renamed instance is still caught);
+        falls back to the instance name, then the raw cast name when no registry or
+        no live instance is available. This makes 'same instance cast as both
+        coordinator and reviewer' detectable, and treats two distinct identities
+        (e.g. codex_coordinator vs codex_reviewer) as separate.
+        """
+        if self._registry:
+            inst = self._registry.get_instance(agent_name)
+            if inst:
+                return inst.get("identity_id") or inst.get("name") or agent_name
+        return agent_name
 
     def _trigger_current(self, session: dict):
         """Trigger the agent whose turn it is."""

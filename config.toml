@@ -22,6 +22,28 @@ label = "Codex"
 # Enter never submits). Run headless via `codex exec` per @mention instead.
 run_mode = "exec"
 
+[agents.codex_coordinator]
+command = "codex"
+cwd = "C:/tools/agentchattr-scratch"
+color = "#0e8c6f"
+label = "Codex Coordinator"
+# Workflow Coordinator identity (Codex #1). Same headless exec behaviour as the
+# base "codex" provider; MCP/default behaviour is inherited via command-based
+# resolution in wrapper._resolve_mcp_inject (command = "codex"). Must remain a
+# SEPARATE identity from codex_reviewer — the session engine anti-self-review
+# guard refuses to cast one identity as both coordinator and reviewer.
+run_mode = "exec"
+
+[agents.codex_reviewer]
+command = "codex"
+cwd = "C:/tools/agentchattr-scratch"
+color = "#13c08a"
+label = "Codex Reviewer"
+# Independent Reviewer identity (Codex #2). Same headless exec behaviour as the
+# base "codex" provider; MCP/default behaviour inherited via command-based
+# resolution. Must remain a SEPARATE identity from codex_coordinator.
+run_mode = "exec"
+
 [agents.codexsafe]
 command = "codex"
 cwd = "C:/tools/agentchattr-scratch"
