@@ -286,6 +286,12 @@ class CodexExecLivePathTests(unittest.TestCase):
         self.assertIn("read-only", args)
         self.assertIn("--skip-git-repo-check", args)
 
+    def test_default_args_reject_dangerous_bypass(self):
+        args = self._build({}, Path("."), "codex")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
+        for arg in args:
+            self.assertNotIn("danger", arg.lower())
+
     def test_safe_custom_args_pass(self):
         args = self._build({"exec_args": ["--sandbox", "read-only", "--ephemeral"]},
                            Path("."), "codex")

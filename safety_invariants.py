@@ -74,6 +74,7 @@ INVARIANTS: dict[str, str] = {
     "INV-018": "immutable role prompts are prepended and cannot be overridden.",
     "INV-019": "capability is f(role, agent): role is evaluated first; disallowed fails closed.",
     "INV-020": "control-plane MCP tools are explicit allowlist per role; repo/source tools are separate.",
+    "INV-021": "Codex MCP approval uses native per-tool config keys; fake requires_approval is rejected.",
 }
 
 
@@ -436,6 +437,106 @@ def check_push_preconditions(*, clean_tree: bool, fast_forward: bool,
     if not isinstance(behind, int) or behind != 0:
         return _fail("INV-015", f"local branch is behind remote by {behind}")
     return _ok("INV-015")
+
+
+# ---------------------------------------------------------------------------
+# INV-021 — Codex native MCP per-tool auto-approval (replaces fake requires_approval)
+# ---------------------------------------------------------------------------
+
+CODEX_MCP_AUTO_APPROVE_TOOLS = frozenset({
+    "chat_read", "chat_send", "chat_propose_job",
+})
+
+_SAFE_MCP_CONFIG_PREFIX = "mcp_servers."
+_SAFE_MCP_CONFIG_APPROVAL_VALUES = frozenset({"auto", "prompt", "approve"})
+_SAFE_MCP_TOOL_SUFFIX = ".approval_mode"
+
+
+def _parse_toml_string_array(raw: str) -> list[str] | None:
+    """Parse a TOML inline array of strings. Returns None on any parse failure."""
+    stripped = raw.strip().strip("'")
+    if not stripped.startswith("[") or not stripped.endswith("]"):
+        return None
+    inner = stripped[1:-1].strip()
+    if not inner:
+        return []
+    items = []
+    for part in inner.split(","):
+        part = part.strip()
+        if len(part) < 2:
+            return None
+        if (part.startswith('"') and part.endswith('"')) or \
+           (part.startswith("'") and part.endswith("'")):
+            items.append(part[1:-1])
+        else:
+            return None
+    return items
+
+
+def validate_mcp_config_overrides(args: list[str], server_name: str) -> InvariantResult:
+    """Validate -c config overrides are limited to safe MCP approval keys (INV-021).
+
+    Only allows: .url (any value), .enabled_tools (subset of
+    CODEX_MCP_AUTO_APPROVE_TOOLS), .default_tools_approval_mode (safe values),
+    and per-tool .approval_mode for tools in CODEX_MCP_AUTO_APPROVE_TOOLS.
+    Rejects unknown keys, unsafe values, and non-MCP overrides. Fails closed.
+    """
+    prefix = f"{_SAFE_MCP_CONFIG_PREFIX}{server_name}"
+    i = 0
+    while i < len(args):
+        if args[i] != "-c":
+            i += 1
+            continue
+        if i + 1 >= len(args):
+            return _fail("INV-021", "-c requires a value")
+        override = args[i + 1]
+        key, _, value = override.partition("=")
+        key = key.strip()
+        value = value.strip().strip("'\"")
+
+        if not key.startswith(prefix):
+            return _fail("INV-021", f"non-MCP config override: {key!r}")
+
+        suffix = key[len(prefix):]
+
+        if suffix == ".url":
+            i += 2
+            continue
+
+        if suffix == ".enabled_tools":
+            raw = override.partition("=")[2].strip()
+            tools = _parse_toml_string_array(raw)
+            if tools is None:
+                return _fail("INV-021", "enabled_tools must be a TOML array of strings")
+            if not tools:
+                return _fail("INV-021", "enabled_tools must not be empty")
+            unknown = set(tools) - CODEX_MCP_AUTO_APPROVE_TOOLS
+            if unknown:
+                return _fail("INV-021",
+                             f"enabled_tools contains unknown tool(s): {sorted(unknown)}")
+            i += 2
+            continue
+
+        if suffix == ".default_tools_approval_mode":
+            if value not in _SAFE_MCP_CONFIG_APPROVAL_VALUES:
+                return _fail("INV-021",
+                             f"unsafe default_tools_approval_mode: {value!r}")
+            i += 2
+            continue
+
+        tool_match = False
+        for tool in CODEX_MCP_AUTO_APPROVE_TOOLS:
+            if suffix == f".tools.{tool}{_SAFE_MCP_TOOL_SUFFIX}":
+                if value not in _SAFE_MCP_CONFIG_APPROVAL_VALUES:
+                    return _fail("INV-021", f"unsafe approval_mode value: {value!r}")
+                tool_match = True
+                break
+        if tool_match:
+            i += 2
+            continue
+
+        return _fail("INV-021", f"unsupported MCP config key suffix: {suffix!r}")
+    return _ok("INV-021")
 
 
 # ---------------------------------------------------------------------------

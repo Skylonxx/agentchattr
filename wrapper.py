@@ -323,6 +323,27 @@ def _apply_mcp_inject(
                                   '-c mcp_servers.{server}.url="{url}"')
         expanded = template.format(server=SERVER_NAME, url=proxy_url or "")
         launch_args = expanded.split()
+        # Native per-tool MCP auto-approval so headless exec mode does not
+        # cancel control-plane tool calls. Only the 3 working-session tools
+        # are enabled; the read-only sandbox still blocks shell/file ops.
+        if inject_cfg.get("mcp_auto_approve", True):
+            from safety_invariants import CODEX_MCP_AUTO_APPROVE_TOOLS
+            tools_toml = "[" + ",".join(
+                f'"{t}"' for t in sorted(CODEX_MCP_AUTO_APPROVE_TOOLS)
+            ) + "]"
+            launch_args += [
+                "-c", f"mcp_servers.{SERVER_NAME}.enabled_tools={tools_toml}",
+            ]
+            for tool in sorted(CODEX_MCP_AUTO_APPROVE_TOOLS):
+                launch_args += [
+                    "-c", f'mcp_servers.{SERVER_NAME}.tools.{tool}.approval_mode="auto"',
+                ]
+            from safety_invariants import validate_mcp_config_overrides
+            result = validate_mcp_config_overrides(launch_args, SERVER_NAME)
+            if not result.ok:
+                raise SystemExit(
+                    f"Refusing unsafe MCP config ({result.code}): {result.reason}"
+                )
 
     return launch_args, inject_env, settings_path
 
@@ -674,7 +695,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # Flatten to single line — multi-line text triggers paste
                     # detection in CLIs (Claude Code shows "[Pasted text +N]")
                     # which can break injection of long session prompts
-                    inject_fn(prompt.replace("\n", " "))
+                    inject_fn(prompt.replace("\n", " "), channel=channel)
         except Exception:
             pass
 
@@ -861,7 +882,7 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
     import subprocess
 
     exec_args = list(exec_args or [])
-    # Each work item is a dict: {"prompt": str, "relay_meta": dict | None}.
+    # Each work item is a dict: {"prompt": str, "relay_meta": dict | None, "channel": str}.
     work: "_queue.Queue[dict]" = _queue.Queue()
 
     # Locate the -o output file path from exec_args
@@ -871,10 +892,10 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             _output_file = Path(exec_args[_i + 1])
             break
 
-    def _enqueue(text, relay_meta=None):
+    def _enqueue(text, relay_meta=None, channel=""):
         if running_flag is not None:
             running_flag[0] = True
-        work.put({"prompt": text, "relay_meta": relay_meta})
+        work.put({"prompt": text, "relay_meta": relay_meta, "channel": channel})
 
     start_watcher(_enqueue)
 
@@ -901,10 +922,15 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             prompt = item
             relay_meta = None
 
-        # Relay replies must go back to the SESSION's channel, which the server
-        # carries in relay_meta.channel. Non-relay items have no relay_meta, so
-        # preserve the historical "general" target for normal @mention turns.
-        reply_channel = (relay_meta or {}).get("channel") or "general"
+        # Reply channel: relay turns carry it in relay_meta.channel; direct-mention
+        # turns carry it in the work item's "channel" field (set by the queue watcher
+        # from the @mention's source channel). Falls back to "general" only when
+        # neither source is available.
+        reply_channel = (
+            (relay_meta or {}).get("channel")
+            or item.get("channel", "")
+            or "general"
+        )
 
         # Relay mode is METADATA-DRIVEN: structured relay_meta.disable_mcp is the
         # authoritative signal to strip MCP args/env (see _should_disable_mcp).

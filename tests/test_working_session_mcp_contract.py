@@ -325,5 +325,305 @@ class TestExternalRoleLock(unittest.TestCase):
                 f"role '{role}' references CodexSafe as persona")
 
 
+class TestMcpAutoApproval(unittest.TestCase):
+    """Codex proxy_flag MCP injection uses native per-tool approval (INV-021)."""
+
+    def _get_proxy_flag_args(self, auto_approve=True):
+        import tempfile
+        from pathlib import Path
+        from wrapper import _apply_mcp_inject
+        inject_cfg = {"mcp_inject": "proxy_flag",
+                      "mcp_proxy_flag_template": '-c mcp_servers.{server}.url="{url}"',
+                      "mcp_auto_approve": auto_approve}
+        with tempfile.TemporaryDirectory() as td:
+            args, _, _ = _apply_mcp_inject(
+                inject_cfg, "codex", Path(td), "http://127.0.0.1:9999/mcp")
+        return args
+
+    def test_proxy_flag_does_not_emit_requires_approval(self):
+        joined = " ".join(self._get_proxy_flag_args())
+        self.assertNotIn("requires_approval", joined)
+
+    def test_proxy_flag_emits_enabled_tools(self):
+        joined = " ".join(self._get_proxy_flag_args())
+        self.assertIn("enabled_tools", joined)
+        self.assertIn("chat_read", joined)
+        self.assertIn("chat_send", joined)
+        self.assertIn("chat_propose_job", joined)
+
+    def test_proxy_flag_emits_per_tool_approval_mode_auto(self):
+        joined = " ".join(self._get_proxy_flag_args())
+        for tool in ("chat_read", "chat_send", "chat_propose_job"):
+            self.assertIn(f"tools.{tool}.approval_mode", joined)
+        self.assertIn('"auto"', joined)
+
+    def test_proxy_flag_only_enables_3_working_session_tools(self):
+        from safety_invariants import CODEX_MCP_AUTO_APPROVE_TOOLS
+        self.assertEqual(CODEX_MCP_AUTO_APPROVE_TOOLS,
+                         frozenset({"chat_read", "chat_send", "chat_propose_job"}))
+
+    def test_proxy_flag_auto_approve_can_be_disabled(self):
+        args = self._get_proxy_flag_args(auto_approve=False)
+        joined = " ".join(args)
+        self.assertNotIn("enabled_tools", joined)
+        self.assertNotIn("approval_mode", joined)
+        self.assertNotIn("requires_approval", joined)
+
+    def test_proxy_flag_args_pass_inv021_validation(self):
+        from wrapper import SERVER_NAME
+        from safety_invariants import validate_mcp_config_overrides
+        args = self._get_proxy_flag_args()
+        r = validate_mcp_config_overrides(args, SERVER_NAME)
+        self.assertTrue(r.ok, r.reason)
+
+
+class TestMcpConfigValidation(unittest.TestCase):
+    """INV-021: MCP config overrides must be limited to safe keys AND values."""
+
+    def _v(self, *overrides):
+        from safety_invariants import validate_mcp_config_overrides
+        args = []
+        for o in overrides:
+            args += ["-c", o]
+        return validate_mcp_config_overrides(args, "agentchattr")
+
+    # --- enabled_tools: safe values ---
+
+    def test_enabled_tools_exact_set_accepted(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=["chat_propose_job","chat_read","chat_send"]')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_enabled_tools_subset_accepted(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=["chat_read","chat_send"]')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_enabled_tools_single_accepted(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=["chat_read"]')
+        self.assertTrue(r.ok, r.reason)
+
+    # --- enabled_tools: unsafe values ---
+
+    def test_enabled_tools_unknown_tool_rejected(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=["shell_exec"]')
+        self.assertFalse(r.ok)
+        self.assertIn("unknown tool", r.reason)
+
+    def test_enabled_tools_mixed_allowed_and_unknown_rejected(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=["chat_read","shell_exec"]')
+        self.assertFalse(r.ok)
+        self.assertIn("unknown tool", r.reason)
+
+    def test_enabled_tools_superset_with_extra_rejected(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=["chat_read","chat_send","chat_propose_job","extra_tool"]')
+        self.assertFalse(r.ok)
+
+    def test_enabled_tools_empty_array_rejected(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=[]')
+        self.assertFalse(r.ok)
+        self.assertIn("empty", r.reason)
+
+    def test_enabled_tools_bare_string_rejected(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools="chat_read"')
+        self.assertFalse(r.ok)
+        self.assertIn("array", r.reason.lower())
+
+    def test_enabled_tools_malformed_rejected(self):
+        r = self._v('mcp_servers.agentchattr.enabled_tools=not_an_array')
+        self.assertFalse(r.ok)
+
+    # --- default_tools_approval_mode: safe values ---
+
+    def test_default_approval_mode_auto_accepted(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="auto"')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_default_approval_mode_prompt_accepted(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="prompt"')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_default_approval_mode_approve_accepted(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="approve"')
+        self.assertTrue(r.ok, r.reason)
+
+    # --- default_tools_approval_mode: unsafe values ---
+
+    def test_default_approval_mode_never_rejected(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="never"')
+        self.assertFalse(r.ok)
+        self.assertIn("unsafe", r.reason)
+
+    def test_default_approval_mode_always_rejected(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="always"')
+        self.assertFalse(r.ok)
+
+    def test_default_approval_mode_true_rejected(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="true"')
+        self.assertFalse(r.ok)
+
+    def test_default_approval_mode_danger_rejected(self):
+        r = self._v('mcp_servers.agentchattr.default_tools_approval_mode="danger-full-access"')
+        self.assertFalse(r.ok)
+
+    # --- per-tool approval: safe ---
+
+    def test_per_tool_approval_auto_accepted(self):
+        r = self._v('mcp_servers.agentchattr.tools.chat_read.approval_mode="auto"')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_per_tool_approval_prompt_accepted(self):
+        r = self._v('mcp_servers.agentchattr.tools.chat_send.approval_mode="prompt"')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_per_tool_approval_approve_accepted(self):
+        r = self._v('mcp_servers.agentchattr.tools.chat_propose_job.approval_mode="approve"')
+        self.assertTrue(r.ok, r.reason)
+
+    # --- per-tool approval: unsafe ---
+
+    def test_per_tool_unknown_tool_rejected(self):
+        r = self._v('mcp_servers.agentchattr.tools.shell_exec.approval_mode="auto"')
+        self.assertFalse(r.ok)
+
+    def test_per_tool_approval_never_rejected(self):
+        r = self._v('mcp_servers.agentchattr.tools.chat_read.approval_mode="never"')
+        self.assertFalse(r.ok)
+
+    # --- other keys ---
+
+    def test_url_accepted(self):
+        r = self._v('mcp_servers.agentchattr.url="http://127.0.0.1:8200/mcp"')
+        self.assertTrue(r.ok, r.reason)
+
+    def test_fake_requires_approval_rejected(self):
+        r = self._v('mcp_servers.agentchattr.requires_approval="never"')
+        self.assertFalse(r.ok)
+
+    def test_command_key_rejected(self):
+        r = self._v('mcp_servers.agentchattr.command="/bin/evil"')
+        self.assertFalse(r.ok)
+
+    def test_wrong_server_name_rejected(self):
+        from safety_invariants import validate_mcp_config_overrides
+        args = ["-c", 'mcp_servers.evil_server.enabled_tools=["chat_read"]']
+        r = validate_mcp_config_overrides(args, "agentchattr")
+        self.assertFalse(r.ok)
+
+    def test_non_mcp_override_rejected(self):
+        r = self._v('sandbox_mode="danger-full-access"')
+        self.assertFalse(r.ok)
+        self.assertEqual(r.code, "INV-021")
+
+    def test_global_approval_policy_rejected(self):
+        r = self._v('approval_policy="never"')
+        self.assertFalse(r.ok)
+
+    def test_non_c_flags_ignored(self):
+        from safety_invariants import validate_mcp_config_overrides
+        args = ["--sandbox", "read-only", "--ephemeral"]
+        r = validate_mcp_config_overrides(args, "agentchattr")
+        self.assertTrue(r.ok, r.reason)
+
+    def test_generated_wrapper_config_passes(self):
+        from wrapper import SERVER_NAME
+        from safety_invariants import validate_mcp_config_overrides
+        import tempfile
+        from pathlib import Path
+        from wrapper import _apply_mcp_inject
+        inject_cfg = {"mcp_inject": "proxy_flag",
+                      "mcp_proxy_flag_template": '-c mcp_servers.{server}.url="{url}"'}
+        with tempfile.TemporaryDirectory() as td:
+            args, _, _ = _apply_mcp_inject(
+                inject_cfg, "codex", Path(td), "http://127.0.0.1:9999/mcp")
+        r = validate_mcp_config_overrides(args, SERVER_NAME)
+        self.assertTrue(r.ok, r.reason)
+
+    def test_inv021_in_catalogue(self):
+        self.assertIn("INV-021", INVARIANTS)
+
+
+class TestDangerousBypassRejected(unittest.TestCase):
+    """Dangerous sandbox bypass must never appear in defaults or allowlists."""
+
+    def test_default_codex_exec_args_use_read_only_sandbox(self):
+        from wrapper import _build_codex_exec_args
+        from pathlib import Path
+        args = _build_codex_exec_args({}, Path("."), "codex")
+        self.assertIn("--sandbox", args)
+        self.assertIn("read-only", args)
+
+    def test_default_codex_exec_args_no_dangerous_bypass(self):
+        from wrapper import _build_codex_exec_args
+        from pathlib import Path
+        args = _build_codex_exec_args({}, Path("."), "codex")
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", args)
+        for arg in args:
+            self.assertNotIn("danger", arg.lower(),
+                             f"dangerous flag found: {arg}")
+
+    def test_dangerous_bypass_not_in_allowed_bool_flags(self):
+        from safety_invariants import CODEX_EXEC_ALLOWED_BOOL_FLAGS
+        self.assertNotIn("--dangerously-bypass-approvals-and-sandbox",
+                         CODEX_EXEC_ALLOWED_BOOL_FLAGS)
+
+    def test_dangerous_bypass_rejected_by_validator(self):
+        from safety_invariants import validate_codex_exec_args
+        r = validate_codex_exec_args(["--dangerously-bypass-approvals-and-sandbox"])
+        self.assertFalse(r.ok)
+
+    def test_danger_full_access_rejected_by_validator(self):
+        from safety_invariants import validate_codex_exec_args
+        r = validate_codex_exec_args(["--sandbox", "danger-full-access"])
+        self.assertFalse(r.ok)
+
+    def test_unsafe_marker_dangerously_still_detected(self):
+        from safety_invariants import contains_unsafe_arg
+        self.assertTrue(len(contains_unsafe_arg(
+            ["--dangerously-bypass-approvals-and-sandbox"])) > 0)
+
+    def test_unsafe_marker_bypass_still_detected(self):
+        from safety_invariants import contains_unsafe_arg
+        self.assertTrue(len(contains_unsafe_arg(["--bypass-safety"])) > 0)
+
+
+class TestReplyChannelRouting(unittest.TestCase):
+    """Direct-mention exec responses route to the source channel, not #general."""
+
+    def test_work_item_channel_used_for_reply(self):
+        item = {"prompt": "test", "relay_meta": None, "channel": "scratch-review"}
+        relay_meta = item.get("relay_meta")
+        reply_channel = (
+            (relay_meta or {}).get("channel")
+            or item.get("channel", "")
+            or "general"
+        )
+        self.assertEqual(reply_channel, "scratch-review")
+
+    def test_relay_meta_channel_takes_precedence(self):
+        item = {"prompt": "test", "relay_meta": {"channel": "relay-ch"},
+                "channel": "mention-ch"}
+        relay_meta = item.get("relay_meta")
+        reply_channel = (
+            (relay_meta or {}).get("channel")
+            or item.get("channel", "")
+            or "general"
+        )
+        self.assertEqual(reply_channel, "relay-ch")
+
+    def test_fallback_to_general_when_no_channel(self):
+        item = {"prompt": "test", "relay_meta": None, "channel": ""}
+        relay_meta = item.get("relay_meta")
+        reply_channel = (
+            (relay_meta or {}).get("channel")
+            or item.get("channel", "")
+            or "general"
+        )
+        self.assertEqual(reply_channel, "general")
+
+    def test_queue_watcher_inject_passes_channel(self):
+        from wrapper import _build_direct_mention_prompt
+        prompt = _build_direct_mention_prompt("my-channel", "test")
+        self.assertIn("#my-channel", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
