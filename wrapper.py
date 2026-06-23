@@ -488,18 +488,22 @@ def _report_rule_sync(server_port: int, agent_name: str, epoch: int, token: str 
 
 def _build_direct_mention_prompt(channel: str, mention_payload: str, *,
                                  exec_prompt_suffix: str = "", role: str = "") -> str:
-    """Build the no-MCP prompt used by headless direct-mention wrappers.
+    """Build the prompt used by headless direct-mention wrappers.
 
     When ``role`` is a known role, its IMMUTABLE role prompt (INV-018) is
     prepended FIRST so it precedes — and cannot be overridden by — the base
     contract or the agent-specific ``exec_prompt_suffix`` that follow. ``role``
     defaults to empty for full backward compatibility with existing callers.
+
+    The base contract distinguishes repo/source tools (forbidden) from
+    agentchattr control-plane MCP tools (allowed for workflow orchestration).
     """
     base = (
         f"You received a mention in agentchattr #{channel}.\n\n"
         f"Message:\n---\n{mention_payload}\n---\n\n"
         "Respond to this message. Output ONLY your reply text -- nothing else. "
-        "Do not use MCP tools. Do not edit files. Do not run shell commands."
+        "Do not edit files. Do not run shell commands. Do not run git commands. "
+        "Do not use Slack MCP. Do not spawn subagents. Do not request Target:*."
     )
     role_prompt = ""
     if isinstance(role, str) and role:

@@ -44,7 +44,7 @@ class AgyConfigReadinessTests(unittest.TestCase):
             "responsive layout",
             "accessibility",
             "Do not edit files",
-            "call MCP tools",
+            "run shell commands",
             "Slack MCP",
             "Target:*",
             "spawn subagents",
@@ -53,6 +53,12 @@ class AgyConfigReadinessTests(unittest.TestCase):
         ]
         for text in required:
             self.assertIn(text, prompt)
+
+    def test_agy_suffix_no_broad_mcp_prohibition(self):
+        prompt = self.agy["exec_prompt_suffix"]
+        self.assertNotIn("call MCP tools", prompt)
+        self.assertNotIn("Do not use MCP tools", prompt)
+        self.assertNotIn("calling MCP", prompt)
 
     def test_agy_has_no_mcp_injection_defaults(self):
         self.assertNotIn("mcp_inject", self.agy)
@@ -76,7 +82,8 @@ class AgyPromptReadinessTests(unittest.TestCase):
         self.assertIn("You received a mention in agentchattr #design-review", prompt)
         self.assertIn("Please inspect the POS customer list on mobile.", prompt)
         self.assertIn("Output ONLY your reply text", prompt)
-        self.assertIn("Do not use MCP tools", prompt)
+        self.assertIn("Do not edit files", prompt)
+        self.assertIn("Do not run shell commands", prompt)
         self.assertIn("AGY reviewer mode", prompt)
         self.assertIn("Do not coordinate workflow", prompt)
         self.assertIn("Return concise findings", prompt)
@@ -84,7 +91,8 @@ class AgyPromptReadinessTests(unittest.TestCase):
     def test_direct_prompt_without_suffix_preserves_existing_base_contract(self):
         prompt = _build_direct_mention_prompt("general", "hello")
         self.assertIn("Message:\n---\nhello\n---", prompt)
-        self.assertIn("Do not use MCP tools", prompt)
+        self.assertIn("Do not edit files", prompt)
+        self.assertIn("Do not run shell commands", prompt)
         self.assertNotIn("AGY reviewer mode", prompt)
 
 
