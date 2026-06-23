@@ -323,9 +323,10 @@ def _apply_mcp_inject(
                                   '-c mcp_servers.{server}.url="{url}"')
         expanded = template.format(server=SERVER_NAME, url=proxy_url or "")
         launch_args = expanded.split()
-        # Native per-tool MCP auto-approval so headless exec mode does not
-        # cancel control-plane tool calls. Only the 3 working-session tools
-        # are enabled; the read-only sandbox still blocks shell/file ops.
+        # Native per-tool MCP config for forward compatibility (INV-021).
+        # Codex exec currently cancels MCP tool calls regardless of approval
+        # config; Reviewer operates as text-relay. These keys are emitted so
+        # the config is correct if exec-mode MCP is supported in the future.
         if inject_cfg.get("mcp_auto_approve", True):
             from safety_invariants import CODEX_MCP_AUTO_APPROVE_TOOLS
             tools_toml = "[" + ",".join(
@@ -704,14 +705,21 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
 
 # ---------------------------------------------------------------------------
 # Headless exec mode (e.g. codex)
+#
+# Codex Reviewer operates as text-relay: the session engine provides sealed
+# context, Codex produces a text verdict, and the wrapper relays the text to
+# the source/session channel.  Direct MCP tool execution (chat_read,
+# chat_send, chat_propose_job) is not required for this flow.  Native MCP
+# config keys are still emitted and validated (INV-021) for forward
+# compatibility.  No safe non-bypass codex exec MCP runtime path is
+# currently proven for this project.
 # ---------------------------------------------------------------------------
 
 def _build_codex_exec_args(agent_cfg: dict, data_dir: Path, instance_name: str) -> list[str]:
     """CLI flags for ``codex exec`` headless runs.
 
     Override entirely via agent_cfg['exec_args'] (a list). Defaults use
-    read-only sandbox so the agent can call MCP tools but cannot write
-    files. --skip-git-repo-check allows non-repo cwds.
+    read-only sandbox. --skip-git-repo-check allows non-repo cwds.
     """
     custom = agent_cfg.get("exec_args")
     if custom:

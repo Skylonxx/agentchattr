@@ -20,6 +20,9 @@ color = "#10a37f"
 label = "Codex"
 # codex 0.140's TUI ignores injected keystrokes on Windows (text enters but
 # Enter never submits). Run headless via `codex exec` per @mention instead.
+# Codex Reviewer operates as text-relay: sealed context in, text verdict out.
+# No safe non-bypass codex exec MCP runtime path is currently proven for this
+# project. Native MCP config keys are still emitted for future compatibility.
 run_mode = "exec"
 
 [agents.codex_coordinator]

@@ -625,5 +625,82 @@ class TestReplyChannelRouting(unittest.TestCase):
         self.assertIn("#my-channel", prompt)
 
 
+class TestCodexTextRelayOperationalModel(unittest.TestCase):
+    """Codex Reviewer text-relay: sealed context in, text verdict out.
+
+    No safe non-bypass codex exec MCP runtime path is currently proven for
+    this project.  These tests pin the accepted operational model: relay
+    turns provide all context as text, Codex responds as text, the wrapper
+    routes the text to the source channel.  Direct MCP tool execution by
+    Codex is not required.
+    """
+
+    def test_relay_prompt_forbids_mcp_tools(self):
+        from session_relay import build_relay_prompt
+        prompt = build_relay_prompt(
+            session_name="s", goal="g", phase_name="p",
+            phase_index=0, total_phases=1, role="reviewer",
+            instruction="review this", agent_base="codex",
+        )
+        self.assertIn("Do not use MCP tools", prompt)
+        self.assertIn("Do not call chat_read or chat_send", prompt)
+
+    def test_relay_prompt_contains_all_context(self):
+        from session_relay import build_relay_prompt
+        prompt = build_relay_prompt(
+            session_name="test-session", goal="verify text-relay",
+            phase_name="Review", phase_index=0, total_phases=2,
+            role="reviewer", instruction="check the code",
+            context_messages=[{"sender": "claude", "text": "here is the diff"}],
+            agent_base="codex",
+        )
+        self.assertIn("test-session", prompt)
+        self.assertIn("verify text-relay", prompt)
+        self.assertIn("Review", prompt)
+        self.assertIn("reviewer", prompt)
+        self.assertIn("check the code", prompt)
+        self.assertIn("here is the diff", prompt)
+
+    def test_mcp_stripped_for_relay_turns(self):
+        from wrapper import _should_disable_mcp
+        meta = {"relay_mode": True, "disable_mcp": True}
+        self.assertTrue(_should_disable_mcp("sealed prompt text", meta))
+
+    def test_native_mcp_config_still_emitted_for_compatibility(self):
+        from safety_invariants import CODEX_MCP_AUTO_APPROVE_TOOLS
+        self.assertEqual(CODEX_MCP_AUTO_APPROVE_TOOLS,
+                         frozenset({"chat_read", "chat_send", "chat_propose_job"}))
+
+    def test_codex_exec_defaults_enforce_read_only_sandbox(self):
+        from wrapper import _build_codex_exec_args
+        from pathlib import Path
+        args = _build_codex_exec_args({}, Path("."), "codex")
+        idx = args.index("--sandbox")
+        self.assertEqual(args[idx + 1], "read-only")
+
+    def test_codex_reviewer_is_relay_eligible(self):
+        from session_relay import is_relay_eligible
+        for agent in ("codex", "codex_reviewer", "codex_coordinator"):
+            self.assertTrue(is_relay_eligible(agent), f"{agent} should be relay-eligible")
+
+    def test_text_relay_does_not_require_mcp_execution(self):
+        """The text-relay flow is: sealed prompt via stdin -> text output ->
+        wrapper routes to channel.  No MCP tool call is part of this path."""
+        from session_relay import build_relay_prompt
+        from wrapper import _should_disable_mcp, _resolve_relay_reply
+        prompt = build_relay_prompt(
+            session_name="s", goal="g", phase_name="p",
+            phase_index=0, total_phases=1, role="reviewer",
+            instruction="review", agent_base="codex",
+        )
+        meta = {"relay_mode": True, "disable_mcp": True, "channel": "relay-ch"}
+        self.assertTrue(_should_disable_mcp(prompt, meta))
+        reply = _resolve_relay_reply(
+            timed_out=False, errored=False, returncode=0,
+            captured="LGTM — no issues found",
+        )
+        self.assertEqual(reply, "LGTM — no issues found")
+
+
 if __name__ == "__main__":
     unittest.main()
