@@ -803,6 +803,70 @@ async def _handle_new_message(msg: dict):
             targets.append(t)
     targets = list(dict.fromkeys(targets))  # dedupe, preserve order
 
+    # Codex review-package path relay: expand approved file into sealed text
+    # before triggering Codex (stdin relay — preserves multiline package body).
+    from package_relay import (
+        PackageRelayError,
+        format_relay_system_summary,
+        is_codex_agent,
+        parse_review_package_path,
+        prepare_package_review_relay,
+    )
+    review_package_path = parse_review_package_path(text)
+    if review_package_path and sender not in known_agents:
+        try:
+            relay_entry, manifest = prepare_package_review_relay(
+                review_package_path, channel=channel,
+            )
+        except PackageRelayError as exc:
+            store.add(
+                "system",
+                f"review-package BLOCKED: {exc}",
+                msg_type="system",
+                channel=channel,
+            )
+            return
+
+        store.add(
+            "system",
+            format_relay_system_summary(manifest),
+            msg_type="system",
+            channel=channel,
+        )
+
+        chat_msg = f"{sender}: @codex review-package {manifest.path}"
+        codex_targets = [t for t in targets if is_codex_agent(t)]
+        if not codex_targets:
+            store.add(
+                "system",
+                "review-package BLOCKED: no online Codex instance matched @codex.",
+                msg_type="system",
+                channel=channel,
+            )
+            return
+
+        import mcp_bridge
+        for target in codex_targets:
+            if registry:
+                inst = registry.get_instance(target)
+                if inst and inst.get("state") == "pending":
+                    continue
+            if not mcp_bridge.is_online(target):
+                store.add(
+                    "system",
+                    f"{target} appears offline — review-package queued.",
+                    msg_type="system",
+                    channel=channel,
+                )
+            if agents.is_available(target):
+                await agents.trigger(
+                    target,
+                    message=chat_msg,
+                    channel=channel,
+                    relay_entry=relay_entry,
+                )
+        return
+
     if router.is_paused(channel):
         # Only emit the loop guard notice once per pause
         if not router.is_guard_emitted(channel):
