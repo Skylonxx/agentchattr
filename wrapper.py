@@ -19,6 +19,7 @@ How it works:
 """
 
 import json
+import logging
 import os
 import shutil
 import sys
@@ -27,6 +28,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).parent
+
+log = logging.getLogger(__name__)
 
 SERVER_NAME = "agentchattr"
 
@@ -698,7 +701,15 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # which can break injection of long session prompts
                     inject_fn(prompt.replace("\n", " "), channel=channel)
         except Exception:
-            pass
+            try:
+                agent_label, qpath = get_identity_fn()
+            except Exception:
+                agent_label, qpath = agent_name or "?", "?"
+            log.exception(
+                "queue watcher failed processing trigger for @%s (queue=%s)",
+                agent_label,
+                qpath,
+            )
 
         time.sleep(1)
 
@@ -1133,12 +1144,12 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
     import queue as _queue
     import subprocess
 
-    work: "_queue.Queue[str]" = _queue.Queue()
+    work: "_queue.Queue[dict]" = _queue.Queue()
 
-    def _enqueue(text):
+    def _enqueue(text, channel="", **kwargs):
         if running_flag is not None:
             running_flag[0] = True
-        work.put(text)
+        work.put({"prompt": text, "channel": channel or "general"})
 
     start_watcher(_enqueue)
 
@@ -1151,11 +1162,19 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
 
     while True:
         try:
-            prompt = work.get()
+            item = work.get()
         except (KeyboardInterrupt, EOFError):
             break
         if running_flag is not None:
             running_flag[0] = True
+
+        # Backward-compat: tolerate a bare string item (older callers).
+        if isinstance(item, dict):
+            prompt = item.get("prompt", "")
+            reply_channel = item.get("channel", "general")
+        else:
+            prompt = item
+            reply_channel = "general"
 
         cmd = _build_agy_store_command(
             command, prompt, print_timeout, store_args=store_args)
@@ -1172,8 +1191,11 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
             print(f"  > {agent} store-exec timed out ({print_timeout + 30}s)")
             if get_token_fn:
                 try:
-                    _relay_to_chat(server_port, get_token_fn(),
-                                   f"[agy --print timed out after {print_timeout}s]")
+                    _relay_to_chat(
+                        server_port, get_token_fn(),
+                        f"[agy --print timed out after {print_timeout}s]",
+                        channel=reply_channel,
+                    )
                 except Exception:
                     pass
         except Exception as exc:
@@ -1223,20 +1245,28 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
                 if full_len > 2000:
                     reply = reply[:2000] + f"... [truncated, {full_len} chars total]"
                 try:
-                    _relay_to_chat(server_port, get_token_fn(), reply)
+                    _relay_to_chat(
+                        server_port, get_token_fn(), reply, channel=reply_channel,
+                    )
                     print(f"  > {agent} reply relayed ({len(reply)} chars)")
                 except Exception as exc:
                     print(f"  > {agent} relay failed: {exc}")
             elif not reply and proc.returncode == 0 and get_token_fn:
                 try:
-                    _relay_to_chat(server_port, get_token_fn(),
-                                   "[agy produced no reply]")
+                    _relay_to_chat(
+                        server_port, get_token_fn(),
+                        "[agy produced no reply]",
+                        channel=reply_channel,
+                    )
                 except Exception:
                     pass
             elif not reply and proc.returncode != 0 and get_token_fn:
                 try:
-                    _relay_to_chat(server_port, get_token_fn(),
-                                   f"[agy --print failed (exit {proc.returncode})]")
+                    _relay_to_chat(
+                        server_port, get_token_fn(),
+                        f"[agy --print failed (exit {proc.returncode})]",
+                        channel=reply_channel,
+                    )
                 except Exception:
                     pass
 

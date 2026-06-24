@@ -5,7 +5,11 @@ does not enable production AGY relay, production Claude relay, broad MCP,
 Slack MCP, Target:* access, or subagent loops.
 """
 
+import json
 import sys
+import tempfile
+import threading
+import time
 import tomllib
 import unittest
 from pathlib import Path
@@ -18,6 +22,7 @@ from session_relay import RELAY_ELIGIBLE_AGENTS, is_relay_eligible  # noqa: E402
 from wrapper import (  # noqa: E402
     _build_agy_store_command,
     _build_direct_mention_prompt,
+    _queue_watcher,
     _resolve_mcp_inject,
 )
 
@@ -137,6 +142,72 @@ class AgyStoreCommandTests(unittest.TestCase):
     def test_store_command_rejects_model_flag_without_value(self):
         with self.assertRaises(SystemExit):
             _build_agy_store_command("agy", "prompt", 120, store_args=["--model"])
+
+
+class StoreExecInjectRegressionTests(unittest.TestCase):
+    """Regression: _queue_watcher passes channel=; store_exec enqueue must accept it."""
+
+    def test_store_exec_enqueue_contract_accepts_channel_kwarg(self):
+        """Mirror run_agent_store_exec._enqueue — must accept channel= from watcher."""
+        import queue as _queue
+
+        work: _queue.Queue[dict] = _queue.Queue()
+        running_flag = [False]
+
+        def _enqueue(text, channel="", **kwargs):
+            if running_flag is not None:
+                running_flag[0] = True
+            work.put({"prompt": text, "channel": channel or "general"})
+
+        _enqueue("flattened prompt", channel="design-review")
+        item = work.get_nowait()
+        self.assertTrue(running_flag[0])
+        self.assertEqual(item["prompt"], "flattened prompt")
+        self.assertEqual(item["channel"], "design-review")
+
+    def test_queue_watcher_inject_fn_receives_channel_kwarg(self):
+        received = []
+
+        def inject_fn(text, channel="", **kwargs):
+            received.append({"text": text, "channel": channel})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            qf = Path(tmp) / "agy_queue.jsonl"
+            qf.write_text(
+                json.dumps(
+                    {
+                        "sender": "user",
+                        "text": "user: @agy Reply exactly: PING_OK",
+                        "time": "12:00:00",
+                        "channel": "design-review",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            identity = lambda: ("agy", qf)
+
+            t = threading.Thread(
+                target=_queue_watcher,
+                args=(identity, inject_fn),
+                kwargs={
+                    "suppress_identity_hint": True,
+                    "exec_prompt_suffix": "",
+                },
+                daemon=True,
+            )
+            t.start()
+            deadline = time.time() + 5
+            while time.time() < deadline and not received:
+                time.sleep(0.05)
+
+        self.assertTrue(received, "inject_fn was never called")
+        self.assertEqual(received[0]["channel"], "design-review")
+        self.assertIn("@agy Reply exactly: PING_OK", received[0]["text"])
+
+    def test_store_exec_enqueue_signature_present_in_wrapper(self):
+        src = (ROOT / "wrapper.py").read_text(encoding="utf-8")
+        self.assertIn('def _enqueue(text, channel="", **kwargs):', src)
 
 
 if __name__ == "__main__":
