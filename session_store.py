@@ -298,6 +298,37 @@ class SessionStore:
         self._fire("interrupt", result)
         return result
 
+    def update_flow_state(self, session_id: int, flow_state: dict) -> dict | None:
+        """Persist flow coordinator state inside a session record."""
+        with self._lock:
+            session = self._find(session_id)
+            if not session:
+                return None
+            session["flow_state"] = flow_state
+            session["updated_at"] = time.time()
+            self._save()
+            result = dict(session)
+        self._fire("update", result)
+        return result
+
+    def set_phase_and_turn(self, session_id: int, phase: int, turn: int,
+                           message_id: int | None = None) -> dict | None:
+        """Set session to an arbitrary phase/turn (for flow-coordinator routing)."""
+        with self._lock:
+            session = self._find(session_id)
+            if not session or session["state"] not in ("active", "waiting"):
+                return None
+            session["current_phase"] = phase
+            session["current_turn"] = turn
+            session["state"] = "active"
+            session["updated_at"] = time.time()
+            if message_id is not None:
+                session["last_message_id"] = message_id
+            self._save()
+            result = dict(session)
+        self._fire("update", result)
+        return result
+
     def _find(self, session_id: int) -> dict | None:
         """Find session by ID (caller must hold lock)."""
         for s in self._sessions:

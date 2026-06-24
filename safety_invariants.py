@@ -895,3 +895,54 @@ def check_immutable_role_prompt(prompt, role) -> InvariantResult:
     if "CONTROL-PLANE" not in prompt:
         return _fail("INV-018", "control-plane section missing")
     return _ok("INV-018")
+
+
+# ---------------------------------------------------------------------------
+# INV-022 — Sandbox flow coordinator loop limits (additive, flag-gated)
+# ---------------------------------------------------------------------------
+
+INVARIANTS["INV-022"] = "Sandbox flow coordinator loop limits are enforced."
+
+SANDBOX_MAX_UX_LOOPS = 2
+SANDBOX_MAX_ENG_LOOPS = 2
+SANDBOX_MAX_TOTAL_STEPS = 12
+
+
+def _is_strict_int(value) -> bool:
+    """True only for int, not bool (bool is a subclass of int in Python)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def check_sandbox_loop_limits(*, ux_loops: int, eng_loops: int,
+                              total_steps: int) -> InvariantResult:
+    """Validate sandbox flow coordinator loop counters (INV-022).
+
+    Fails closed if any counter is non-int, bool, negative, or above the limit.
+    """
+    for name, value, limit in (
+        ("ux_loops", ux_loops, SANDBOX_MAX_UX_LOOPS),
+        ("eng_loops", eng_loops, SANDBOX_MAX_ENG_LOOPS),
+        ("total_steps", total_steps, SANDBOX_MAX_TOTAL_STEPS),
+    ):
+        if not _is_strict_int(value):
+            return _fail("INV-022", f"{name} must be a non-bool int, got {type(value).__name__}")
+        if value < 0:
+            return _fail("INV-022", f"{name} is negative: {value}")
+        if value > limit:
+            return _fail("INV-022", f"{name} {value} exceeds max {limit}")
+    return _ok("INV-022")
+
+
+def check_sandbox_template_safe(template: dict) -> InvariantResult:
+    """Reject a sandbox template that references production identities or paths.
+
+    Additive companion to check_dryrun_template_safe for sandbox-flow templates.
+    Reuses the same fail-closed logic.
+    """
+    base = check_dryrun_template_safe(template)
+    if not base.ok:
+        return base
+    blob = repr(template).lower()
+    if "twinpet" in blob:
+        return _fail("INV-022", "sandbox template references twinpet")
+    return _ok("INV-022")

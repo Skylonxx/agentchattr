@@ -1,0 +1,30 @@
+{
+  "id": "sandbox-bakery-flow",
+  "name": "Sandbox Bakery Flow (orchestration dry-run)",
+  "description": "Sandbox-only orchestration dry-run: Developer → UI Lead → Code Reviewer with verdict-driven back-routing. Scenario: Bakery POS checkout modal UX improvement. No production repo mutation.",
+  "roles": ["developer", "ui_lead", "codex_reviewer"],
+  "user_required": false,
+  "sandbox_only": true,
+  "flow_coordinator": true,
+  "phases": [
+    {
+      "name": "Developer Implementation",
+      "participants": ["developer"],
+      "prompt": "Implement the Bakery POS checkout modal UX improvement. Write a mock report. Return your status on the first line: READY_FOR_AGY_REVIEW, READY_FOR_CODEX_REVIEW, READY_FOR_REVIEW_PACKAGE, or BLOCKED. Text only; do not edit real files.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "UI/UX Review",
+      "participants": ["ui_lead"],
+      "prompt": "Review the Developer's mock report for UI/UX quality: visual, responsive, accessibility, interaction. Return your verdict on the first line: PASS, PASS WITH NOTES, REQUEST UX CHANGES, or BLOCKED. Do not edit files or run shell commands.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Codex Code Review",
+      "participants": ["codex_reviewer"],
+      "prompt": "Review the Developer's implementation for correctness, safety, boundary handling, and test coverage. Return your verdict on the first line: PASS, PASS WITH NOTES, REQUEST CHANGES, or BLOCKED. Do not edit files.",
+      "turn_order": "sequential",
+      "is_output": true
+    }
+  ]
+}

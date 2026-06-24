@@ -10,6 +10,10 @@ from session_relay import (
     is_relay_eligible,
     make_relay_queue_entry,
     parse_safety_verdict,
+    parse_workflow_verdict,
+    AGY_TOKENS,
+    CODEX_REVIEWER_TOKENS,
+    DEVELOPER_TOKENS,
 )
 
 log = logging.getLogger(__name__)
@@ -205,6 +209,12 @@ class SessionEngine:
 
         log.info("Session %d started: %s in #%s", session["id"],
                  session["template_name"], channel)
+
+        # Flow-coordinator sessions: initialize FlowState and run intake
+        tmpl = self._store.get_template(template_id)
+        if tmpl and tmpl.get("flow_coordinator"):
+            self._init_flow_coordinator(session, goal)
+            return session
 
         # Trigger the first participant
         self._trigger_current(session)
@@ -420,6 +430,22 @@ class SessionEngine:
         tmpl = self._store.get_template(session["template_id"])
         if not tmpl:
             self._store.interrupt(session["id"], "template not found")
+            return
+
+        # Flow-coordinator sessions use verdict-driven routing instead of
+        # linear forward advance. Delegate entirely to avoid mixing paths.
+        # Fail closed: if a flow-coordinator template is missing its flow_state
+        # (persistence failure or malformed session), halt rather than falling
+        # through to linear advance.
+        if tmpl.get("flow_coordinator"):
+            if session.get("flow_state"):
+                self._advance_flow_coordinator(session, message_id)
+            else:
+                log.warning("Session %d: flow_coordinator template but no "
+                            "flow_state — halting (fail-closed)", session["id"])
+                self._store.interrupt(
+                    session["id"],
+                    "flow coordinator: missing flow_state (fail-closed)")
             return
 
         phases = tmpl.get("phases", [])
@@ -678,6 +704,192 @@ class SessionEngine:
         cast = session.get("cast", {})
         return cast.get(role)
 
+    # --- Flow coordinator wiring (sandbox-only, opt-in) ---
+
+    _ROLE_TO_VERDICT_TOKENS = {
+        "developer": DEVELOPER_TOKENS,
+        "ui_lead": AGY_TOKENS,
+        "codex_reviewer": CODEX_REVIEWER_TOKENS,
+    }
+
+    def _init_flow_coordinator(self, session: dict, goal: str):
+        """Initialize flow state on a flow-coordinator session and run intake."""
+        from flow_coordinator import FlowState, intake
+
+        fs = FlowState()
+        action = intake(fs, goal or session.get("goal", ""))
+        self._store.update_flow_state(session["id"], fs.to_dict())
+
+        if action.is_terminal:
+            channel = session.get("channel", "general")
+            self._messages.add(
+                sender="system",
+                text=f"Flow coordinator halted: {fs.halt_reason}",
+                msg_type="session_flow_halted",
+                channel=channel,
+                metadata={"session_id": session["id"],
+                          "halt_reason": fs.halt_reason},
+            )
+            self._store.interrupt(session["id"],
+                                  f"flow coordinator: {fs.halt_reason}")
+            return
+
+        self._route_flow_action(session, action)
+
+    def _advance_flow_coordinator(self, session: dict, message_id: int):
+        """Advance a flow-coordinator session based on the agent's verdict."""
+        from flow_coordinator import (
+            FlowState, on_developer_verdict, on_agy_verdict, on_codex_verdict,
+        )
+
+        fs_dict = session.get("flow_state", {})
+        fs = FlowState.from_dict(fs_dict)
+
+        tmpl = self._store.get_template(session["template_id"])
+        if not tmpl:
+            self._store.interrupt(session["id"], "template not found")
+            return
+
+        phases = tmpl.get("phases", [])
+        phase_idx = session["current_phase"]
+        if phase_idx >= len(phases):
+            self._store.complete(session["id"], message_id)
+            return
+
+        role = phases[phase_idx]["participants"][0]
+        output = session.get("_last_msg", {}).get("text", "")
+
+        tokens = self._ROLE_TO_VERDICT_TOKENS.get(role)
+        if not tokens:
+            log.warning("Session %d: no verdict tokens for role '%s'",
+                        session["id"], role)
+            self._store.interrupt(session["id"],
+                                  f"flow coordinator: unknown role '{role}'")
+            return
+
+        verdict = parse_workflow_verdict(output, tokens)
+        channel = session.get("channel", "general")
+
+        _ROLE_HANDLER = {
+            "developer": lambda: on_developer_verdict(
+                fs, verdict.token, report_path="", notes=verdict.notes),
+            "ui_lead": lambda: on_agy_verdict(
+                fs, verdict.token, notes=verdict.notes),
+            "codex_reviewer": lambda: on_codex_verdict(
+                fs, verdict.token, notes=verdict.notes,
+                fix_description=verdict.notes),
+        }
+        handler = _ROLE_HANDLER.get(role)
+        if not handler:
+            log.warning("Session %d: flow coordinator has no handler for role '%s'",
+                        session["id"], role)
+            self._store.interrupt(session["id"],
+                                  f"flow coordinator: unhandled role '{role}'")
+            return
+        action = handler()
+
+        self._store.update_flow_state(session["id"], fs.to_dict())
+
+        self._messages.add(
+            sender="system",
+            text=f"[{role}] verdict: {verdict.token}",
+            msg_type="session_flow_verdict",
+            channel=channel,
+            metadata={"session_id": session["id"], "role": role,
+                      "token": verdict.token, "phase": fs.phase.value},
+        )
+
+        if action.is_terminal:
+            if fs.phase.value == "closure":
+                self._messages.add(
+                    sender="system",
+                    text=f"Flow coordinator closure: {action.prompt_context}",
+                    msg_type="session_flow_closure",
+                    channel=channel,
+                    metadata={"session_id": session["id"],
+                              "closure_summary": fs.closure_summary},
+                )
+                self._store.complete(session["id"], message_id)
+            else:
+                self._messages.add(
+                    sender="system",
+                    text=f"Flow coordinator halted: {fs.halt_reason}",
+                    msg_type="session_flow_halted",
+                    channel=channel,
+                    metadata={"session_id": session["id"],
+                              "halt_reason": fs.halt_reason},
+                )
+                self._store.interrupt(session["id"],
+                                      f"flow coordinator: {fs.halt_reason}")
+            return
+
+        self._route_flow_action(session, action)
+
+    def _route_flow_action(self, session: dict, action):
+        """Set the session to the target role's phase and trigger the agent."""
+        session_id = session["id"]
+
+        # Reload from store so we never dispatch from a stale in-memory copy.
+        session = self._store.get(session_id)
+        if not session or session.get("state") in ("complete", "interrupted"):
+            return
+
+        tmpl = self._store.get_template(session["template_id"])
+        if not tmpl:
+            return
+
+        target = action.target_role
+        phases = tmpl.get("phases", [])
+
+        target_phase = None
+        for i, phase in enumerate(phases):
+            participants = phase.get("participants", [])
+            role_map = {
+                "developer": "developer",
+                "agy": "ui_lead",
+                "codex": "codex_reviewer",
+            }
+            mapped_role = role_map.get(target, target)
+            if mapped_role in participants:
+                target_phase = i
+                break
+
+        if target_phase is None:
+            log.warning("Session %d: no phase found for target role '%s'",
+                        session_id, target)
+            self._store.interrupt(session_id,
+                                  f"flow coordinator: no phase for '{target}'")
+            return
+
+        session = self._store.set_phase_and_turn(session_id, target_phase, 0)
+        if not session:
+            return
+
+        channel = session.get("channel", "general")
+        phase_obj = phases[target_phase]
+        self._messages.add(
+            sender="system",
+            text=f"Phase: {phase_obj['name']}",
+            msg_type="session_phase",
+            channel=channel,
+            metadata={"session_id": session_id,
+                      "phase": target_phase,
+                      "phase_name": phase_obj["name"]},
+        )
+        self._trigger_current(session)
+
+    def is_flow_coordinator_session(self, session: dict) -> bool:
+        """True if the session's template opts in to flow-coordinator routing.
+
+        Only templates with ``"flow_coordinator": true`` activate the sandbox
+        orchestration loop. All other templates (including the 6 shipped linear
+        templates) behave exactly as before — this is the opt-in gate.
+        """
+        tmpl = self._store.get_template(session.get("template_id", ""))
+        if not tmpl:
+            return False
+        return bool(tmpl.get("flow_coordinator"))
+
     def _enrich(self, session: dict) -> dict:
         """Add computed fields to a session dict for the frontend."""
         tmpl = self._store.get_template(session["template_id"])
@@ -694,4 +906,5 @@ class SessionEngine:
                     role = participants[turn_idx]
                     session["current_role"] = role
                     session["current_agent"] = session.get("cast", {}).get(role)
+            session["flow_coordinator"] = bool(tmpl.get("flow_coordinator"))
         return session

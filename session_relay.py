@@ -301,3 +301,105 @@ def is_relay_queue_entry(entry: dict) -> bool:
     """Check if a queue entry is a relay session turn."""
     meta = entry.get("relay_meta", {})
     return meta.get("relay_mode", False) and meta.get("disable_mcp", False)
+
+
+# ---------------------------------------------------------------------------
+# Workflow verdict parser (sandbox orchestration flow)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkflowVerdict:
+    """Parsed result of a workflow participant's verdict output."""
+    token: str
+    passed: bool
+    needs_rework: bool
+    raw_output: str
+    notes: str = ""
+
+AGY_TOKENS = {
+    "PASS": {"passed": True, "needs_rework": False},
+    "PASS WITH NOTES": {"passed": True, "needs_rework": False},
+    "REQUEST UX CHANGES": {"passed": False, "needs_rework": True},
+    "BLOCKED": {"passed": False, "needs_rework": False},
+}
+
+CODEX_REVIEWER_TOKENS = {
+    "PASS": {"passed": True, "needs_rework": False},
+    "PASS WITH NOTES": {"passed": True, "needs_rework": False},
+    "REQUEST CHANGES": {"passed": False, "needs_rework": True},
+    "BLOCKED": {"passed": False, "needs_rework": False},
+}
+
+DEVELOPER_TOKENS = {
+    "READY_FOR_AGY_REVIEW": {"passed": True, "needs_rework": False},
+    "READY_FOR_CODEX_REVIEW": {"passed": True, "needs_rework": False},
+    "READY_FOR_REVIEW_PACKAGE": {"passed": True, "needs_rework": False},
+    "BLOCKED": {"passed": False, "needs_rework": False},
+}
+
+_ALL_WORKFLOW_TOKENS = set(AGY_TOKENS) | set(CODEX_REVIEWER_TOKENS) | set(DEVELOPER_TOKENS)
+
+
+def parse_workflow_verdict(output: str | None, accepted_tokens: dict) -> WorkflowVerdict:
+    """Parse a workflow participant's output into a WorkflowVerdict.
+
+    First non-empty line is matched case-insensitively against accepted_tokens.
+    Ambiguous, empty, or unrecognised output fails closed (token="AMBIGUOUS",
+    passed=False, needs_rework=False). Does NOT alter CodexSafe safety-gate
+    verdict behaviour — that path uses parse_safety_verdict exclusively.
+    """
+    if not output or not output.strip():
+        return WorkflowVerdict(
+            token="AMBIGUOUS", passed=False, needs_rework=False,
+            raw_output=output or "",
+            notes="empty output from workflow participant",
+        )
+
+    non_empty = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    if not non_empty:
+        return WorkflowVerdict(
+            token="AMBIGUOUS", passed=False, needs_rework=False,
+            raw_output=output,
+            notes="no non-empty line in workflow output",
+        )
+
+    first_line = non_empty[0]
+    first_upper = first_line.upper()
+
+    # Build case-insensitive lookup
+    upper_map = {k.upper(): k for k in accepted_tokens}
+
+    if first_upper not in upper_map:
+        return WorkflowVerdict(
+            token="AMBIGUOUS", passed=False, needs_rework=False,
+            raw_output=output,
+            notes=f"unrecognised verdict: {first_line[:100]}",
+        )
+
+    canonical = upper_map[first_upper]
+    spec = accepted_tokens[canonical]
+    rest = non_empty[1:]
+
+    # Check for conflicting verdict-like lines using ALL known workflow tokens
+    # (not just the current role's accepted_tokens) so a cross-role verdict
+    # token on a later line is also caught as ambiguous.
+    all_upper = {k.upper() for k in _ALL_WORKFLOW_TOKENS}
+    conflicting = next(
+        (ln for ln in rest if ln.strip().upper() in all_upper), None
+    )
+    if conflicting is not None:
+        return WorkflowVerdict(
+            token="AMBIGUOUS", passed=False, needs_rework=False,
+            raw_output=output,
+            notes=f"mixed/conflicting verdict: {canonical} followed by '{conflicting[:80]}'",
+        )
+
+    notes_text = "\n".join(rest) if rest else ""
+
+    return WorkflowVerdict(
+        token=canonical,
+        passed=spec["passed"],
+        needs_rework=spec["needs_rework"],
+        raw_output=output,
+        notes=notes_text,
+    )
