@@ -1147,6 +1147,127 @@ def _build_agy_store_command(command: str, prompt: str, print_timeout: int, *,
     return [command, *args, "--print", prompt, "--print-timeout", f"{print_timeout}s"]
 
 
+def _build_claude_print_command(command: str, prompt: str, *, use_stdin: bool = True):
+    """Build a Claude ``--print`` invocation and optional stdin payload."""
+    if use_stdin:
+        return [command, "--print"], prompt.encode("utf-8")
+    return [command, "--print", prompt], None
+
+
+def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
+                                trigger_flag=None, running_flag=None,
+                                data_dir=None, no_restart=False,
+                                server_port=8300, get_token_fn=None):
+    """Headless Claude runner using ``claude --print`` with stdin payloads."""
+    import queue as _queue
+    import subprocess
+
+    work: "_queue.Queue[dict]" = _queue.Queue()
+
+    def _enqueue(text, channel="", **kwargs):
+        if running_flag is not None:
+            running_flag[0] = True
+        work.put({"prompt": text, "channel": channel or "general"})
+
+    start_watcher(_enqueue)
+
+    log_path = (data_dir / f"{agent}_print_exec.log") if data_dir else None
+    print(f"  === {agent.capitalize()} Print-Exec Wrapper (headless, stdin relay) ===")
+    print(f"  @mentions run: {command} --print <stdin>")
+    if log_path:
+        print(f"  Exec log: {log_path}")
+    print("  Waiting for mentions...\n")
+
+    while True:
+        try:
+            item = work.get()
+        except (KeyboardInterrupt, EOFError):
+            break
+        if running_flag is not None:
+            running_flag[0] = True
+
+        if isinstance(item, dict):
+            prompt = item.get("prompt", "")
+            reply_channel = item.get("channel", "general")
+        else:
+            prompt = item
+            reply_channel = "general"
+
+        cmd, stdin_payload = _build_claude_print_command(
+            command, prompt, use_stdin=True)
+        print(f"  > {agent} print-exec triggered ({len(prompt)} chars)")
+
+        timed_out = False
+        errored = False
+        proc = None
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=cwd,
+                env=env,
+                input=stdin_payload,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=EXEC_TIMEOUT_SECS,
+            )
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            print(f"  > {agent} print-exec timed out ({EXEC_TIMEOUT_SECS}s)")
+        except Exception as exc:  # noqa: BLE001
+            errored = True
+            print(f"  > {agent} print-exec error: {exc}")
+
+        returncode = None
+        captured = ""
+        stderr_text = ""
+        if proc is not None:
+            returncode = proc.returncode
+            print(f"  > {agent} print-exec finished (exit {proc.returncode})")
+            captured = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+            stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+
+        if log_path:
+            try:
+                with open(log_path, "ab") as lf:
+                    header = (
+                        f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} print-exec ===\n"
+                        f"channel={reply_channel} prompt_len={len(prompt)}\n"
+                    )
+                    lf.write(header.encode("utf-8", "replace"))
+                    if captured:
+                        lf.write(b"stdout: ")
+                        lf.write(captured.encode("utf-8", "replace"))
+                        lf.write(b"\n")
+                    if stderr_text:
+                        lf.write(b"stderr: ")
+                        lf.write(stderr_text.encode("utf-8", "replace"))
+                        lf.write(b"\n")
+            except Exception:
+                pass
+
+        if get_token_fn:
+            if timed_out:
+                reply = f"[claude --print timed out after {EXEC_TIMEOUT_SECS}s]"
+            elif errored:
+                reply = "[claude --print failed to start]"
+            elif captured:
+                reply = _format_relay_reply(captured)
+            elif returncode not in (None, 0):
+                reply = f"[claude --print failed (exit {returncode})]"
+            else:
+                reply = "[claude produced no reply]"
+            try:
+                _relay_to_chat(server_port, get_token_fn(), reply, channel=reply_channel)
+                print(f"  > {agent} reply relayed ({len(reply)} chars) -> #{reply_channel}")
+            except Exception as exc:
+                print(f"  > {agent} relay failed: {exc}")
+
+        if running_flag is not None and work.empty():
+            running_flag[0] = False
+        if no_restart:
+            break
+
+
 def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
                          trigger_flag=None, running_flag=None,
                          data_dir=None, no_restart=False,
@@ -1742,7 +1863,10 @@ def main():
     strip_vars = {"CLAUDECODE"} | set(agent_cfg.get("strip_env", []))
     env = {k: v for k, v in os.environ.items() if k not in strip_vars}
 
-    resolved = shutil.which(command)
+    if sys.platform == "win32" and command.lower() == "claude":
+        resolved = shutil.which("claude.cmd") or shutil.which(command)
+    else:
+        resolved = shutil.which(command)
     if not resolved:
         print(f"  Error: '{command}' not found on PATH.")
         print("  Install it first, then try again.")
@@ -1820,7 +1944,7 @@ def main():
     # Exec mode runs are stateless fresh contexts with proxy-assigned identity,
     # so the "reclaim your previous identity" hint is never applicable and only
     # provokes an unnecessary chat_claim. Suppress it.
-    _suppress_identity_hint = agent_cfg.get("run_mode", "tui") in ("exec", "store_exec")
+    _suppress_identity_hint = agent_cfg.get("run_mode", "tui") in ("exec", "store_exec", "print_exec")
     _trigger_flag = [False]  # shared: queue watcher sets True, activity checker reads
     _refresh_interval = 10  # default; overridden per-trigger by server settings
 
@@ -1918,7 +2042,7 @@ def main():
     unix_session_name = f"agentchattr-{assigned_name}"
     _exec_running = [False]
 
-    if run_mode in ("exec", "store_exec", "claude_relay"):
+    if run_mode in ("exec", "store_exec", "print_exec", "claude_relay"):
         # Headless exec mode: activity = a run in flight.
         _set_activity_checker(lambda: _exec_running[0])
     elif sys.platform == "win32":
@@ -1940,6 +2064,20 @@ def main():
                 agent=agent,
                 start_watcher=start_watcher,
                 exec_args=_build_codex_exec_args(agent_cfg, data_dir, assigned_name),
+                trigger_flag=_trigger_flag,
+                running_flag=_exec_running,
+                data_dir=data_dir,
+                no_restart=args.no_restart,
+                server_port=server_port,
+                get_token_fn=get_token,
+            )
+        elif run_mode == "print_exec":
+            run_agent_claude_print_exec(
+                command=command,
+                cwd=cwd,
+                env={**env, **(inject_env or {})},
+                agent=agent,
+                start_watcher=start_watcher,
                 trigger_flag=_trigger_flag,
                 running_flag=_exec_running,
                 data_dir=data_dir,

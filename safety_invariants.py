@@ -107,7 +107,7 @@ def _fail(code: str, reason: str, detail=()) -> InvariantResult:
 # ---------------------------------------------------------------------------
 
 # Recognised run modes. Anything else (including None / "") fails closed.
-KNOWN_RUN_MODES = frozenset({"tui", "exec", "store_exec", "claude_relay"})
+KNOWN_RUN_MODES = frozenset({"tui", "exec", "store_exec", "print_exec", "claude_relay"})
 # When an agent config omits run_mode entirely, the wrapper defaults to "tui".
 DEFAULT_RUN_MODE = "tui"
 
