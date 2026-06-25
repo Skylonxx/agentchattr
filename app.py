@@ -371,19 +371,23 @@ def configure(cfg: dict, session_token: str = ""):
     )
     agents = AgentTrigger(registry, data_dir=data_dir)
 
+    sb_cfg = normalize_sandbox_config(cfg)
+    sb_guard = check_sandbox_config(sb_cfg)
+    if not sb_guard.ok:
+        raise RuntimeError(f"Invalid sandbox config ({sb_guard.code}): {sb_guard.reason}")
+
     # Sessions
     ROOT = Path(__file__).parent
     session_store = SessionStore(
         str(Path(data_dir) / "session_runs.json"),
         templates_dir=str(ROOT / "session_templates"),
     )
-    session_engine = SessionEngine(session_store, store, agents, registry)
+    session_engine = SessionEngine(
+        session_store, store, agents, registry,
+        sandbox_config=sb_cfg,
+        data_dir=data_dir,
+    )
     session_store.on_change(_on_session_change)
-
-    sb_cfg = normalize_sandbox_config(cfg)
-    sb_guard = check_sandbox_config(sb_cfg)
-    if not sb_guard.ok:
-        raise RuntimeError(f"Invalid sandbox config ({sb_guard.code}): {sb_guard.reason}")
 
     # Bridge: when ANY message is added to store (including via MCP),
     # broadcast to all WebSocket clients

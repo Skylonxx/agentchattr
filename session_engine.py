@@ -147,11 +147,14 @@ class SessionEngine:
     agents via the AgentTrigger system.
     """
 
-    def __init__(self, session_store, message_store, agent_trigger, registry=None):
+    def __init__(self, session_store, message_store, agent_trigger, registry=None,
+                 sandbox_config: dict | None = None, data_dir: str | None = None):
         self._store = session_store
         self._messages = message_store
         self._trigger = agent_trigger
         self._registry = registry
+        self._sandbox_config = sandbox_config or {}
+        self._data_dir = data_dir
         self._lock = threading.Lock()
 
         # Hook into message stream
@@ -721,17 +724,7 @@ class SessionEngine:
         self._store.update_flow_state(session["id"], fs.to_dict())
 
         if action.is_terminal:
-            channel = session.get("channel", "general")
-            self._messages.add(
-                sender="system",
-                text=f"Flow coordinator halted: {fs.halt_reason}",
-                msg_type="session_flow_halted",
-                channel=channel,
-                metadata={"session_id": session["id"],
-                          "halt_reason": fs.halt_reason},
-            )
-            self._store.interrupt(session["id"],
-                                  f"flow coordinator: {fs.halt_reason}")
+            self._handle_flow_terminal(session, fs, None, action)
             return
 
         self._route_flow_action(session, action)
@@ -739,8 +732,9 @@ class SessionEngine:
     def _advance_flow_coordinator(self, session: dict, message_id: int):
         """Advance a flow-coordinator session based on the agent's verdict."""
         from flow_coordinator import (
-            FlowState, on_developer_verdict, on_agy_verdict, on_codex_verdict,
+            FlowState, _halt, on_developer_verdict, on_agy_verdict, on_codex_verdict,
         )
+        from flow_transcript import parse_report_path, validate_approved_report_path
 
         fs_dict = session.get("flow_state", {})
         fs = FlowState.from_dict(fs_dict)
@@ -770,9 +764,35 @@ class SessionEngine:
         verdict = parse_workflow_verdict(output, tokens)
         channel = session.get("channel", "general")
 
+        report_path = parse_report_path(output) or ""
+        if role == "developer" and report_path:
+            ok, reason = validate_approved_report_path(report_path)
+            if not ok:
+                import time as _time
+                block_reason = f"blocked: invalid report_path: {reason}"
+                fs.total_steps += 1
+                fs.verdicts.append({
+                    "role": "developer",
+                    "token": "BLOCKED",
+                    "notes": f"invalid report_path: {reason}",
+                    "time": _time.time(),
+                })
+                action = _halt(fs, block_reason)
+                self._store.update_flow_state(session["id"], fs.to_dict())
+                self._messages.add(
+                    sender="system",
+                    text=f"[{role}] verdict: BLOCKED (invalid report_path)",
+                    msg_type="session_flow_verdict",
+                    channel=channel,
+                    metadata={"session_id": session["id"], "role": role,
+                              "token": "BLOCKED", "phase": fs.phase.value},
+                )
+                self._handle_flow_terminal(session, fs, message_id, action, output)
+                return
+
         _ROLE_HANDLER = {
             "developer": lambda: on_developer_verdict(
-                fs, verdict.token, report_path="", notes=verdict.notes),
+                fs, verdict.token, report_path=report_path, notes=verdict.notes),
             "ui_lead": lambda: on_agy_verdict(
                 fs, verdict.token, notes=verdict.notes),
             "codex_reviewer": lambda: on_codex_verdict(
@@ -800,30 +820,130 @@ class SessionEngine:
         )
 
         if action.is_terminal:
-            if fs.phase.value == "closure":
-                self._messages.add(
-                    sender="system",
-                    text=f"Flow coordinator closure: {action.prompt_context}",
-                    msg_type="session_flow_closure",
-                    channel=channel,
-                    metadata={"session_id": session["id"],
-                              "closure_summary": fs.closure_summary},
-                )
-                self._store.complete(session["id"], message_id)
-            else:
-                self._messages.add(
-                    sender="system",
-                    text=f"Flow coordinator halted: {fs.halt_reason}",
-                    msg_type="session_flow_halted",
-                    channel=channel,
-                    metadata={"session_id": session["id"],
-                              "halt_reason": fs.halt_reason},
-                )
-                self._store.interrupt(session["id"],
-                                      f"flow coordinator: {fs.halt_reason}")
+            self._handle_flow_terminal(session, fs, message_id, action, output)
             return
 
         self._route_flow_action(session, action)
+
+    def _resolve_sandbox_output_root(self) -> str:
+        from safety_invariants import SANDBOX_CONFIG_DEFAULTS, normalize_sandbox_config
+
+        sb = normalize_sandbox_config({"sandbox": self._sandbox_config})
+        return str(sb.get("flow_start_output_root")
+                     or SANDBOX_CONFIG_DEFAULTS["flow_start_output_root"])
+
+    def _export_flow_artifacts(self, session: dict, flow_state: dict,
+                               last_output: str = ""):
+        """Write transcript + closure markdown; return FlowExportResult."""
+        from flow_transcript import FlowExportResult, export_sandbox_flow_artifacts
+
+        channel = session.get("channel", "general")
+        messages = self._messages.get_recent(count=500, channel=channel)
+        tmpl = self._store.get_template(session.get("template_id", ""))
+        result = export_sandbox_flow_artifacts(
+            session=session,
+            template=tmpl,
+            flow_state=flow_state,
+            messages=messages,
+            output_root=self._resolve_sandbox_output_root(),
+            data_dir=self._data_dir,
+            last_output_snippet=last_output,
+        )
+        if not result.ok:
+            log.warning("Session %s: flow export failed: %s",
+                        session.get("id"), result.error)
+        return result
+
+    def _handle_flow_terminal(self, session: dict, fs, message_id: int,
+                              action, last_output: str = ""):
+        """Complete or interrupt a flow-coordinator session with V2-C exports."""
+        from flow_coordinator import FlowState
+        from flow_transcript import (
+            format_flow_export_error_message,
+            format_flow_export_system_message,
+        )
+
+        if not isinstance(fs, FlowState):
+            fs = FlowState.from_dict(fs if isinstance(fs, dict) else {})
+
+        channel = session.get("channel", "general")
+        session_id = session["id"]
+        fs_dict = fs.to_dict()
+        original_halt_reason = fs.halt_reason or ""
+
+        export_result = self._export_flow_artifacts(
+            session, fs_dict, last_output=last_output)
+
+        if not export_result.ok:
+            export_error = export_result.error or "unknown export error"
+            self._messages.add(
+                sender="system",
+                text=format_flow_export_error_message(
+                    session=session,
+                    error=export_error,
+                ),
+                msg_type="session_flow_export_error",
+                channel=channel,
+                metadata={
+                    "session_id": session_id,
+                    "export_error": export_error,
+                    "final_status": fs_dict.get("phase"),
+                },
+            )
+            if original_halt_reason:
+                interrupt_reason = (
+                    f"{original_halt_reason}; flow export failed: {export_error}")
+            else:
+                interrupt_reason = f"flow export failed: {export_error}"
+            self._store.interrupt(session_id, interrupt_reason)
+            return
+
+        transcript_path = export_result.transcript_path
+        closure_path = export_result.closure_path
+        if transcript_path or closure_path:
+            fs_dict["transcript_path"] = transcript_path
+            fs_dict["closure_path"] = closure_path
+            self._store.update_flow_state(session_id, fs_dict)
+
+        self._messages.add(
+            sender="system",
+            text=format_flow_export_system_message(
+                session=session,
+                flow_state=fs_dict,
+                transcript_path=transcript_path,
+                closure_path=closure_path,
+            ),
+            msg_type="session_flow_export",
+            channel=channel,
+            metadata={
+                "session_id": session_id,
+                "transcript_path": transcript_path,
+                "closure_path": closure_path,
+                "final_status": fs_dict.get("phase"),
+            },
+        )
+
+        if fs.phase.value == "closure":
+            self._messages.add(
+                sender="system",
+                text=f"Flow coordinator closure: {action.prompt_context}",
+                msg_type="session_flow_closure",
+                channel=channel,
+                metadata={"session_id": session_id,
+                            "closure_summary": fs.closure_summary},
+            )
+            self._store.complete(session_id, message_id)
+        else:
+            self._messages.add(
+                sender="system",
+                text=f"Flow coordinator halted: {fs.halt_reason}",
+                msg_type="session_flow_halted",
+                channel=channel,
+                metadata={"session_id": session_id,
+                          "halt_reason": fs.halt_reason},
+            )
+            self._store.interrupt(session_id,
+                                  f"flow coordinator: {fs.halt_reason}")
 
     def _route_flow_action(self, session: dict, action):
         """Set the session to the target role's phase and trigger the agent."""
