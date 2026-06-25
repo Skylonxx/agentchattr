@@ -25,6 +25,7 @@ import shutil
 import sys
 import threading
 import time
+import inspect
 from pathlib import Path
 
 ROOT = Path(__file__).parent
@@ -545,6 +546,21 @@ def _build_direct_mention_prompt(channel: str, mention_payload: str, *,
     return prompt
 
 
+def _inject_with_supported_kwargs(inject_fn, text: str, **kwargs):
+    """Call an injector without passing kwargs its signature cannot accept."""
+    try:
+        sig = inspect.signature(inject_fn)
+    except (TypeError, ValueError):
+        return inject_fn(text, **kwargs)
+
+    params = sig.parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return inject_fn(text, **kwargs)
+
+    supported = {k: v for k, v in kwargs.items() if k in params}
+    return inject_fn(text, **supported)
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10, suppress_identity_hint: bool = False,
@@ -611,7 +627,8 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # so multi-line is safe). Forward the prompt unmutated plus the
                     # structured relay_meta so the exec runner can disable MCP.
                     if relay_meta is not None and relay_prompt:
-                        inject_fn(relay_prompt, relay_meta=relay_meta)
+                        _inject_with_supported_kwargs(
+                            inject_fn, relay_prompt, relay_meta=relay_meta)
                         time.sleep(1)
                         continue
 
@@ -699,7 +716,8 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # Flatten to single line — multi-line text triggers paste
                     # detection in CLIs (Claude Code shows "[Pasted text +N]")
                     # which can break injection of long session prompts
-                    inject_fn(prompt.replace("\n", " "), channel=channel)
+                    _inject_with_supported_kwargs(
+                        inject_fn, prompt.replace("\n", " "), channel=channel)
         except Exception:
             try:
                 agent_label, qpath = get_identity_fn()
