@@ -25,6 +25,16 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent
 
+SAFE_LOCAL_AGENT_OVERRIDE_KEYS = frozenset({
+    "run_mode",
+    "cwd",
+    "inject_delay",
+    "skip_vt_input",
+    "print_timeout",
+    "exec_prompt_suffix",
+    "strip_env",
+})
+
 
 # Mapping: env var name → (config section, key, is_int)
 _ENV_OVERRIDES = [
@@ -100,6 +110,33 @@ def _apply_env_overrides(config: dict) -> None:
         config.setdefault(section, {})[key] = value
 
 
+def _merge_local_agents(config: dict, local: dict) -> None:
+    """Merge local [agents] with a strict allowlist for existing agents."""
+    local_agents = local.get("agents", {})
+    config_agents = config.setdefault("agents", {})
+    for name, agent_cfg in local_agents.items():
+        if name not in config_agents:
+            config_agents[name] = agent_cfg
+            continue
+        if not isinstance(config_agents[name], dict) or not isinstance(agent_cfg, dict):
+            print(f"  Warning: Ignoring local agent '{name}' (incompatible config shape)")
+            continue
+
+        safe_updates = {
+            key: value for key, value in agent_cfg.items()
+            if key in SAFE_LOCAL_AGENT_OVERRIDE_KEYS
+        }
+        ignored_keys = sorted(set(agent_cfg) - set(safe_updates))
+        config_agents[name].update(safe_updates)
+
+        if safe_updates:
+            applied = ", ".join(sorted(safe_updates))
+            print(f"  Info: Applied safe local overrides for agent '{name}': {applied}")
+        if ignored_keys:
+            ignored = ", ".join(ignored_keys)
+            print(f"  Warning: Ignoring unsafe local overrides for agent '{name}': {ignored}")
+
+
 def load_config(root: Path | None = None) -> dict:
     """Load config.toml and merge config.local.toml if it exists.
 
@@ -122,15 +159,10 @@ def load_config(root: Path | None = None) -> dict:
         with open(local_path, "rb") as f:
             local = tomllib.load(f)
 
-        # Merge [agents] section — local agents are added ONLY if they don't already exist.
-        # This protects the "holy trinity" (claude, codex, gemini) from being overridden.
-        local_agents = local.get("agents", {})
-        config_agents = config.setdefault("agents", {})
-        for name, agent_cfg in local_agents.items():
-            if name not in config_agents:
-                config_agents[name] = agent_cfg
-            else:
-                print(f"  Warning: Ignoring local agent '{name}' (already defined in config.toml)")
+        # Merge [agents] section. New local agents are added as-is. For existing
+        # agents, only an explicit allowlist of runtime-safe keys may override the
+        # committed config. Executable/identity-shaping keys stay protected.
+        _merge_local_agents(config, local)
 
         # Merge [sandbox] — local overrides committed defaults (Owner opt-in enablement).
         local_sandbox = local.get("sandbox")
