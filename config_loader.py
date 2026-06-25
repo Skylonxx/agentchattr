@@ -105,8 +105,8 @@ def load_config(root: Path | None = None) -> dict:
 
     config.local.toml is gitignored and intended for user-specific agents
     (e.g. local LLM endpoints) that shouldn't be committed.
-    Only the [agents] section is merged — local entries are added alongside
-    (not replacing) the agents defined in config.toml.
+    [agents] from local are added alongside (not replacing) config.toml entries.
+    [sandbox] from local overrides committed [sandbox] defaults.
 
     AGENTCHATTR_* environment variables override values from config.toml
     (see module docstring for the list).
@@ -131,6 +131,15 @@ def load_config(root: Path | None = None) -> dict:
                 config_agents[name] = agent_cfg
             else:
                 print(f"  Warning: Ignoring local agent '{name}' (already defined in config.toml)")
+
+        # Merge [sandbox] — local overrides committed defaults (Owner opt-in enablement).
+        local_sandbox = local.get("sandbox")
+        if isinstance(local_sandbox, dict) and local_sandbox:
+            config_sandbox = config.setdefault("sandbox", {})
+            if not isinstance(config_sandbox, dict):
+                config_sandbox = {}
+                config["sandbox"] = config_sandbox
+            config_sandbox.update(local_sandbox)
 
     _apply_env_overrides(config)
 

@@ -946,3 +946,176 @@ def check_sandbox_template_safe(template: dict) -> InvariantResult:
     if "twinpet" in blob:
         return _fail("INV-022", "sandbox template references twinpet")
     return _ok("INV-022")
+
+
+# ---------------------------------------------------------------------------
+# Sandbox flow start API (V2-B) — loopback, config, cast, channel helpers
+# ---------------------------------------------------------------------------
+
+SANDBOX_CONFIG_DEFAULTS = {
+    "flow_start_enabled": False,
+    "flow_start_require_loopback": True,
+    "flow_start_template_allowlist": ["sandbox-bakery-flow"],
+    "flow_start_channel_prefix": "sandbox-flow",
+    "flow_start_max_active": 1,
+    "flow_start_rate_limit_per_minute": 3,
+    "flow_start_output_root": r"C:\Users\Narachat\OneDrive\Ai-Report\claude",
+}
+
+SANDBOX_TEMPLATE_ROSTER_MAP = {
+    "developer": "developer",
+    "ui_lead": "ui_lead",
+    "codex_reviewer": "runtime_reviewer",
+}
+
+# V2-B reserves exactly this prefix; channel names are sandbox-flow-* only.
+SANDBOX_FLOW_RESERVED_PREFIX = "sandbox-flow"
+
+SANDBOX_CHANNEL_RE = re.compile(r"^sandbox-flow-[a-z0-9][a-z0-9\-]{0,35}$")
+_SANDBOX_PHASE_RE = re.compile(r"^[a-z0-9][a-z0-9\-]{0,7}$")
+
+# Generic base Codex identity must not serve as sandbox flow reviewer.
+SANDBOX_REVIEWER_FORBIDDEN_AGENTS = frozenset({"codex"})
+
+
+def is_loopback_client(host: str | None) -> bool:
+    """Return True iff the TCP client is local loopback. Fail closed on None/empty."""
+    if not host or not str(host).strip():
+        return False
+    h = str(host).strip().lower()
+    if h.startswith("::ffff:"):
+        h = h[7:]
+    if h == "localhost":
+        return True
+    try:
+        import ipaddress
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return h in ("127.0.0.1", "::1")
+
+
+def normalize_sandbox_config(config: dict | None) -> dict:
+    """Return sandbox settings with documented defaults (fail-closed when missing)."""
+    raw = {}
+    if isinstance(config, dict):
+        section = config.get("sandbox")
+        if isinstance(section, dict):
+            raw = section
+    out = dict(SANDBOX_CONFIG_DEFAULTS)
+    out.update(raw)
+    out["flow_start_enabled"] = bool(out.get("flow_start_enabled", False))
+    out["flow_start_require_loopback"] = bool(
+        out.get("flow_start_require_loopback", True))
+    allow = out.get("flow_start_template_allowlist")
+    if not isinstance(allow, list):
+        allow = list(SANDBOX_CONFIG_DEFAULTS["flow_start_template_allowlist"])
+    out["flow_start_template_allowlist"] = [str(x) for x in allow if x]
+    out["flow_start_channel_prefix"] = str(
+        out.get("flow_start_channel_prefix") or "sandbox-flow")
+    try:
+        out["flow_start_max_active"] = max(1, int(out.get("flow_start_max_active", 1)))
+    except (TypeError, ValueError):
+        out["flow_start_max_active"] = 1
+    try:
+        out["flow_start_rate_limit_per_minute"] = max(
+            1, int(out.get("flow_start_rate_limit_per_minute", 3)))
+    except (TypeError, ValueError):
+        out["flow_start_rate_limit_per_minute"] = 3
+    out["flow_start_output_root"] = str(
+        out.get("flow_start_output_root")
+        or SANDBOX_CONFIG_DEFAULTS["flow_start_output_root"])
+    return out
+
+
+def check_sandbox_config(sandbox_cfg: dict) -> InvariantResult:
+    """Validate normalized sandbox config at startup (fail closed)."""
+    if not isinstance(sandbox_cfg, dict):
+        return _fail("INV-022", "sandbox config must be a mapping")
+    if sandbox_cfg.get("flow_start_max_active", 1) < 1:
+        return _fail("INV-022", "flow_start_max_active must be >= 1")
+    allow = sandbox_cfg.get("flow_start_template_allowlist")
+    if sandbox_cfg.get("flow_start_enabled") and (not allow or not isinstance(allow, list)):
+        return _fail("INV-022", "flow_start_template_allowlist must be non-empty when enabled")
+    if sandbox_cfg.get("flow_start_enabled") and not sandbox_cfg.get(
+            "flow_start_require_loopback", True):
+        return _fail(
+            "INV-022",
+            "flow_start_require_loopback must remain true when flow_start_enabled is true",
+        )
+    prefix = str(sandbox_cfg.get("flow_start_channel_prefix", "")).strip()
+    if prefix != SANDBOX_FLOW_RESERVED_PREFIX:
+        return _fail(
+            "INV-022",
+            f'flow_start_channel_prefix must be "{SANDBOX_FLOW_RESERVED_PREFIX}" in V2-B '
+            f"(got {prefix!r})",
+        )
+    return _ok("INV-022")
+
+
+def is_sandbox_task_blocked(task: str) -> bool:
+    """True if task text references blocked production paths (Twinpet, etc.)."""
+    from flow_coordinator import _is_blocked_path
+    return _is_blocked_path(task or "")
+
+
+def validate_sandbox_phase(phase: str) -> bool:
+    return bool(phase and _SANDBOX_PHASE_RE.match(phase))
+
+
+def build_sandbox_flow_channel_name(*, prefix: str, phase: str, session_id: int,
+                                    yymmdd: str, hhmm: str) -> str | None:
+    """Build channel name; return None if pattern/length invalid."""
+    name = f"{prefix}-{phase}-{yymmdd}-{hhmm}-{session_id}"
+    if not SANDBOX_CHANNEL_RE.match(name):
+        return None
+    return name
+
+
+def resolve_sandbox_flow_cast(template: dict, roster: dict, *,
+                              is_online_fn) -> tuple[dict | None, str, dict]:
+    """Resolve session cast from roster only. Fail closed.
+
+    Returns (cast, error_code, details). error_code is empty string on success.
+    """
+    if not isinstance(template, dict):
+        return None, "INVALID_TEMPLATE", {"reason": "template must be a mapping"}
+    roles = template.get("roles", [])
+    if not isinstance(roles, list) or not roles:
+        return None, "INVALID_TEMPLATE", {"reason": "template has no roles"}
+
+    cast: dict[str, str] = {}
+    offline: list[str] = []
+    required: list[str] = []
+
+    for template_role in roles:
+        roster_key = SANDBOX_TEMPLATE_ROSTER_MAP.get(template_role)
+        if not roster_key:
+            return None, "INVALID_TEMPLATE", {
+                "reason": f"unsupported template role: {template_role!r}",
+            }
+        agent = resolve_role_agent(roster_key, roster)
+        if not agent:
+            return None, "ROSTER_INVALID", {
+                "reason": f"roster missing or invalid mapping for {roster_key!r}",
+            }
+        if template_role == "codex_reviewer" and agent.lower() in SANDBOX_REVIEWER_FORBIDDEN_AGENTS:
+            return None, "ROSTER_INVALID", {
+                "reason": "generic codex not accepted for codex_reviewer; "
+                          "use codex_reviewer identity via runtime_reviewer roster key",
+            }
+        cast[template_role] = agent
+        required.append(agent)
+        if not is_online_fn(agent):
+            offline.append(agent)
+
+    if offline:
+        return None, "ROSTER_OFFLINE", {
+            "offline_agents": offline,
+            "required": required,
+        }
+
+    cast_guard = check_session_cast(cast, role_to_identity=cast)
+    if not cast_guard.ok:
+        return None, "ROSTER_INVALID", {"reason": cast_guard.reason}
+
+    return cast, "", {}

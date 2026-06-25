@@ -139,6 +139,19 @@ sse_port = 8201
 upload_dir = "./uploads"
 max_size_mb = 10
 
+# Sandbox flow start API (V2-B). Default OFF — enable in config.local.toml only.
+# flow_start_require_loopback must remain true when flow_start_enabled is true;
+# startup fails closed if a local override attempts to disable loopback.
+# flow_start_channel_prefix is fixed/reserved as "sandbox-flow" in V2-B (not configurable).
+[sandbox]
+flow_start_enabled = false
+flow_start_require_loopback = true
+flow_start_template_allowlist = ["sandbox-bakery-flow"]
+flow_start_channel_prefix = "sandbox-flow"
+flow_start_max_active = 1
+flow_start_rate_limit_per_minute = 3
+flow_start_output_root = "C:\\Users\\Narachat\\OneDrive\\Ai-Report\\claude"
+
 # --- MCP injection modes ---
 # By default, claude/codex/gemini/kimi use built-in MCP config injection.
 # For other CLI agents, set mcp_inject to tell the wrapper how to inject auth:

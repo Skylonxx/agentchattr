@@ -24,6 +24,18 @@ from agents import AgentTrigger
 from registry import RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
+from safety_invariants import (
+    build_sandbox_flow_channel_name,
+    check_sandbox_config,
+    check_sandbox_template_safe,
+    contains_secret,
+    is_loopback_client,
+    is_sandbox_task_blocked,
+    normalize_sandbox_config,
+    resolve_sandbox_flow_cast,
+    validate_sandbox_phase,
+    SANDBOX_CHANNEL_RE,
+)
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +72,70 @@ room_settings: dict = {
 # Channel validation
 _CHANNEL_NAME_RE = _re.compile(r'^[a-z0-9][a-z0-9\-]{0,19}$')
 MAX_CHANNELS = 8
+_SANDBOX_FLOW_CONFIRM_HEADER = "x-sandbox-flow-confirm"
+_sandbox_flow_rate: dict[str, list[float]] = {}
+_sandbox_flow_rate_lock = threading.Lock()
+
+
+_SANDBOX_FLOW_CHANNEL_PREFIX = "sandbox-flow-"
+
+
+def _validate_channel_name(name: str) -> bool:
+    """True if name is valid for user-driven channel create/rename (not sandbox-flow)."""
+    if not name:
+        return False
+    if name.startswith(_SANDBOX_FLOW_CHANNEL_PREFIX):
+        return False
+    return bool(_CHANNEL_NAME_RE.match(name))
+
+
+def _validate_sandbox_channel_name(name: str) -> bool:
+    """True if name matches server-generated sandbox-flow channel pattern."""
+    if not name:
+        return False
+    return bool(SANDBOX_CHANNEL_RE.match(name))
+
+
+def _sandbox_settings() -> dict:
+    return normalize_sandbox_config(config)
+
+
+def _check_sandbox_rate_limit(client_host: str, limit: int) -> bool:
+    """Return True if request is within rolling 60s rate limit."""
+    import time as _time
+    now = _time.time()
+    with _sandbox_flow_rate_lock:
+        times = _sandbox_flow_rate.setdefault(client_host or "?", [])
+        times[:] = [t for t in times if now - t < 60.0]
+        if len(times) >= limit:
+            return False
+        times.append(now)
+        return True
+
+
+def _append_sandbox_audit(record: dict):
+    """Append one JSON audit line; never includes session/agent tokens."""
+    try:
+        data_dir = Path(config.get("server", {}).get("data_dir", "./data"))
+        data_dir.mkdir(parents=True, exist_ok=True)
+        path = data_dir / "sandbox_flow_audit.jsonl"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        log.exception("Failed to append sandbox flow audit record")
+
+
+def _sandbox_agent_is_online(name: str) -> bool:
+    """Check agent presence for sandbox cast resolution (patchable in tests)."""
+    import mcp_bridge
+    return mcp_bridge.is_online(name)
+
+
+def _sandbox_flow_error(status: int, error: str, code: str, **details):
+    body = {"ok": False, "error": error, "code": code}
+    if details:
+        body["details"] = details
+    return JSONResponse(body, status_code=status)
 
 # Agent hats (persisted to data/hats.json)
 agent_hats: dict[str, str] = {}  # { agent_name: svg_string }
@@ -190,11 +266,17 @@ def _install_security_middleware(token: str, cfg: dict):
             # Agent registration/heartbeat: loopback only (no remote agent minting).
             if path.startswith(("/api/register", "/api/deregister/", "/api/heartbeat/")):
                 client_ip = request.client.host if request.client else ""
-                if client_ip not in ("127.0.0.1", "::1", "localhost"):
+                if not is_loopback_client(client_ip):
                     return JSONResponse(
                         {"error": f"forbidden: agent registration is restricted to local loopback. Source {client_ip} is not allowed."},
                         status_code=403,
                     )
+                return await call_next(request)
+
+            # Sandbox flow start: handler enforces guards; no session token here.
+            if path == "/api/sandbox/flow/start":
+                if request.method != "POST":
+                    return JSONResponse({"error": "method not allowed"}, status_code=405)
                 return await call_next(request)
 
             # --- Origin check (blocks cross-origin / DNS-rebinding attacks) ---
@@ -297,6 +379,11 @@ def configure(cfg: dict, session_token: str = ""):
     )
     session_engine = SessionEngine(session_store, store, agents, registry)
     session_store.on_change(_on_session_change)
+
+    sb_cfg = normalize_sandbox_config(cfg)
+    sb_guard = check_sandbox_config(sb_cfg)
+    if not sb_guard.ok:
+        raise RuntimeError(f"Invalid sandbox config ({sb_guard.code}): {sb_guard.reason}")
 
     # Bridge: when ANY message is added to store (including via MCP),
     # broadcast to all WebSocket clients
@@ -1411,7 +1498,7 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif event.get("type") == "channel_create":
                 name = (event.get("name") or "").strip().lower()
-                if not name or not _CHANNEL_NAME_RE.match(name):
+                if not name or not _validate_channel_name(name):
                     continue
                 if name in room_settings["channels"]:
                     continue
@@ -1426,7 +1513,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 new_name = (event.get("new_name") or "").strip().lower()
                 if old_name == "general":
                     continue
-                if not new_name or not _CHANNEL_NAME_RE.match(new_name):
+                if not new_name or not _validate_channel_name(new_name):
                     continue
                 if old_name not in room_settings["channels"]:
                     continue
@@ -2390,6 +2477,242 @@ async def get_all_active_sessions():
     if not session_engine:
         return JSONResponse([])
     return JSONResponse(session_engine.list_active())
+
+
+@app.post("/api/sandbox/flow/start")
+async def sandbox_flow_start(request: Request):
+    """Start a sandbox orchestration flow (localhost + config gated, V2-B)."""
+    import time as _time
+    from datetime import datetime
+
+    if not session_engine or not session_store or not store:
+        return _sandbox_flow_error(500, "sessions not configured", "NOT_CONFIGURED")
+
+    client_ip = request.client.host if request.client else ""
+    sb = _sandbox_settings()
+    audit_base = {
+        "time": _time.time(),
+        "client": client_ip,
+        "path": "/api/sandbox/flow/start",
+    }
+
+    def _audit(result: str, code: str, session_id=None, template_id=None):
+        rec = dict(audit_base)
+        rec.update({"result": result, "code": code})
+        if session_id is not None:
+            rec["session_id"] = session_id
+        if template_id:
+            rec["template_id"] = template_id
+        _append_sandbox_audit(rec)
+        log.info(
+            "SANDBOX_FLOW_START client=%s template=%s result=%s code=%s session_id=%s",
+            client_ip, template_id or "-", result, code, session_id or "-",
+        )
+
+    if not sb.get("flow_start_enabled"):
+        _audit("reject", "SANDBOX_FLOW_DISABLED")
+        return _sandbox_flow_error(
+            403, "forbidden: sandbox flow start is disabled", "SANDBOX_FLOW_DISABLED")
+
+    sb_cfg_guard = check_sandbox_config(sb)
+    if not sb_cfg_guard.ok:
+        _audit("reject", "INVALID_SANDBOX_CONFIG")
+        return _sandbox_flow_error(500, sb_cfg_guard.reason, "INVALID_SANDBOX_CONFIG")
+
+    if not is_loopback_client(client_ip):
+        _audit("reject", "NOT_LOOPBACK")
+        return _sandbox_flow_error(
+            403,
+            "forbidden: sandbox flow start is restricted to local loopback",
+            "NOT_LOOPBACK",
+            client=client_ip,
+        )
+
+    if request.headers.get(_SANDBOX_FLOW_CONFIRM_HEADER, "").strip() != "1":
+        _audit("reject", "CONFIRM_REQUIRED")
+        return _sandbox_flow_error(
+            400,
+            "missing or invalid X-Sandbox-Flow-Confirm header (expected: 1)",
+            "CONFIRM_REQUIRED",
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        _audit("reject", "INVALID_JSON")
+        return _sandbox_flow_error(400, "invalid JSON body", "INVALID_JSON")
+
+    if not isinstance(body, dict):
+        _audit("reject", "INVALID_JSON")
+        return _sandbox_flow_error(400, "request body must be a JSON object", "INVALID_JSON")
+
+    forbidden = [k for k in ("cast", "channel", "dry_run") if k in body]
+    if forbidden:
+        field = forbidden[0]
+        if field == "cast":
+            msg = "client-supplied cast is not allowed"
+        elif field == "channel":
+            msg = "client-supplied channel is not allowed"
+        else:
+            msg = "dry_run is not supported on this endpoint; deferred"
+        _audit("reject", f"FORBIDDEN_FIELD_{field.upper()}")
+        return _sandbox_flow_error(400, msg, f"FORBIDDEN_FIELD_{field.upper()}")
+
+    task = str(body.get("task", "")).strip()
+    if not task or len(task) > 500:
+        _audit("reject", "INVALID_TASK")
+        return _sandbox_flow_error(400, "task is required (1-500 chars)", "INVALID_TASK")
+
+    template_id = str(body.get("template_id") or "sandbox-bakery-flow").strip()
+    phase = str(body.get("phase") or "v2-d").strip().lower()
+    channel_prefix = sb.get("flow_start_channel_prefix", "sandbox-flow")
+
+    req_prefix = body.get("channel_prefix")
+    if req_prefix is not None:
+        req_prefix = str(req_prefix).strip().lower()
+        if req_prefix != channel_prefix:
+            _audit("reject", "INVALID_CHANNEL_PREFIX", template_id=template_id)
+            return _sandbox_flow_error(
+                400,
+                f"channel_prefix must match configured prefix {channel_prefix!r}",
+                "INVALID_CHANNEL_PREFIX",
+            )
+
+    if not validate_sandbox_phase(phase):
+        _audit("reject", "INVALID_PHASE", template_id=template_id)
+        return _sandbox_flow_error(400, "invalid phase slug", "INVALID_PHASE")
+
+    allowlist = sb.get("flow_start_template_allowlist") or []
+    if template_id not in allowlist:
+        _audit("reject", "TEMPLATE_NOT_ALLOWLISTED", template_id=template_id)
+        return _sandbox_flow_error(
+            400, f"template not allowlisted: {template_id}", "TEMPLATE_NOT_ALLOWLISTED")
+
+    tmpl = session_store.get_template(template_id)
+    if not tmpl:
+        _audit("reject", "UNKNOWN_TEMPLATE", template_id=template_id)
+        return _sandbox_flow_error(
+            400, f"unknown template: {template_id}", "UNKNOWN_TEMPLATE")
+
+    if not tmpl.get("flow_coordinator"):
+        _audit("reject", "MISSING_FLOW_COORDINATOR", template_id=template_id)
+        return _sandbox_flow_error(
+            400, "template missing flow_coordinator: true", "MISSING_FLOW_COORDINATOR")
+
+    if not tmpl.get("sandbox_only"):
+        _audit("reject", "MISSING_SANDBOX_ONLY", template_id=template_id)
+        return _sandbox_flow_error(
+            400, "template missing sandbox_only: true", "MISSING_SANDBOX_ONLY")
+
+    tmpl_safe = check_sandbox_template_safe(tmpl)
+    if not tmpl_safe.ok:
+        _audit("reject", "TEMPLATE_UNSAFE", template_id=template_id)
+        return _sandbox_flow_error(400, tmpl_safe.reason, "TEMPLATE_UNSAFE")
+
+    if is_sandbox_task_blocked(task):
+        _audit("reject", "TASK_BLOCKED", template_id=template_id)
+        return _sandbox_flow_error(
+            403, "task references blocked production path", "TASK_BLOCKED")
+
+    if session_store.count_active_by_channel_prefix(channel_prefix) >= sb.get(
+            "flow_start_max_active", 1):
+        _audit("reject", "SANDBOX_FLOW_ACTIVE", template_id=template_id)
+        return _sandbox_flow_error(
+            409, "sandbox flow session already active", "SANDBOX_FLOW_ACTIVE")
+
+    rate_limit = sb.get("flow_start_rate_limit_per_minute", 3)
+    if not _check_sandbox_rate_limit(client_ip, rate_limit):
+        _audit("reject", "RATE_LIMIT", template_id=template_id)
+        return _sandbox_flow_error(429, "rate limit exceeded", "RATE_LIMIT")
+
+    roster = config.get("roster", {})
+    cast, cast_err, cast_details = resolve_sandbox_flow_cast(
+        tmpl, roster, is_online_fn=_sandbox_agent_is_online)
+    if cast_err:
+        _audit("reject", cast_err, template_id=template_id)
+        status = 503 if cast_err == "ROSTER_OFFLINE" else 400
+        return _sandbox_flow_error(
+            status,
+            cast_details.get("reason") or cast_err.replace("_", " ").lower(),
+            cast_err,
+            **{k: v for k, v in cast_details.items() if k != "reason"},
+        )
+
+    channels = list(room_settings.get("channels", ["general"]))
+    if len(channels) >= MAX_CHANNELS:
+        _audit("reject", "CHANNEL_LIMIT", template_id=template_id)
+        return _sandbox_flow_error(409, "channel limit reached", "CHANNEL_LIMIT")
+
+    session_id = session_store.peek_next_id()
+    now = datetime.now()
+    channel = build_sandbox_flow_channel_name(
+        prefix=channel_prefix,
+        phase=phase,
+        session_id=session_id,
+        yymmdd=now.strftime("%y%m%d"),
+        hhmm=now.strftime("%H%M"),
+    )
+    if not channel or not _validate_sandbox_channel_name(channel):
+        _audit("reject", "INVALID_CHANNEL_NAME", template_id=template_id)
+        return _sandbox_flow_error(500, "failed to build sandbox channel name", "INVALID_CHANNEL_NAME")
+
+    if channel in channels:
+        _audit("reject", "CHANNEL_EXISTS", template_id=template_id)
+        return _sandbox_flow_error(409, "sandbox channel already exists", "CHANNEL_EXISTS")
+
+    channels.append(channel)
+    room_settings["channels"] = channels
+    _save_settings()
+
+    started_by = str(body.get("started_by") or "sandbox-flow-cli").strip()
+    if not _re.match(r"^[a-zA-Z0-9._-]{1,32}$", started_by):
+        started_by = "sandbox-flow-cli"
+
+    session = session_engine.start_session(
+        template_id, channel, cast, started_by, goal=task)
+    if not session:
+        # Roll back channel on failure
+        if channel in room_settings.get("channels", []):
+            room_settings["channels"] = [
+                c for c in room_settings["channels"] if c != channel]
+            _save_settings()
+        _audit("reject", "SESSION_CREATE_FAILED", template_id=template_id)
+        return _sandbox_flow_error(
+            409, "could not start session (channel may already be active)", "SESSION_CREATE_FAILED")
+
+    store.add(
+        sender="system",
+        text=f"Sandbox flow started: {tmpl.get('name', template_id)}",
+        msg_type="session_start",
+        channel=channel,
+        metadata={
+            "template_id": template_id,
+            "goal": task if not contains_secret(task) else "[redacted task]",
+            "session_id": session["id"],
+            "sandbox_flow": True,
+        },
+    )
+    session_engine.emit_current_phase_banner(session)
+
+    persisted = session_store.get(session["id"]) or session
+    audit_id = f"sf-{session['id']}-{int(_time.time())}"
+    _audit("ok", "CREATED", session_id=session["id"], template_id=template_id)
+
+    resp = {
+        "ok": True,
+        "session_id": session["id"],
+        "channel": channel,
+        "template_id": template_id,
+        "template_name": tmpl.get("name", template_id),
+        "cast": cast,
+        "goal": task if not contains_secret(task) else "[redacted]",
+        "flow_state": persisted.get("flow_state", {}),
+        "waiting_on": persisted.get("waiting_on"),
+        "started_at": persisted.get("started_at"),
+        "output_root": sb.get("flow_start_output_root"),
+        "audit_id": audit_id,
+    }
+    return JSONResponse(resp, status_code=201)
 
 
 @app.post("/api/sessions/start")

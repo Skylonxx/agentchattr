@@ -181,6 +181,22 @@ class SessionStore:
                     return dict(s)
             return None
 
+    def peek_next_id(self) -> int:
+        """Return the next session id that create() would assign (does not reserve)."""
+        with self._lock:
+            return self._next_id
+
+    def count_active_by_channel_prefix(self, prefix: str) -> int:
+        """Count active/waiting/paused sessions on channels starting with prefix + '-'."""
+        active_states = ("active", "waiting", "paused")
+        needle = f"{prefix}-"
+        with self._lock:
+            return sum(
+                1 for s in self._sessions
+                if s.get("state") in active_states
+                and str(s.get("channel", "")).startswith(needle)
+            )
+
     def get_active(self, channel: str) -> dict | None:
         """Get the active/waiting/paused session for a channel."""
         with self._lock:
