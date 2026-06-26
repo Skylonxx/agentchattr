@@ -23,6 +23,7 @@ import logging
 import os
 import shutil
 import sys
+from collections.abc import Sequence
 import threading
 import time
 import inspect
@@ -1547,6 +1548,31 @@ def _claude_relay_meta_ok(relay_meta) -> bool:
     return _claude_relay_channel(relay_meta) is not None
 
 
+def _resolve_claude_relay_command(cmd: Sequence[str]) -> list[str]:
+    """Resolve the sealed Claude relay argv for subprocess launch (no shell).
+
+    On Windows npm installs expose ``claude.cmd``; bare ``claude`` works in a
+    shell but ``subprocess.run(..., shell=False)`` cannot launch the shim.
+    Returns a fresh argv list; does not mutate the input sequence.
+    """
+    argv = list(cmd)
+    if not argv:
+        raise ValueError("empty claude relay command")
+
+    executable = argv[0]
+    resolved = None
+
+    if sys.platform == "win32" and executable.lower() == "claude":
+        resolved = shutil.which("claude.cmd") or shutil.which(executable)
+    else:
+        resolved = shutil.which(executable) or executable
+
+    if not resolved:
+        raise FileNotFoundError(f"Claude executable not found: {executable}")
+
+    return [resolved, *argv[1:]]
+
+
 def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
                            trigger_flag=None, running_flag=None, data_dir=None,
                            no_restart=False, server_port=8300, get_token_fn=None,
@@ -1570,6 +1596,7 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
         build_claude_child_env,
         build_claude_command,
         resolve_claude_reply,
+        scrub_evidence,
     )
 
     work: "_queue.Queue[dict]" = _queue.Queue()
@@ -1625,10 +1652,31 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
 
         # 5. Sealed command + stripped child env. Prompt via STDIN only.
         cmd = build_claude_command()
+        try:
+            cmd = _resolve_claude_relay_command(cmd)
+        except Exception as exc:  # noqa: BLE001
+            errored = True
+            exec_error_detail = scrub_evidence(f"{type(exc).__name__}: {exc}")
+            print(f"  > {agent} claude exec error: {exc}")
+            outcome = resolve_claude_reply(errored=True)
+            if log_path:
+                try:
+                    with open(log_path, "ab") as lf:
+                        header = f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} claude relay ===\n"
+                        lf.write(header.encode("utf-8", "replace"))
+                        lf.write(f"channel={channel} ok={outcome.ok} "
+                                 f"failure={outcome.failure_kind}\n".encode("utf-8", "replace"))
+                        lf.write(f"evidence={exec_error_detail}\n".encode("utf-8", "replace"))
+                except Exception:
+                    pass
+            _post(channel, outcome.text)
+            return
+
         child_env = build_claude_child_env(env)
 
         timed_out = False
         errored = False
+        exec_error_detail = ""
         proc = None
         try:
             proc = subprocess.run(
@@ -1642,6 +1690,7 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
             print(f"  > {agent} claude exec timed out ({CLAUDE_EXEC_TIMEOUT_SECS}s)")
         except Exception as exc:  # noqa: BLE001
             errored = True
+            exec_error_detail = scrub_evidence(f"{type(exc).__name__}: {exc}")
             print(f"  > {agent} claude exec error: {exc}")
 
         returncode = None
@@ -1666,7 +1715,8 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
                     lf.write(header.encode("utf-8", "replace"))
                     lf.write(f"channel={channel} ok={outcome.ok} "
                              f"failure={outcome.failure_kind}\n".encode("utf-8", "replace"))
-                    lf.write(f"evidence={outcome.evidence}\n".encode("utf-8", "replace"))
+                    evidence = outcome.evidence or exec_error_detail
+                    lf.write(f"evidence={evidence}\n".encode("utf-8", "replace"))
                     if outcome.stderr_warning:
                         lf.write(f"stderr_warning={outcome.stderr_warning}\n".encode("utf-8", "replace"))
             except Exception:

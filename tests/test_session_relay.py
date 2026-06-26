@@ -2866,11 +2866,14 @@ class TestClaudeRelayRunner(_RunClaudeRelayHarness):
         self.assertEqual(relayed[0]["channel"], "relay-dryrun")
 
     def test_uses_sealed_command(self):
+        import wrapper
         proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
         _, sub_calls = self._run_once(activated=True, fake_proc=proc)
         self.assertEqual(len(sub_calls), 1)
         cmd = sub_calls[0]["args"][0]
-        self.assertEqual(cmd, build_claude_command())
+        sealed = build_claude_command()
+        self.assertEqual(cmd, wrapper._resolve_claude_relay_command(sealed))
+        self.assertEqual(cmd[1:], sealed[1:])
         self.assertEqual(cmd[-1], "--strict-mcp-config")
 
     def test_prompt_via_stdin_not_argv(self):
