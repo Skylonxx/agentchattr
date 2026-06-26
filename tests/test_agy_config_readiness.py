@@ -24,6 +24,9 @@ import wrapper  # noqa: E402
 from wrapper import (  # noqa: E402
     _build_agy_store_command,
     _build_direct_mention_prompt,
+    _extract_agy_reply,
+    _is_agy_directory_listing_output,
+    _agy_first_verdict_token,
     _queue_watcher,
     _resolve_mcp_inject,
 )
@@ -219,6 +222,61 @@ class StoreExecInjectRegressionTests(unittest.TestCase):
     def test_store_exec_enqueue_signature_present_in_wrapper(self):
         src = (ROOT / "wrapper.py").read_text(encoding="utf-8")
         self.assertIn('def _enqueue(text, channel="", **kwargs):', src)
+
+
+class AgyReplyExtractionTests(unittest.TestCase):
+    """Hardened _extract_agy_reply: verdict preference and listing rejection."""
+
+    def _write_transcript(self, tmp: Path, conv_id: str, model_contents: list[str]):
+        tdir = (
+            tmp / "brain" / conv_id / ".system_generated" / "logs"
+        )
+        tdir.mkdir(parents=True)
+        lines = []
+        for content in model_contents:
+            lines.append(json.dumps({"source": "MODEL", "content": content}))
+        (tdir / "transcript.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def test_prefers_verdict_over_directory_listing(self):
+        listing = (
+            "Created At: 2026-06-26\n"
+            '{"name": "codex-cwd", "isDir": true, "sizeBytes": 0}\n'
+            "Summary: This directory contains server.log and data/"
+        )
+        verdict = "PASS WITH NOTES\nMobile layout looks good."
+        with tempfile.TemporaryDirectory() as tmp:
+            conv = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            self._write_transcript(Path(tmp), conv, [listing, verdict])
+            reply = _extract_agy_reply(conv, agy_data_dir=tmp)
+        self.assertEqual(reply, verdict)
+
+    def test_rejects_directory_listing_only_transcript(self):
+        listing = (
+            "Created At: 2026-06-26\n"
+            '{"name": "server.log", "isDir": false, "sizeBytes": 99}\n'
+            "Summary: This directory contains codex-cwd"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            conv = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+            self._write_transcript(Path(tmp), conv, [listing])
+            reply = _extract_agy_reply(conv, agy_data_dir=tmp)
+        self.assertEqual(reply, "")
+
+    def test_directory_listing_heuristic_positive(self):
+        text = (
+            "Created At: x\n"
+            '{"name": "data/", "isDir": true}\n'
+            "Summary: This directory contains files"
+        )
+        self.assertTrue(_is_agy_directory_listing_output(text))
+
+    def test_verdict_token_detection(self):
+        self.assertEqual(_agy_first_verdict_token("PASS\nnotes"), "PASS")
+        self.assertEqual(
+            _agy_first_verdict_token("REQUEST UX CHANGES\nfix tap targets"),
+            "REQUEST UX CHANGES",
+        )
+        self.assertIsNone(_agy_first_verdict_token("Created At: now"))
 
 
 if __name__ == "__main__":

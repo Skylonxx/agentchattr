@@ -1064,6 +1064,48 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
 # AGY store-relay exec mode
 # ---------------------------------------------------------------------------
 
+_AGY_DIRECTORY_LISTING_MARKERS = (
+    "Created At:",
+    "Completed At:",
+    '{"name":',
+    '"isDir":',
+    '"sizeBytes":',
+    "Summary: This directory contains",
+    "codex-cwd",
+    "server.log",
+)
+
+
+def _agy_first_verdict_token(text: str) -> str | None:
+    """Return the AGY verdict token if the first non-empty line matches."""
+    from session_relay import AGY_TOKENS
+
+    non_empty = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not non_empty:
+        return None
+    first_upper = non_empty[0].upper()
+    for token in AGY_TOKENS:
+        if first_upper == token.upper():
+            return token
+    return None
+
+
+def _is_agy_directory_listing_output(text: str) -> bool:
+    """Heuristic: reject obvious filesystem/directory-listing tool output."""
+    if not text or not text.strip():
+        return False
+    lowered = text.lower()
+    hits = sum(1 for marker in _AGY_DIRECTORY_LISTING_MARKERS
+               if marker.lower() in lowered)
+    if hits >= 2:
+        return True
+    if "created at:" in lowered and ('{"name"' in lowered or '"isdir"' in lowered):
+        return True
+    if "summary: this directory contains" in lowered:
+        return True
+    return False
+
+
 def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) -> str:
     """Read the assistant reply from AGY's brain transcript after a --print run.
 
@@ -1071,8 +1113,8 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     rather than printing it to stdout.  The path is deterministic:
       <agy_data_dir>/brain/<conv_id>/.system_generated/logs/transcript.jsonl
 
-    We look for the last step with source=MODEL and return its ``content``
-    field (the clean reply text, separate from chain-of-thought ``thinking``).
+    Prefers MODEL content whose first non-empty line is a valid AGY UX verdict
+    token.  Rejects obvious directory-listing/tool output (fail-closed).
     """
     if agy_data_dir is None:
         agy_data_dir = str(
@@ -1084,7 +1126,7 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     )
     if not transcript.exists():
         return ""
-    reply = ""
+    model_replies: list[str] = []
     with open(transcript, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1095,8 +1137,22 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
             except json.JSONDecodeError:
                 continue
             if entry.get("source") == "MODEL" and "content" in entry:
-                reply = entry["content"]
-    return reply.strip()
+                content = str(entry["content"]).strip()
+                if content:
+                    model_replies.append(content)
+
+    if not model_replies:
+        return ""
+
+    verdict_replies = [r for r in model_replies if _agy_first_verdict_token(r)]
+    if verdict_replies:
+        return verdict_replies[-1]
+
+    non_listing = [r for r in model_replies if not _is_agy_directory_listing_output(r)]
+    if non_listing:
+        return non_listing[-1]
+
+    return ""
 
 
 def _extract_conversation_id_from_log(log_dir: str | None = None) -> str:

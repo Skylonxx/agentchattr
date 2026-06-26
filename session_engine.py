@@ -24,6 +24,66 @@ _DISSENT_LINE = "Provide your own independent analysis. Do not repeat or defer t
 # Roles that get the dissent mandate
 _DISSENT_ROLES = {"reviewer", "red_team", "critic", "challenger", "against"}
 
+
+def build_store_exec_session_prompt(
+    *,
+    session_name: str,
+    channel: str,
+    goal: str,
+    phase_name: str,
+    phase_index: int,
+    total_phases: int,
+    role: str,
+    instruction: str,
+    context_messages: list[dict] | None = None,
+) -> str:
+    """Build a plain-text session prompt for headless store_exec agents (e.g. AGY).
+
+    Inlines channel context so the agent does not need MCP/TUI tools. The output
+    contract requires a first-line UX verdict token and forbids tool usage.
+    """
+    lines = [
+        f"SESSION: {session_name}",
+        f"CHANNEL: #{channel}",
+    ]
+    if goal:
+        lines.append(f"GOAL: {goal}")
+    lines.append(f"PHASE: {phase_name} ({phase_index + 1}/{total_phases})")
+    lines.append(f"YOUR ROLE: {role} (UI/UX reviewer)")
+    lines.append(f"INSTRUCTION: {instruction}")
+
+    if role.lower() in _DISSENT_ROLES:
+        lines.append(_DISSENT_LINE)
+
+    if context_messages:
+        lines.append("")
+        lines.append("CONTEXT (recent channel messages — use this instead of tools):")
+        for msg in context_messages[-10:]:
+            sender = msg.get("sender", "?")
+            text = msg.get("text", "")
+            lines.append(f"  [{sender}]: {text}")
+
+    lines.append("")
+    lines.append(
+        "OUTPUT CONTRACT (strict — headless store_exec; plain text only):\n"
+        "Output ONLY plain text.\n"
+        "First line MUST be exactly one of:\n"
+        "PASS\n"
+        "PASS WITH NOTES\n"
+        "REQUEST UX CHANGES\n"
+        "BLOCKED\n"
+        "\n"
+        "Do not use tools.\n"
+        "Do not list directories.\n"
+        "Do not inspect files.\n"
+        "Do not use shell.\n"
+        "Do not use git.\n"
+        "Do not use MCP.\n"
+        "Do not create or edit files."
+    )
+
+    return "\n\n".join(lines)
+
 # Roles treated as safety gates (CodexSafe)
 _SAFETY_GATE_ROLES = {"safety_gate", "safety", "gate", "review_gate"}
 
@@ -501,6 +561,16 @@ class SessionEngine:
                 return inst.get("base", agent_name)
         return agent_name
 
+    def _agent_uses_store_exec(self, agent_name: str) -> bool:
+        """True only when registry confirms run_mode == store_exec (fail-closed)."""
+        if not self._registry:
+            return False
+        base = self._get_agent_base(agent_name)
+        cfg = self._registry.get_base_config(base)
+        if not cfg:
+            return False
+        return cfg.get("run_mode") == "store_exec"
+
     def _restricted_identity(self, agent_name: str) -> str:
         """Resolve an agent to the identity used for safety-role restriction.
 
@@ -572,7 +642,7 @@ class SessionEngine:
             self._trigger_relay(session, tmpl, phase, phase_idx, turn_idx,
                                 role, agent, agent_base, channel)
         else:
-            prompt = self._assemble_prompt(session, tmpl, phase, role)
+            prompt = self._assemble_prompt(session, tmpl, phase, role, agent=agent)
             log.info("Session %d: triggering %s (%s) for phase '%s'",
                      session["id"], agent, role, phase["name"])
             try:
@@ -654,13 +724,27 @@ class SessionEngine:
             return []
 
     def _assemble_prompt(self, session: dict, tmpl: dict, phase: dict,
-                         role: str) -> str:
+                         role: str, agent: str | None = None) -> str:
         """Build the session-aware prompt for an agent."""
         phases = tmpl.get("phases", [])
         phase_idx = session["current_phase"]
         total_phases = len(phases)
 
         channel = session.get("channel", "general")
+
+        if agent and self._agent_uses_store_exec(agent):
+            return build_store_exec_session_prompt(
+                session_name=tmpl.get("name", "?"),
+                channel=channel,
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                phase_index=phase_idx,
+                total_phases=total_phases,
+                role=role,
+                instruction=phase.get("prompt", ""),
+                context_messages=self._get_recent_context(channel),
+            )
+
         lines = [
             f"SESSION: {tmpl.get('name', '?')}",
         ]
