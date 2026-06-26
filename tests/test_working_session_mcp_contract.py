@@ -8,7 +8,8 @@ Validates that:
   - AGY ui_lead can use allowed control-plane actions.
   - Safety guard has no control-plane access.
   - Unknown roles/tools fail closed.
-  - Production Claude/AGY remain relay-ineligible.
+  - Production Claude is relay-eligible via authorized claude_relay activation.
+  - AGY remains relay-ineligible.
   - CodexSafe cannot be selected as a workflow persona.
   - No external workflow prompt contains 'Codex Coordinator' / 'Codex Reviewer split'.
 """
@@ -275,11 +276,11 @@ class TestRelayPromptStillBlocksMcp(unittest.TestCase):
 
 
 class TestProductionRelayIneligibility(unittest.TestCase):
-    """Production Claude and AGY remain relay-ineligible."""
+    """Production AGY remains relay-ineligible; Claude is authorized relay-eligible."""
 
-    def test_claude_relay_ineligible(self):
-        self.assertTrue(is_production_relay_ineligible("claude"))
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+    def test_claude_relay_eligible(self):
+        self.assertFalse(is_production_relay_ineligible("claude"))
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
 
     def test_agy_relay_ineligible(self):
         self.assertTrue(is_production_relay_ineligible("agy"))

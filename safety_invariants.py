@@ -112,7 +112,8 @@ KNOWN_RUN_MODES = frozenset({"tui", "exec", "store_exec", "print_exec", "claude_
 DEFAULT_RUN_MODE = "tui"
 
 # Identities that must NEVER be relay-eligible without a separate approved gate.
-PRODUCTION_RELAY_INELIGIBLE = frozenset({"claude", "agy"})
+# "claude" was removed by authorized V2-D claude_relay activation; "agy" stays blocked.
+PRODUCTION_RELAY_INELIGIBLE = frozenset({"agy"})
 # Branch-only / dry-run identities that must never appear in a main relay set.
 BRANCH_ONLY_IDENTITIES = frozenset({"claude_dryrun"})
 # Existing safety-mechanism (boundary-guard) identities — not workflow personas.
@@ -170,7 +171,7 @@ def check_relay_eligibility(relay_set=RELAY_ELIGIBLE_AGENTS) -> InvariantResult:
 
     Fails closed if: the set is not a concrete set/frozenset (INV-004 requires an
     explicit allowlist, not a wildcard/callable), or contains any production
-    relay-ineligible identity (claude/agy) or any branch-only dry-run identity.
+    relay-ineligible identity (agy) or any branch-only dry-run identity.
     """
     if not isinstance(relay_set, (set, frozenset)):
         return _fail("INV-004", "relay eligibility must be an explicit set allowlist")
@@ -186,7 +187,7 @@ def check_relay_eligibility(relay_set=RELAY_ELIGIBLE_AGENTS) -> InvariantResult:
 
 
 def is_production_relay_ineligible(agent: str) -> bool:
-    """True if ``agent`` is one that must stay relay-ineligible (claude/agy)."""
+    """True if ``agent`` must stay relay-ineligible (agy only after V2-D activation)."""
     return str(agent).lower() in PRODUCTION_RELAY_INELIGIBLE
 
 

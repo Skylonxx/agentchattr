@@ -81,9 +81,15 @@ class LoopbackHelperTests(unittest.TestCase):
 class RelayEligibilityInvariantTests(unittest.TestCase):
     def test_agy_not_relay_eligible(self):
         self.assertFalse(is_relay_eligible("agy"))
+        self.assertNotIn("agy", RELAY_ELIGIBLE_AGENTS)
 
-    def test_claude_not_relay_eligible(self):
-        self.assertFalse(is_relay_eligible("claude"))
+    def test_claude_relay_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
+
+    def test_claude_dryrun_not_relay_eligible(self):
+        self.assertFalse(is_relay_eligible("claude_dryrun"))
+        self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
 
     def test_codex_reviewer_still_eligible(self):
         self.assertTrue(is_relay_eligible("codex_reviewer"))

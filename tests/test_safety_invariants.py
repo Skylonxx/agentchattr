@@ -47,10 +47,9 @@ class RelayEligibilityTests(unittest.TestCase):
     def test_real_relay_set_passes(self):
         self.assertTrue(si.check_relay_eligibility().ok)
 
-    def test_claude_in_set_fails_inv001(self):
+    def test_claude_in_set_passes_inv004(self):
         r = si.check_relay_eligibility({"codex", "claude"})
-        self.assertFalse(r.ok)
-        self.assertEqual(r.code, "INV-001")
+        self.assertTrue(r.ok)
 
     def test_agy_in_set_fails_inv002(self):
         r = si.check_relay_eligibility({"codex", "agy"})
@@ -68,7 +67,7 @@ class RelayEligibilityTests(unittest.TestCase):
         self.assertEqual(r.code, "INV-004")
 
     def test_production_ineligible_helper(self):
-        self.assertTrue(si.is_production_relay_ineligible("claude"))
+        self.assertFalse(si.is_production_relay_ineligible("claude"))
         self.assertTrue(si.is_production_relay_ineligible("AGY"))
         self.assertFalse(si.is_production_relay_ineligible("codex"))
 
@@ -176,10 +175,14 @@ class DryrunTemplateTests(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertEqual(r.code, "INV-009")
 
-    def test_template_pinning_production_identity_rejected(self):
-        r = si.check_dryrun_template_safe({"id": "x", "cast": {"role": "claude"}})
+    def test_template_pinning_agy_identity_rejected(self):
+        r = si.check_dryrun_template_safe({"id": "x", "cast": {"role": "agy"}})
         self.assertFalse(r.ok)
         self.assertEqual(r.code, "INV-009")
+
+    def test_template_pinning_claude_allowed_after_activation(self):
+        r = si.check_dryrun_template_safe({"id": "x", "cast": {"developer": "claude"}})
+        self.assertTrue(r.ok)
 
     def test_template_referencing_dryrun_rejected(self):
         self.assertFalse(si.check_dryrun_template_safe({"x": "claude_dryrun"}).ok)
@@ -200,10 +203,9 @@ class LiveRelayActivationTests(unittest.TestCase):
     def test_activated_eligible_agent_ok(self):
         self.assertTrue(si.require_live_relay_activation(True, "codex").ok)
 
-    def test_activated_but_claude_blocked(self):
+    def test_activated_claude_ok_when_authorized(self):
         r = si.require_live_relay_activation(True, "claude")
-        self.assertFalse(r.ok)
-        self.assertEqual(r.code, "INV-001")
+        self.assertTrue(r.ok)
 
     def test_activated_but_not_in_allowlist_blocked(self):
         r = si.require_live_relay_activation(True, "kimi")

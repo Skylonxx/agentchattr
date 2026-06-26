@@ -20,11 +20,11 @@ log = logging.getLogger(__name__)
 # (validate_no_self_review) that refuses to cast one identity as both coordinator
 # and reviewer — eligibility for the pair must never be enabled without that guard.
 #
-# Production "claude" is intentionally ABSENT (it remains relay-ineligible unless a
-# separate Gemini-approved production activation gate authorizes it). "agy" is
-# ABSENT (AGY relay is not enabled). Branch-only dry-run identities such as
-# "claude_dryrun" must never appear here on main.
+# Production "claude" is authorized for claude_relay (V2-D activation gate).
+# "agy" remains ABSENT (AGY relay is not enabled). Branch-only dry-run identities
+# such as "claude_dryrun" must never appear here on main.
 RELAY_ELIGIBLE_AGENTS = frozenset({
+    "claude",
     "codex",
     "codexsafe",
     "codex_coordinator",

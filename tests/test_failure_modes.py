@@ -54,10 +54,12 @@ class ConfigConformanceTests(unittest.TestCase):
     def test_no_duplicate_agent_identities(self):
         self.assertTrue(si.check_no_duplicate_identities(list(self.agents.keys())).ok)
 
-    def test_production_claude_and_agy_relay_ineligible(self):
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+    def test_production_agy_relay_ineligible(self):
         self.assertNotIn("agy", RELAY_ELIGIBLE_AGENTS)
         self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
+
+    def test_production_claude_relay_eligible(self):
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
 
     def test_no_config_value_leaks_a_secret(self):
         # Defensive: the committed config must not embed a token/PAT/secret.
@@ -71,11 +73,12 @@ class ConfigConformanceTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class RelayRejectionTests(unittest.TestCase):
-    def test_production_claude_relay_rejected(self):
-        self.assertFalse(si.check_relay_eligibility(RELAY_ELIGIBLE_AGENTS | {"claude"}).ok)
-
     def test_agy_production_relay_rejected(self):
         self.assertFalse(si.check_relay_eligibility(RELAY_ELIGIBLE_AGENTS | {"agy"}).ok)
+
+    def test_authorized_claude_relay_accepted(self):
+        self.assertTrue(si.check_relay_eligibility(RELAY_ELIGIBLE_AGENTS).ok)
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
 
     def test_live_activation_default_off(self):
         # No agent may be live-relay activated without the explicit True flag.
@@ -265,9 +268,7 @@ class RealRosterTests(unittest.TestCase):
         for role, agent in self.roster.items():
             self.assertIn(agent, self.agents, f"roster role {role} -> unknown agent {agent}")
 
-    def test_roster_does_not_make_claude_or_agy_relay_eligible(self):
-        # Roster mapping must not affect relay eligibility.
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+    def test_roster_does_not_make_agy_relay_eligible(self):
         self.assertNotIn("agy", RELAY_ELIGIBLE_AGENTS)
 
 

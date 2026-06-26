@@ -1444,8 +1444,8 @@ class TestRelayEligibility(unittest.TestCase):
     def test_codexsafe_eligible(self):
         self.assertTrue(is_relay_eligible("codexsafe"))
 
-    def test_claude_not_eligible(self):
-        self.assertFalse(is_relay_eligible("claude"))
+    def test_claude_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
 
     def test_agy_not_eligible(self):
         self.assertFalse(is_relay_eligible("agy"))
@@ -1645,8 +1645,7 @@ class TestSdlcTemplateCast(unittest.TestCase):
                             f"role {role!r} cast to non-relay agent {agent!r}")
 
     def test_excluded_agents_are_not_relay_eligible(self):
-        # Claude and AGY remain excluded from relay operations.
-        self.assertFalse(is_relay_eligible("claude"))
+        # AGY remains excluded from relay operations.
         self.assertFalse(is_relay_eligible("agy"))
 
     def test_gate_role_cast_to_codexsafe(self):
@@ -2414,21 +2413,24 @@ class TestClaudeScratchValidator(unittest.TestCase):
 
 
 class TestClaudeSafetyIsolation(unittest.TestCase):
-    def test_claude_not_relay_eligible(self):
-        self.assertFalse(is_relay_eligible("claude"))
-        self.assertFalse(is_relay_eligible("Claude"))
+    def test_claude_relay_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
+        self.assertTrue(is_relay_eligible("Claude"))
 
-    def test_relay_eligible_set_unchanged(self):
+    def test_authorized_relay_eligible_set(self):
         from session_relay import RELAY_ELIGIBLE_AGENTS
-        # Authorized Codex identity split (feat/codex-identity-split) added the
-        # coordinator/reviewer workflow identities alongside the same-package
-        # anti-self-review guard. Production "claude" stays excluded — that
-        # exclusion is the invariant this test protects.
         self.assertEqual(
             RELAY_ELIGIBLE_AGENTS,
-            frozenset({"codex", "codexsafe", "codex_coordinator", "codex_reviewer"}),
+            frozenset({
+                "claude",
+                "codex",
+                "codexsafe",
+                "codex_coordinator",
+                "codex_reviewer",
+            }),
         )
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
+        self.assertNotIn("agy", RELAY_ELIGIBLE_AGENTS)
 
     def test_claude_reply_is_not_a_safety_verdict(self):
         """A Claude success reply of 'PASS' must NOT be interpretable as a gate
@@ -2637,22 +2639,25 @@ class TestDryrunGuardVerdictParseRefusal(TestBlockHaltsDownstream):
 
 
 class TestDryrunIdentityIsolation(unittest.TestCase):
-    """Production claude stays ineligible/unreferenced; only claude_dryrun is the
-    dry-run identity (and only ever test-scoped, never in the production set)."""
+    """Production claude is relay-eligible; claude_dryrun stays test-scoped only."""
 
-    def test_production_claude_still_ineligible(self):
-        self.assertFalse(is_relay_eligible("claude"))
-        self.assertFalse(is_relay_eligible("Claude"))
+    def test_production_claude_is_relay_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
+        self.assertTrue(is_relay_eligible("Claude"))
 
-    def test_relay_eligible_set_unchanged(self):
+    def test_relay_eligible_set_includes_claude_not_dryrun(self):
         from session_relay import RELAY_ELIGIBLE_AGENTS
-        # Authorized Codex identity split added coordinator/reviewer identities;
-        # the dry-run isolation invariant is that claude and claude_dryrun stay out.
         self.assertEqual(
             RELAY_ELIGIBLE_AGENTS,
-            frozenset({"codex", "codexsafe", "codex_coordinator", "codex_reviewer"}),
+            frozenset({
+                "claude",
+                "codex",
+                "codexsafe",
+                "codex_coordinator",
+                "codex_reviewer",
+            }),
         )
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
         self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
 
     def test_dryrun_fixture_does_not_reference_production_claude(self):
@@ -2996,8 +3001,8 @@ class TestClaudeRelayRunner(_RunClaudeRelayHarness):
         self.assertEqual(relayed[0]["text"], "BLOCK: this is just text")
         self.assertEqual(relayed[0]["channel"], "relay-dryrun")
 
-    def test_claude_not_relay_eligible(self):
-        self.assertFalse(is_relay_eligible("claude"))
+    def test_claude_is_relay_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
 
 
 class TestClaudeRelayMetaGate(_RunClaudeRelayHarness):
@@ -3220,27 +3225,30 @@ class TestCanonicalDryrunFixtureSafety(unittest.TestCase):
 
 
 class TestDryrunRuntimeDormancyInvariants(unittest.TestCase):
-    """Production runtime stays dormant and the scratch root is the dedicated,
-    out-of-tree path the design specifies."""
+    """Scratch root path and dry-run identity exclusions remain enforced."""
 
-    def test_activation_default_is_false(self):
+    def test_activation_flag_is_true(self):
         import wrapper
-        self.assertFalse(wrapper.CLAUDE_RELAY_ACTIVATED)
+        self.assertTrue(wrapper.CLAUDE_RELAY_ACTIVATED)
 
     def test_scratch_root_is_exact_dedicated_path(self):
         import wrapper
         self.assertEqual(wrapper.CLAUDE_SCRATCH_ROOT,
                          Path(r"C:\tools\agentchattr-relay-scratch\claude"))
 
-    def test_production_set_excludes_both_claude_identities(self):
+    def test_production_set_includes_claude_excludes_dryrun(self):
         from session_relay import RELAY_ELIGIBLE_AGENTS
-        # Authorized Codex identity split added coordinator/reviewer identities;
-        # both Claude identities (production + dry-run) remain excluded.
         self.assertEqual(
             RELAY_ELIGIBLE_AGENTS,
-            frozenset({"codex", "codexsafe", "codex_coordinator", "codex_reviewer"}),
+            frozenset({
+                "claude",
+                "codex",
+                "codexsafe",
+                "codex_coordinator",
+                "codex_reviewer",
+            }),
         )
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
         self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
 
 

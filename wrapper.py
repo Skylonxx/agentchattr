@@ -1430,9 +1430,9 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
 # parses Claude output as a PASS/BLOCK verdict — it maps output to a relay reply
 # or a fail-loud marker via claude_relay.resolve_claude_reply() only.
 
-# HARD OFF-SWITCH. Phase A leaves this False. Flipping it is part of the final
-# activation gate (alongside the RELAY_ELIGIBLE_AGENTS flip), not this phase.
-CLAUDE_RELAY_ACTIVATED = False
+# HARD OFF-SWITCH. Authorized activation gate (V2-D claude_relay pivot).
+# Must remain paired with session_relay.RELAY_ELIGIBLE_AGENTS including "claude".
+CLAUDE_RELAY_ACTIVATED = True
 
 # Dedicated, owned scratch root for per-turn Claude relay cwd. Never the repo,
 # Twinpet, or user home. Each turn gets a fresh owned child dir.
@@ -1515,7 +1515,7 @@ def _claude_relay_channel(relay_meta: dict | None) -> "str | None":
     ch = relay_meta.get("channel")
     if not isinstance(ch, str):
         return None
-    ch = ch.strip()
+    ch = ch.strip().lstrip("#")
     if not ch or ch.lower() == "general":
         return None
     return ch

@@ -117,9 +117,9 @@ class RelayEligibilityTests(unittest.TestCase):
         self.assertTrue(is_relay_eligible("codex"))
         self.assertTrue(is_relay_eligible("codexsafe"))
 
-    def test_production_claude_not_relay_eligible(self):
-        self.assertFalse(is_relay_eligible("claude"))
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+    def test_production_claude_relay_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
 
     def test_agy_not_relay_eligible(self):
         self.assertFalse(is_relay_eligible("agy"))
@@ -346,8 +346,8 @@ class BranchContaminationTests(unittest.TestCase):
             self.assertNotEqual(cfg.get("run_mode"), "claude_relay",
                                 f"agent {name} unexpectedly uses claude_relay run_mode")
 
-    def test_production_claude_not_relay_eligible(self):
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+    def test_production_claude_relay_eligible_in_branch_contamination_guard(self):
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
 
     def test_agy_not_relay_eligible(self):
         self.assertNotIn("agy", RELAY_ELIGIBLE_AGENTS)

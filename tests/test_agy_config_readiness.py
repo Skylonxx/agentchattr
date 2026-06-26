@@ -1,8 +1,8 @@
 """Focused AGY operational-readiness tests.
 
 These tests keep AGY useful for future UI/UX review while ensuring this phase
-does not enable production AGY relay, production Claude relay, broad MCP,
-Slack MCP, Target:* access, or subagent loops.
+does not enable production AGY relay, broad MCP, Slack MCP, Target:* access,
+or subagent loops. Claude is authorized relay-eligible via claude_relay only.
 """
 
 import json
@@ -13,12 +13,14 @@ import time
 import tomllib
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from session_relay import RELAY_ELIGIBLE_AGENTS, is_relay_eligible  # noqa: E402
+import wrapper  # noqa: E402
 from wrapper import (  # noqa: E402
     _build_agy_store_command,
     _build_direct_mention_prompt,
@@ -69,11 +71,17 @@ class AgyConfigReadinessTests(unittest.TestCase):
         self.assertNotIn("mcp_inject", self.agy)
         self.assertEqual(_resolve_mcp_inject("agy", self.agy), {})
 
-    def test_agy_and_claude_remain_relay_ineligible(self):
+    def test_agy_remains_relay_ineligible(self):
         self.assertFalse(is_relay_eligible("agy"))
-        self.assertFalse(is_relay_eligible("claude"))
         self.assertNotIn("agy", RELAY_ELIGIBLE_AGENTS)
-        self.assertNotIn("claude", RELAY_ELIGIBLE_AGENTS)
+
+    def test_claude_authorized_relay_eligible(self):
+        self.assertTrue(is_relay_eligible("claude"))
+        self.assertIn("claude", RELAY_ELIGIBLE_AGENTS)
+
+    def test_claude_dryrun_not_relay_eligible(self):
+        self.assertFalse(is_relay_eligible("claude_dryrun"))
+        self.assertNotIn("claude_dryrun", RELAY_ELIGIBLE_AGENTS)
 
 
 class AgyPromptReadinessTests(unittest.TestCase):
@@ -187,19 +195,22 @@ class StoreExecInjectRegressionTests(unittest.TestCase):
             )
             identity = lambda: ("agy", qf)
 
-            t = threading.Thread(
-                target=_queue_watcher,
-                args=(identity, inject_fn),
-                kwargs={
-                    "suppress_identity_hint": True,
-                    "exec_prompt_suffix": "",
-                },
-                daemon=True,
-            )
-            t.start()
-            deadline = time.time() + 5
-            while time.time() < deadline and not received:
-                time.sleep(0.05)
+            with patch.object(wrapper, "_fetch_role", return_value=""), \
+                 patch.object(wrapper, "_fetch_active_rules", return_value=None), \
+                 patch.object(wrapper, "_report_rule_sync"):
+                t = threading.Thread(
+                    target=_queue_watcher,
+                    args=(identity, inject_fn),
+                    kwargs={
+                        "suppress_identity_hint": True,
+                        "exec_prompt_suffix": "",
+                    },
+                    daemon=True,
+                )
+                t.start()
+                deadline = time.time() + 5
+                while time.time() < deadline and not received:
+                    time.sleep(0.05)
 
         self.assertTrue(received, "inject_fn was never called")
         self.assertEqual(received[0]["channel"], "design-review")
