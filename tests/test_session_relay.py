@@ -1552,12 +1552,13 @@ class TestContentSelection(unittest.TestCase):
 
 _SDLC_TEMPLATE_PATH = ROOT / "session_templates" / "sdlc-todo-widget.json"
 
-# The approved relay-only cast for the 4-agent macro-flow. codex performs the
-# three productive roles; codexsafe is the dedicated terminal safety gate.
+# The approved relay-only cast for the 4-agent macro-flow. codex performs
+# planner and developer; codex_reviewer is the independent reviewer;
+# codexsafe is the dedicated terminal safety gate.
 _SDLC_CAST = {
     "planner": "codex",
     "developer": "codex",
-    "reviewer": "codex",
+    "reviewer": "codex_reviewer",
     "safety_gate": "codexsafe",
 }
 
@@ -1657,6 +1658,9 @@ class TestSdlcTemplateCast(unittest.TestCase):
     def test_gate_role_cast_to_codexsafe(self):
         self.assertEqual(_SDLC_CAST["safety_gate"], "codexsafe")
 
+    def test_reviewer_role_cast_to_codex_reviewer(self):
+        self.assertEqual(_SDLC_CAST["reviewer"], "codex_reviewer")
+
 
 class TestSdlcReviewerDissentPrompt(unittest.TestCase):
     """The reviewer phase must carry an explicit independent/dissent instruction
@@ -1682,11 +1686,60 @@ class TestSdlcReviewerDissentPrompt(unittest.TestCase):
             total_phases=len(tmpl["phases"]),
             role=phase["participants"][0],
             instruction=phase["prompt"],
-            agent_base="codex",
+            agent_base="codex_reviewer",
         )
         low = relay_prompt.lower()
         self.assertIn("independ", low)
         self.assertIn("do not defer", low)
+
+
+class TestSdlcStartSessionCastGuard(unittest.TestCase):
+    """start_session RBAC (INV-007): SDLC cast must split developer vs reviewer."""
+
+    def _engine(self, registry_agents=None):
+        from session_engine import SessionEngine
+        tmpl = _load_sdlc_template()
+        store = _DryrunRecordingStore(templates={tmpl["id"]: tmpl})
+        messages = _FakeMessageStore()
+        trigger = _FakeAgentTrigger()
+        registry = _FakeRegistry(registry_agents or {
+            "codex": {"name": "codex", "base": "codex"},
+            "codex_reviewer": {"name": "codex_reviewer", "base": "codex_reviewer"},
+            "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
+        })
+        engine = SessionEngine(store, messages, trigger, registry=registry)
+        return engine, store
+
+    def test_sdlc_cast_same_developer_reviewer_identity_start_refused(self):
+        engine, store = self._engine()
+        same_identity_cast = {
+            "planner": "codex",
+            "developer": "codex",
+            "reviewer": "codex",
+            "safety_gate": "codexsafe",
+        }
+        with patch.object(engine, "_trigger_current") as mock_tc:
+            out = engine.start_session(
+                "sdlc-todo-widget", "sdlc-dryrun",
+                same_identity_cast, started_by="tester", goal="dry-run")
+        self.assertIsNone(out)
+        self.assertEqual(store.created, [])
+        mock_tc.assert_not_called()
+
+    def test_sdlc_cast_split_reviewer_identity_start_allowed(self):
+        engine, store = self._engine()
+        with patch.object(engine, "_trigger_current") as mock_tc:
+            out = engine.start_session(
+                "sdlc-todo-widget", "sdlc-dryrun",
+                dict(_SDLC_CAST), started_by="tester", goal="dry-run")
+        self.assertIsNotNone(out)
+        self.assertEqual(len(store.created), 1)
+        created = store.created[0]
+        self.assertEqual(created["template_id"], "sdlc-todo-widget")
+        self.assertEqual(created["channel"], "sdlc-dryrun")
+        self.assertEqual(created["cast"], dict(_SDLC_CAST))
+        self.assertEqual(created["cast"]["reviewer"], "codex_reviewer")
+        mock_tc.assert_called_once()
 
 
 class TestSdlcTemplateChannelIsolation(unittest.TestCase):
@@ -1746,6 +1799,7 @@ class TestSdlcTemplateEngineFlow(unittest.TestCase):
         trigger = _FakeAgentTrigger()
         registry = _FakeRegistry({
             "codex": {"name": "codex", "base": "codex"},
+            "codex_reviewer": {"name": "codex_reviewer", "base": "codex_reviewer"},
             "codexsafe": {"name": "codexsafe", "base": "codexsafe"},
         })
         engine = SessionEngine(store, messages, trigger, registry=registry)
@@ -1786,7 +1840,7 @@ class TestSdlcTemplateEngineFlow(unittest.TestCase):
         self.assertEqual(len(block_msgs), 1)
 
     def test_productive_review_block_text_does_not_halt(self):
-        """codex in the reviewer (non-safety) role emitting text that looks like
+        """codex_reviewer in the reviewer (non-safety) role emitting text that looks like
         a BLOCK must NOT halt — only the gate role is verdict-parsed."""
         engine, store, messages, trigger = self._make_engine()
         self._advance_with(engine, store, "Plan: steps", 10)
