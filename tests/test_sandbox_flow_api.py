@@ -391,6 +391,12 @@ class SandboxFlowApiTests(unittest.TestCase):
             self._app.room_settings, self._app.session_store)
         self.assertEqual(prunable, [ch])
 
+    def test_protected_channels_include_sdlc_dryrun(self):
+        protected = self._app._PROTECTED_CHANNEL_NAMES
+        self.assertIn("general", protected)
+        self.assertIn("relay-dryrun", protected)
+        self.assertIn("sdlc-dryrun", protected)
+
     def test_general_relay_custom_never_prunable(self):
         ch = self._sandbox_channel(30)
         self._add_session(ch, state="complete", session_id=30)
@@ -401,6 +407,17 @@ class SandboxFlowApiTests(unittest.TestCase):
         self.assertIn("general", self._app.room_settings["channels"])
         self.assertIn("relay-dryrun", self._app.room_settings["channels"])
         self.assertIn("dev-team", self._app.room_settings["channels"])
+
+    def test_sdlc_dryrun_channel_never_prunable(self):
+        ch = self._sandbox_channel(31)
+        self._add_session(ch, state="complete", session_id=31)
+        self._set_channels(["general", "relay-dryrun", "sdlc-dryrun", "dev-team", ch])
+        pruned = self._app._prune_completed_sandbox_channels(
+            self._app.room_settings, self._app.session_store)
+        self.assertEqual(pruned, [ch])
+        self.assertIn("sdlc-dryrun", self._app.room_settings["channels"])
+        self.assertIn("general", self._app.room_settings["channels"])
+        self.assertIn("relay-dryrun", self._app.room_settings["channels"])
 
     def test_active_waiting_paused_sandbox_not_prunable(self):
         for state, sid in (("active", 40), ("waiting", 41), ("paused", 42)):

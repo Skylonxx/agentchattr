@@ -96,7 +96,7 @@ def _validate_sandbox_channel_name(name: str) -> bool:
     return bool(SANDBOX_CHANNEL_RE.match(name))
 
 
-_PROTECTED_CHANNEL_NAMES = frozenset({"general", "relay-dryrun"})
+_PROTECTED_CHANNEL_NAMES = frozenset({"general", "relay-dryrun", "sdlc-dryrun"})
 _TERMINAL_SESSION_STATES = frozenset({"complete", "interrupted"})
 
 
