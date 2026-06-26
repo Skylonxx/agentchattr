@@ -171,6 +171,12 @@ class TestSafetyGatePromptBuilder(unittest.TestCase):
         self.assertIn("malformed verdict", prompt)
         self.assertIn("automatically becomes BLOCK", prompt)
 
+    def test_prompt_includes_test_mutation_block_examples(self):
+        prompt = self._build()
+        self.assertIn("modify tests/", prompt)
+        self.assertIn("weaken channel prune tests", prompt)
+        self.assertIn("tests/... paths are repo mutation", prompt)
+
 
 # ---------------------------------------------------------------------------
 # 2. Session turn queue metadata

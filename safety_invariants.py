@@ -75,6 +75,7 @@ INVARIANTS: dict[str, str] = {
     "INV-019": "capability is f(role, agent): role is evaluated first; disallowed fails closed.",
     "INV-020": "control-plane MCP tools are explicit allowlist per role; repo/source tools are separate.",
     "INV-021": "Codex MCP approval uses native per-tool config keys; fake requires_approval is rejected.",
+    "INV-023": "CodexSafe safety-gate request policy rejects forbidden mutation/ops even on model PASS.",
 }
 
 
@@ -384,6 +385,65 @@ def check_no_injection(text, *, markers=INJECTION_MARKERS) -> InvariantResult:
     if hits:
         return _fail("INV-013", f"injection marker(s) detected: {hits}", tuple(hits))
     return _ok("INV-013")
+
+
+# ---------------------------------------------------------------------------
+# INV-023 — CodexSafe safety-gate forbidden request policy
+# ---------------------------------------------------------------------------
+
+# Imperative/mutation phrase patterns for safety-gate GOAL/content review.
+# Matched case-insensitively as substrings on combined goal + reviewed content.
+SAFETY_GATE_FORBIDDEN_PHRASES: tuple[tuple[str, str], ...] = (
+    ("modify tests/", "forbidden test file mutation"),
+    ("modify test/", "forbidden test file mutation"),
+    ("weaken channel prune", "forbidden test weakening"),
+    ("weaken tests", "forbidden test weakening"),
+    ("weaken test", "forbidden test weakening"),
+    ("weakening tests", "forbidden test weakening"),
+    ("weakening test", "forbidden test weakening"),
+    ("edit app.py", "forbidden source file edit"),
+    ("edit file", "forbidden file edit"),
+    ("edit files", "forbidden file edit"),
+    ("edit source", "forbidden source edit"),
+    ("modify source", "forbidden source mutation"),
+    ("from data/settings.json", "forbidden settings mutation"),
+    ("settings.json to free", "forbidden settings mutation"),
+    ("manually delete", "forbidden manual channel cleanup"),
+    ("delete sandbox-flow", "forbidden manual channel cleanup"),
+    ("git push", "forbidden git operation"),
+    ("git commit", "forbidden git operation"),
+    ("commit --amend", "forbidden git operation"),
+    ("commit the change", "forbidden commit instruction"),
+    ("commit the", "forbidden commit instruction"),
+    (" and commit", "forbidden commit instruction"),
+    ("session token", "forbidden token leak request"),
+    ("authorization url", "forbidden auth URL leak request"),
+    ("chat_send", "forbidden MCP access"),
+    ("run shell", "forbidden shell operation"),
+    ("restart the server", "forbidden process restart"),
+)
+
+
+def check_safety_gate_request(goal: str, content: str) -> InvariantResult:
+    """Reject forbidden safety-gate request text (fail-closed, INV-023).
+
+    Evaluated after CodexSafe returns PASS so deterministic policy can override
+    model misclassification. ``goal`` is the session goal; ``content`` is the
+    reviewed channel text (may be a placeholder when no prior turn exists).
+    """
+    parts: list[str] = []
+    if isinstance(goal, str) and goal.strip():
+        parts.append(goal)
+    placeholder = "(no content available for review)"
+    if isinstance(content, str) and content.strip() and content.strip() != placeholder:
+        parts.append(content)
+    if not parts:
+        return _ok("INV-023")
+    blob = "\n".join(parts).lower()
+    for phrase, reason in SAFETY_GATE_FORBIDDEN_PHRASES:
+        if phrase in blob:
+            return _fail("INV-023", reason, (phrase,))
+    return _ok("INV-023")
 
 
 # ---------------------------------------------------------------------------

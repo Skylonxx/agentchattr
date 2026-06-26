@@ -11,6 +11,7 @@ from session_relay import (
     make_relay_queue_entry,
     parse_safety_verdict,
     parse_workflow_verdict,
+    SafetyVerdict,
     AGY_TOKENS,
     CODEX_REVIEWER_TOKENS,
     DEVELOPER_TOKENS,
@@ -462,26 +463,53 @@ class SessionEngine:
 
         output = msg.get("text", "")
         verdict = parse_safety_verdict(output)
+        model_passed = verdict.passed
+
+        if verdict.passed:
+            from safety_invariants import check_safety_gate_request
+
+            reviewed = self._get_last_turn_content(
+                session, session.get("channel", "general"))
+            policy = check_safety_gate_request(
+                session.get("goal", ""), reviewed)
+            if not policy.ok:
+                log.warning(
+                    "Session %d: safety gate policy override (model PASS) "
+                    "from %s: %s",
+                    session["id"], expected_agent, policy.reason,
+                )
+                verdict = SafetyVerdict(
+                    passed=False,
+                    reason=f"policy override: {policy.reason}",
+                    raw_output=verdict.raw_output,
+                )
 
         if verdict.passed:
             log.info("Session %d: safety gate PASS from %s", session["id"], expected_agent)
             return False
 
-        log.warning("Session %d: safety gate BLOCK from %s: %s",
-                    session["id"], expected_agent, verdict.reason)
+        log.warning(
+            "Session %d: safety gate BLOCK from %s (model_passed=%s): %s",
+            session["id"], expected_agent, model_passed, verdict.reason,
+        )
 
         channel = session.get("channel", "general")
+        block_meta = {
+            "session_id": session["id"],
+            "blocked_by": expected_agent,
+            "reason": verdict.reason,
+            "raw_output": verdict.raw_output[:500],
+            "model_verdict": "PASS" if model_passed else "BLOCK",
+            "effective_verdict": "BLOCK",
+        }
+        if model_passed and not verdict.passed:
+            block_meta["policy_override"] = True
         self._messages.add(
             sender="system",
             text=f"Safety gate BLOCK: {verdict.reason}",
             msg_type="session_safety_block",
             channel=channel,
-            metadata={
-                "session_id": session["id"],
-                "blocked_by": expected_agent,
-                "reason": verdict.reason,
-                "raw_output": verdict.raw_output[:500],
-            },
+            metadata=block_meta,
         )
 
         self._store.interrupt(session["id"],
