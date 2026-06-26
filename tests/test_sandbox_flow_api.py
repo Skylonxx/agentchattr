@@ -358,6 +358,140 @@ class SandboxFlowApiTests(unittest.TestCase):
         self.assertEqual(r.json()["code"], "INVALID_SANDBOX_CONFIG")
         self.assertIn('flow_start_channel_prefix must be "sandbox-flow"', r.json()["error"])
 
+    # --- V2-E2C: fail-closed auto-prune of completed sandbox-flow channels ---
+
+    def _sandbox_channel(self, n: int) -> str:
+        return f"sandbox-flow-v2-d-260625-1134-{n}"
+
+    def _set_channels(self, channels: list[str]):
+        self._app.room_settings["channels"] = list(channels)
+        self._app._save_settings()
+
+    def _add_session(self, channel: str, *, state: str = "complete", session_id: int = 1):
+        self._app.session_store._sessions.append({
+            "id": session_id,
+            "template_id": "sandbox-bakery-flow",
+            "template_name": "Sandbox Bakery Flow",
+            "channel": channel,
+            "state": state,
+            "cast": {
+                "developer": "claude",
+                "ui_lead": "agy",
+                "codex_reviewer": "codex_reviewer",
+            },
+            "started_at": "2026-06-25T11:34:00",
+        })
+        self._app.session_store._save()
+
+    def test_list_prunable_includes_terminal_sandbox_only(self):
+        ch = self._sandbox_channel(22)
+        self._add_session(ch, state="complete", session_id=22)
+        self._set_channels(["general", "relay-dryrun", "dev-team", ch])
+        prunable = self._app._list_prunable_sandbox_channels(
+            self._app.room_settings, self._app.session_store)
+        self.assertEqual(prunable, [ch])
+
+    def test_general_relay_custom_never_prunable(self):
+        ch = self._sandbox_channel(30)
+        self._add_session(ch, state="complete", session_id=30)
+        self._set_channels(["general", "relay-dryrun", "dev-team", ch])
+        pruned = self._app._prune_completed_sandbox_channels(
+            self._app.room_settings, self._app.session_store)
+        self.assertEqual(pruned, [ch])
+        self.assertIn("general", self._app.room_settings["channels"])
+        self.assertIn("relay-dryrun", self._app.room_settings["channels"])
+        self.assertIn("dev-team", self._app.room_settings["channels"])
+
+    def test_active_waiting_paused_sandbox_not_prunable(self):
+        for state, sid in (("active", 40), ("waiting", 41), ("paused", 42)):
+            ch = f"sandbox-flow-v2-d-state-{sid}"
+            self._add_session(ch, state=state, session_id=sid)
+        channels = ["general"] + [
+            f"sandbox-flow-v2-d-state-{sid}" for _, sid in
+            (("active", 40), ("waiting", 41), ("paused", 42))]
+        self._set_channels(channels)
+        prunable = self._app._list_prunable_sandbox_channels(
+            self._app.room_settings, self._app.session_store)
+        self.assertEqual(prunable, [])
+
+    def test_orphan_sandbox_without_session_not_prunable(self):
+        ch = "sandbox-flow-v2-d-orphan-99"
+        self._set_channels(["general", ch])
+        prunable = self._app._list_prunable_sandbox_channels(
+            self._app.room_settings, self._app.session_store)
+        self.assertEqual(prunable, [])
+
+    def test_ambiguous_multiple_sessions_not_prunable(self):
+        ch = self._sandbox_channel(50)
+        self._add_session(ch, state="complete", session_id=50)
+        self._add_session(ch, state="interrupted", session_id=51)
+        self._set_channels(["general", ch])
+        prunable = self._app._list_prunable_sandbox_channels(
+            self._app.room_settings, self._app.session_store)
+        self.assertEqual(prunable, [])
+
+    @patch("app._sandbox_agent_is_online", return_value=True)
+    def test_channel_limit_when_none_prunable(self, _mock_online):
+        channels = [
+            "general", "relay-dryrun", "dev-team",
+            "team-a", "team-b", "team-c", "team-d", "team-e",
+        ]
+        self._set_channels(channels)
+        r = self._post()
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "CHANNEL_LIMIT")
+        self.assertEqual(self._app.room_settings["channels"], channels)
+
+    @patch("app._sandbox_agent_is_online", return_value=True)
+    def test_prune_completed_sandbox_enables_start(self, _mock_online):
+        channels = ["general", "relay-dryrun"]
+        for i in range(22, 28):
+            ch = self._sandbox_channel(i)
+            channels.append(ch)
+            self._add_session(ch, state="complete", session_id=i)
+        self._set_channels(channels)
+        self.assertEqual(len(self._app.room_settings["channels"]), 8)
+        r = self._post()
+        self.assertEqual(r.status_code, 201, r.text)
+        remaining_sandbox = [
+            c for c in self._app.room_settings["channels"]
+            if c.startswith("sandbox-flow-")]
+        self.assertEqual(len(remaining_sandbox), 1)
+        self.assertEqual(remaining_sandbox[0], r.json()["channel"])
+
+    @patch("app._sandbox_agent_is_online", return_value=True)
+    def test_prune_does_not_call_delete_channel(self, _mock_online):
+        channels = ["general", "relay-dryrun"]
+        for i in range(22, 28):
+            ch = self._sandbox_channel(i)
+            channels.append(ch)
+            self._add_session(ch, state="interrupted", session_id=i)
+        self._set_channels(channels)
+        with patch.object(self._app.store, "delete_channel") as mock_delete:
+            r = self._post()
+            self.assertEqual(r.status_code, 201, r.text)
+            mock_delete.assert_not_called()
+
+    @patch("app._sandbox_agent_is_online", return_value=True)
+    def test_session_create_failure_rolls_back_new_channel(self, _mock_online):
+        with patch.object(self._app.session_engine, "start_session", return_value=None):
+            r = self._post()
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "SESSION_CREATE_FAILED")
+        sandbox_channels = [
+            c for c in self._app.room_settings["channels"]
+            if c.startswith("sandbox-flow-")]
+        self.assertEqual(sandbox_channels, [])
+
+    @patch("app._sandbox_agent_is_online", return_value=True)
+    def test_sandbox_flow_active_still_enforced_after_prune(self, _mock_online):
+        ch = self._sandbox_channel(60)
+        self._add_session(ch, state="active", session_id=60)
+        self._set_channels(["general", ch])
+        r = self._post()
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["code"], "SANDBOX_FLOW_ACTIVE")
+
 
 class RosterCastResolutionTests(unittest.TestCase):
     def test_generic_codex_rejected_for_reviewer(self):

@@ -96,6 +96,92 @@ def _validate_sandbox_channel_name(name: str) -> bool:
     return bool(SANDBOX_CHANNEL_RE.match(name))
 
 
+_PROTECTED_CHANNEL_NAMES = frozenset({"general", "relay-dryrun"})
+_TERMINAL_SESSION_STATES = frozenset({"complete", "interrupted"})
+
+
+def _is_sandbox_flow_channel(channel: str) -> bool:
+    """True if channel is a server-managed sandbox-flow transient channel."""
+    if not channel or not isinstance(channel, str):
+        return False
+    return channel.startswith(_SANDBOX_FLOW_CHANNEL_PREFIX)
+
+
+def _session_for_channel(session_store, channel: str) -> dict | None:
+    """Return the sole session for a channel, or None if missing or ambiguous."""
+    if not session_store or not channel:
+        return None
+    sessions = session_store.list_all(channel=channel)
+    if len(sessions) != 1:
+        return None
+    session = sessions[0]
+    if not isinstance(session, dict):
+        return None
+    return session
+
+
+def _is_terminal_sandbox_session(session: dict) -> bool:
+    """True if session state is safely terminal for channel prune."""
+    if not isinstance(session, dict):
+        return False
+    state = session.get("state")
+    if not isinstance(state, str):
+        return False
+    return state in _TERMINAL_SESSION_STATES
+
+
+def _list_prunable_sandbox_channels(room_settings: dict, session_store) -> list[str]:
+    """List sandbox-flow channels safe to remove from the settings registry."""
+    channels = room_settings.get("channels")
+    if not isinstance(channels, list):
+        return []
+    prunable: list[str] = []
+    for channel in channels:
+        if not isinstance(channel, str):
+            continue
+        if channel in _PROTECTED_CHANNEL_NAMES:
+            continue
+        if not _is_sandbox_flow_channel(channel):
+            continue
+        session = _session_for_channel(session_store, channel)
+        if session is None:
+            continue
+        if not _is_terminal_sandbox_session(session):
+            continue
+        prunable.append(channel)
+    return prunable
+
+
+def _prune_completed_sandbox_channels(room_settings: dict, session_store) -> list[str]:
+    """Remove completed inactive sandbox-flow channels from settings registry only."""
+    import time as _time
+
+    prunable = _list_prunable_sandbox_channels(room_settings, session_store)
+    if not prunable:
+        return []
+    channels = list(room_settings.get("channels", ["general"]))
+    pruned_set = set(prunable)
+    remaining = [c for c in channels if c not in pruned_set]
+    if len(remaining) == len(channels):
+        return []
+    room_settings["channels"] = remaining
+    _save_settings()
+    for channel in prunable:
+        session = _session_for_channel(session_store, channel)
+        session_id = session.get("id") if session else None
+        _append_sandbox_audit({
+            "time": _time.time(),
+            "action": "sandbox_channel_prune",
+            "channel": channel,
+            "session_id": session_id,
+        })
+        log.info(
+            "SANDBOX_CHANNEL_PRUNE channel=%s session_id=%s",
+            channel, session_id if session_id is not None else "-",
+        )
+    return prunable
+
+
 def _sandbox_settings() -> dict:
     return normalize_sandbox_config(config)
 
@@ -2641,6 +2727,8 @@ async def sandbox_flow_start(request: Request):
             cast_err,
             **{k: v for k, v in cast_details.items() if k != "reason"},
         )
+
+    _prune_completed_sandbox_channels(room_settings, session_store)
 
     channels = list(room_settings.get("channels", ["general"]))
     if len(channels) >= MAX_CHANNELS:
