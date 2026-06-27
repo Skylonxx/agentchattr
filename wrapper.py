@@ -21,6 +21,7 @@ How it works:
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from collections.abc import Sequence
@@ -1075,6 +1076,64 @@ _AGY_DIRECTORY_LISTING_MARKERS = (
     "server.log",
 )
 
+_AGY_FAIL_EMPTY = "[agy error: empty output]"
+_AGY_FAIL_TRANSCRIPT = "[agy error: transcript extraction failed]"
+_AGY_FAIL_CONV_ID = "[agy error: conversation id not found]"
+_AGY_FAIL_UNSAFE_OUTPUT = "[agy error: unsafe output rejected]"
+_AGY_FAIL_SENSITIVE = "[agy error: sensitive content rejected]"
+_AGY_CONV_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _is_valid_agy_conversation_id(conversation_id: str) -> bool:
+    return bool(conversation_id and _AGY_CONV_ID_RE.match(conversation_id.strip()))
+
+
+def _looks_like_codexsafe_safety_verdict(text: str) -> bool:
+    """Reject CodexSafe-style authoritative safety verdict lines from AGY relay."""
+    non_empty = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not non_empty:
+        return False
+    first = non_empty[0]
+    upper = first.upper()
+    if upper.startswith("BLOCK:"):
+        return True
+    return False
+
+
+def _prepare_agy_relay_text(raw: str | None) -> tuple[str | None, str | None]:
+    """Validate and redact AGY output before local /api/send relay (fail-closed)."""
+    from safety_invariants import contains_secret, redact_secrets
+
+    if raw is None or not str(raw).strip():
+        return None, _AGY_FAIL_EMPTY
+    text = str(raw).strip()
+    if text.startswith("Traceback"):
+        return None, "[agy error: agy process exception]"
+    if _is_agy_directory_listing_output(text):
+        return None, _AGY_FAIL_UNSAFE_OUTPUT
+    if _looks_like_codexsafe_safety_verdict(text):
+        return None, _AGY_FAIL_UNSAFE_OUTPUT
+    text = redact_secrets(text)
+    if contains_secret(text):
+        return None, _AGY_FAIL_SENSITIVE
+    full_len = len(text)
+    if full_len > 2000:
+        text = text[:2000] + f"... [truncated, {full_len} chars total]"
+    return text, None
+
+
+def _relay_agy_prepared_reply(server_port, get_token_fn, raw_reply, channel):
+    """Apply fail-closed AGY output policy and relay locally when safe."""
+    relay_text, fail_marker = _prepare_agy_relay_text(raw_reply)
+    outbound = fail_marker or relay_text
+    if not outbound:
+        return False
+    _relay_to_chat(server_port, get_token_fn(), outbound, channel=channel)
+    return fail_marker is None
+
 
 def _agy_first_verdict_token(text: str) -> str | None:
     """Return the AGY verdict token if the first non-empty line matches."""
@@ -1126,6 +1185,8 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     )
     if not transcript.exists():
         return ""
+    if not _is_valid_agy_conversation_id(conversation_id):
+        return ""
     model_replies: list[str] = []
     with open(transcript, "r", encoding="utf-8") as f:
         for line in f:
@@ -1136,9 +1197,11 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
                 entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(entry, dict):
+                continue
             if entry.get("source") == "MODEL" and "content" in entry:
                 content = str(entry["content"]).strip()
-                if content:
+                if content and not _is_agy_directory_listing_output(content):
                     model_replies.append(content)
 
     if not model_replies:
@@ -1147,10 +1210,6 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     verdict_replies = [r for r in model_replies if _agy_first_verdict_token(r)]
     if verdict_replies:
         return verdict_replies[-1]
-
-    non_listing = [r for r in model_replies if not _is_agy_directory_listing_output(r)]
-    if non_listing:
-        return non_listing[-1]
 
     return ""
 
@@ -1161,7 +1220,6 @@ def _extract_conversation_id_from_log(log_dir: str | None = None) -> str:
     The log line pattern is:
       printmode.go:...] Print mode: conversation=<UUID>, sending message
     """
-    import re
     if log_dir is None:
         log_dir = str(
             Path.home() / ".gemini" / "antigravity-cli" / "log"
@@ -1176,7 +1234,7 @@ def _extract_conversation_id_from_log(log_dir: str | None = None) -> str:
     with open(logs[0], "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             m = pat.search(line)
-            if m:
+            if m and _is_valid_agy_conversation_id(m.group(1)):
                 return m.group(1)
     return ""
 
@@ -1417,54 +1475,61 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
                     pass
 
             # Try stdout first (in case a future AGY version fixes --print)
-            reply = ""
+            raw_reply = ""
+            fail_marker = None
             if proc.stdout:
-                reply = proc.stdout.decode("utf-8", errors="replace").strip()
+                raw_reply = proc.stdout.decode("utf-8", errors="replace").strip()
+                if raw_reply:
+                    _, stdout_fail = _prepare_agy_relay_text(raw_reply)
+                    if stdout_fail:
+                        raw_reply = ""
+                        fail_marker = stdout_fail
+                        print(f"  > {agent} stdout rejected ({stdout_fail})")
 
-            # Fall back to transcript extraction
-            if not reply:
+            # Fall back to transcript extraction only when stdout is empty/unused
+            if not raw_reply and fail_marker is None:
                 conv_id = _extract_conversation_id_from_log()
                 if conv_id:
-                    reply = _extract_agy_reply(conv_id)
-                    if reply:
+                    raw_reply = _extract_agy_reply(conv_id)
+                    if raw_reply:
                         print(f"  > {agent} reply extracted from transcript (conv {conv_id[:8]}...)")
                     else:
-                        print(f"  > {agent} transcript found but no MODEL reply (conv {conv_id[:8]}...)")
+                        fail_marker = _AGY_FAIL_TRANSCRIPT
+                        print(f"  > {agent} transcript found but no safe verdict reply (conv {conv_id[:8]}...)")
                 else:
+                    fail_marker = _AGY_FAIL_CONV_ID
                     print(f"  > {agent} could not find conversation ID in log")
 
-            # Safety filters + relay
-            if reply and get_token_fn:
-                if reply.startswith("Traceback"):
-                    reply = f"[agy error: {reply[:100]}]"
-                full_len = len(reply)
-                if full_len > 2000:
-                    reply = reply[:2000] + f"... [truncated, {full_len} chars total]"
+            # Safety filters + relay (fail-closed)
+            if get_token_fn:
                 try:
-                    _relay_to_chat(
-                        server_port, get_token_fn(), reply, channel=reply_channel,
-                    )
-                    print(f"  > {agent} reply relayed ({len(reply)} chars)")
+                    if raw_reply:
+                        ok = _relay_agy_prepared_reply(
+                            server_port, get_token_fn, raw_reply, reply_channel,
+                        )
+                        if ok:
+                            print(f"  > {agent} reply relayed -> #{reply_channel}")
+                        else:
+                            print(f"  > {agent} reply rejected at relay boundary")
+                    elif fail_marker:
+                        _relay_to_chat(
+                            server_port, get_token_fn(), fail_marker,
+                            channel=reply_channel,
+                        )
+                        print(f"  > {agent} fail-closed marker relayed -> #{reply_channel}")
+                    elif proc.returncode != 0:
+                        _relay_to_chat(
+                            server_port, get_token_fn(),
+                            f"[agy --print failed (exit {proc.returncode})]",
+                            channel=reply_channel,
+                        )
+                    else:
+                        _relay_to_chat(
+                            server_port, get_token_fn(), _AGY_FAIL_EMPTY,
+                            channel=reply_channel,
+                        )
                 except Exception as exc:
                     print(f"  > {agent} relay failed: {exc}")
-            elif not reply and proc.returncode == 0 and get_token_fn:
-                try:
-                    _relay_to_chat(
-                        server_port, get_token_fn(),
-                        "[agy produced no reply]",
-                        channel=reply_channel,
-                    )
-                except Exception:
-                    pass
-            elif not reply and proc.returncode != 0 and get_token_fn:
-                try:
-                    _relay_to_chat(
-                        server_port, get_token_fn(),
-                        f"[agy --print failed (exit {proc.returncode})]",
-                        channel=reply_channel,
-                    )
-                except Exception:
-                    pass
 
         if running_flag is not None and work.empty():
             running_flag[0] = False
