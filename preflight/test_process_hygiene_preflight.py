@@ -1010,6 +1010,137 @@ class AllowlistSidecarTests(unittest.TestCase):
         self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
 
 
+class StaleCandidatesPreflightTests(unittest.TestCase):
+    """Windows venv child processes may omit repo path in command lines."""
+
+    def _run(self, processes: list[ProcessInfo]) -> PreflightReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, ["general", "relay-dryrun", "sdlc-dryrun"])
+            return run_preflight("E4C_SDLC_LIVE", ctx=_base_ctx(data, processes=processes))
+
+    def _stale(self, report: PreflightReport) -> CheckResult:
+        return next(c for c in report.checks if c.id == "process.stale_candidates")
+
+    def _assert_stale_blocked(self, cmd: str) -> None:
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(900, cmd))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, STATUS_BLOCKED)
+
+    def test_windows_venv_run_py_child_not_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(200, r'"C:\Users\Narachat\AppData\Local\Programs\Python\Python312\python.exe" run.py'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, "PASS")
+
+    def test_windows_venv_wrapper_codex_child_not_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(201, r'"python.exe" wrapper.py codex'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, "PASS")
+
+    def test_windows_venv_wrapper_codex_reviewer_child_not_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(202, r'"python.exe" wrapper.py codex_reviewer'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, "PASS")
+
+    def test_windows_venv_wrapper_codexsafe_child_not_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(203, r'"python.exe" wrapper.py codexsafe'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, "PASS")
+
+    def test_non_agent_python_not_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(300, r'"python.exe" -m pytest tests/test_foo.py'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, "PASS")
+
+    def test_pathless_run_py_with_unknown_flag_still_stale(self):
+        self._assert_stale_blocked(r'"python.exe" run.py --unknown')
+
+    def test_pathless_run_py_with_extra_arg_still_stale(self):
+        self._assert_stale_blocked(r'"python.exe" run.py extra')
+
+    def test_pathless_run_py_with_dev_flag_still_stale(self):
+        self._assert_stale_blocked(r'"python.exe" run.py --dev')
+
+    def test_pathless_run_py_something_still_stale(self):
+        self._assert_stale_blocked(r'"python.exe" run.py something')
+
+    def test_bare_run_py_with_unknown_flag_still_stale(self):
+        self._assert_stale_blocked(r'run.py --unknown')
+
+    def test_bare_run_py_extra_still_stale(self):
+        self._assert_stale_blocked(r'run.py extra')
+
+    def test_malformed_pathless_run_py_like_still_stale(self):
+        self._assert_stale_blocked(r'"python.exe" not-run.py run.py')
+
+    def test_ambiguous_agentchattr_like_run_py_still_stale(self):
+        self._assert_stale_blocked(r'"someother.exe" run.py')
+
+    def test_pathless_forbidden_wrapper_still_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(400, r'"python.exe" wrapper.py agy'))
+        report = self._run(procs)
+        stale = self._stale(report)
+        self.assertEqual(stale.status, STATUS_BLOCKED)
+        self.assertTrue(any(c.id == "wrappers.forbidden" for c in report.checks))
+
+    def test_pathless_forbidden_wrapper_claude_still_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(401, r'"python.exe" wrapper.py claude'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, STATUS_BLOCKED)
+
+    def test_pathless_forbidden_wrapper_gemini_still_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(402, r'"python.exe" wrapper.py gemini'))
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, STATUS_BLOCKED)
+
+    def test_pathless_unknown_wrapper_still_stale(self):
+        procs = _e4c_wrappers_running()
+        procs.append(ProcessInfo(403, r'"python.exe" wrapper.py unknown_agent'))
+        report = self._run(procs)
+        stale = self._stale(report)
+        self.assertEqual(stale.status, STATUS_BLOCKED)
+        self.assertTrue(any(c.id == "wrappers.unexpected" for c in report.checks))
+
+    def test_pathless_wrapper_only_runtime_still_requires_wrappers(self):
+        procs = [
+            ProcessInfo(99, r'"python.exe" run.py'),
+            ProcessInfo(100, r'"python.exe" wrapper.py codex'),
+            ProcessInfo(101, r'"python.exe" wrapper.py codex_reviewer'),
+            ProcessInfo(102, r'"python.exe" wrapper.py codexsafe'),
+        ]
+        report = self._run(procs)
+        self.assertEqual(self._stale(report).status, "PASS")
+        required = next(c for c in report.checks if c.id == "wrappers.required")
+        self.assertEqual(required.status, "PASS")
+
+    def test_windows_venv_mixed_launcher_and_child_passes_e4c(self):
+        procs = [
+            ProcessInfo(99, r'"C:\tools\agentchattr\repo\.venv\Scripts\python.exe" run.py'),
+            ProcessInfo(54448, r'"C:\Users\Narachat\AppData\Local\Programs\Python\Python312\python.exe" run.py'),
+            ProcessInfo(100, r'"C:\tools\agentchattr\repo\.venv\Scripts\python.exe" wrapper.py codex'),
+            ProcessInfo(19676, r'"C:\Users\Narachat\AppData\Local\Programs\Python\Python312\python.exe" wrapper.py codex'),
+            ProcessInfo(101, r'"C:\tools\agentchattr\repo\.venv\Scripts\python.exe" wrapper.py codex_reviewer'),
+            ProcessInfo(50376, r'"C:\Users\Narachat\AppData\Local\Programs\Python\Python312\python.exe" wrapper.py codex_reviewer'),
+            ProcessInfo(102, r'"C:\tools\agentchattr\repo\.venv\Scripts\python.exe" wrapper.py codexsafe'),
+            ProcessInfo(8968, r'"C:\Users\Narachat\AppData\Local\Programs\Python\Python312\python.exe" wrapper.py codexsafe'),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, ["general", "relay-dryrun", "sdlc-dryrun"])
+            report = run_preflight("E4C_SDLC_LIVE", ctx=_base_ctx(data, processes=procs))
+        self.assertEqual(self._stale(report).status, "PASS")
+        self.assertEqual(report.verdict, VERDICT_PASS)
+
+
 class E5DManifestValidationTests(unittest.TestCase):
     def test_shipped_manifests_load(self):
         for phase_id in (

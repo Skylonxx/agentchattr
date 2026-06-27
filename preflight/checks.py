@@ -189,6 +189,53 @@ def _parse_wrapper_agents(processes: list[ProcessInfo]) -> tuple[set[str], bool]
     return wrappers, server
 
 
+_WRAPPER_AGENT_RE = re.compile(r"wrapper\.py\s+([a-zA-Z0-9_\-]+)", re.IGNORECASE)
+# Path-less Windows venv server child: python(.exe) then run.py only — no extra args/flags.
+_PATHLESS_VENV_SERVER_CHILD_RE = re.compile(
+    r'^(?:'
+    r'(?:"[^"]*python(?:\.exe)?"\s+run\.py\s*)'
+    r'|(?:python(?:\.exe)?\s+run\.py\s*)'
+    r')$',
+    re.IGNORECASE,
+)
+
+
+def _is_pathless_venv_server_child(cmd: str) -> bool:
+    """Match observed Windows venv re-exec server child; fail closed on extra tokens."""
+    if "agentchattr" in cmd.lower():
+        return False
+    if re.search(r"wrapper\.py", cmd, re.IGNORECASE):
+        return False
+    return bool(_PATHLESS_VENV_SERVER_CHILD_RE.match(cmd.strip()))
+
+
+def _is_pathless_authorized_runtime_process(cmd: str, manifest: PhaseManifest) -> bool:
+    """Recognize Windows venv child run/wrapper shapes that omit the repo path."""
+    if _is_pathless_venv_server_child(cmd):
+        return True
+    if "agentchattr" in cmd.lower():
+        return False
+    m = _WRAPPER_AGENT_RE.search(cmd)
+    if m:
+        agent = m.group(1).lower()
+        allowed = {a.lower() for a in manifest.wrappers["allowed"]}
+        return agent in allowed
+    return False
+
+
+def _is_stale_agentchattr_process(cmd: str, manifest: PhaseManifest) -> bool:
+    """True when a path-less run/wrapper process looks like a stale agentchattr instance."""
+    if not re.search(r"\b(run|wrapper)\.py\b", cmd, re.IGNORECASE):
+        return False
+    if "agentchattr" in cmd.lower():
+        return False
+    if str(manifest.phase_id) in cmd:
+        return False
+    if _is_pathless_authorized_runtime_process(cmd, manifest):
+        return False
+    return True
+
+
 def _parse_config_sandbox_flow_enabled(
     config_path: Path,
     local_path: Path | None,
@@ -444,9 +491,7 @@ def check_process_and_port(
 
     stale_candidates = [
         p for p in processes
-        if re.search(r"\b(run|wrapper)\.py\b", p.command_line, re.IGNORECASE)
-        and "agentchattr" not in p.command_line.lower()
-        and str(manifest.phase_id) not in p.command_line
+        if _is_stale_agentchattr_process(p.command_line, manifest)
     ]
     if stale_candidates:
         results.append(_block(
