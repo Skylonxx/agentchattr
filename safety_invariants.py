@@ -416,12 +416,243 @@ SAFETY_GATE_FORBIDDEN_PHRASES: tuple[tuple[str, str], ...] = (
     ("commit the change", "forbidden commit instruction"),
     ("commit the", "forbidden commit instruction"),
     (" and commit", "forbidden commit instruction"),
+    ("commit and push", "forbidden commit instruction"),
+    ("do not not commit", "forbidden commit instruction"),
+    ("do not not run git commit", "forbidden git operation"),
     ("session token", "forbidden token leak request"),
+    ("reveal token", "forbidden token leak request"),
     ("authorization url", "forbidden auth URL leak request"),
     ("chat_send", "forbidden MCP access"),
     ("run shell", "forbidden shell operation"),
     ("restart the server", "forbidden process restart"),
 )
+
+# Local context window (chars each side) for INV-023 phrase discrimination.
+_SAFETY_GATE_CONTEXT_CHARS = 96
+
+# Override / disguised-imperative cues — always block when present in context window.
+_SAFETY_GATE_OVERRIDE_BLOCK_RE = (
+    re.compile(r"do\s+not\s+not\b"),
+    re.compile(r"ignore\s+the\s+rule"),
+    re.compile(r"\banyway\b"),
+    re.compile(r"\balthough\b.{0,96}\b(?:now|commit|run|push|execute|go\s+ahead)\b"),
+    re.compile(r"\b(?:now|go\s+ahead)\b.{0,48}\b(?:commit|git\s+(?:commit|push))\b"),
+    re.compile(r"\b(?:commit|git\s+(?:commit|push))\b.{0,48}\b(?:now|anyway|please)\b"),
+)
+
+# Imperative cues — checked after allow cues; ambiguous text stays blocked.
+_SAFETY_GATE_BLOCK_RE = (
+    re.compile(
+        r"(?<!do not )(?<!don't )"
+        r"\b(?:run|execute|perform|make|create)\s+(?:a\s+)?git\s+(?:commit|push)\b"
+    ),
+    re.compile(r"\bplease\s+(?:run\s+)?git\s+(?:commit|push)\b"),
+    re.compile(r"\bstage\s+and\s+commit\b"),
+    re.compile(r"\bcommit\s+and\s+push\b"),
+    re.compile(r"\bcommit\s+the\s+(?:files?|change)\b"),
+    re.compile(r"\bmake\s+a\s+git\s+commit\b"),
+    re.compile(r"\bgit\s+commit\s+-m\b"),
+)
+
+# Prohibition / dry-run constraint cues — a match inside this context may be ignored.
+_SAFETY_GATE_ALLOW_RE = (
+    re.compile(r"\b(?:do\s+not|don't)\s+(?:run\s+)?git\s+(?:commit|push)\b"),
+    re.compile(r"\bno\s+git\s+commits?\b"),
+    re.compile(r"\bwithout\s+git\s+(?:commits?|pushes?)\b"),
+    re.compile(
+        r"\b(?:prohibit(?:s|ed|ing)?|forbidden|not\s+allowed)\b"
+        r"[^.;]{0,64}\b(?:git\s+)?(?:commits?|push(?:es)?)\b"
+    ),
+    re.compile(r"\bgit\s+(?:commit|push)\s+is\s+forbidden\b"),
+    re.compile(r"\bforbidden\s+git\s+operation\b"),
+    re.compile(
+        r"\b(?:policy|constraints?|dry-run\s+constraints?|prohibition)\b"
+        r"[^.;]{0,96}\b(?:git\s+)?(?:commits?|push(?:es)?)\b"
+    ),
+    re.compile(
+        r"\b(?:git\s+)?(?:commits?|push(?:es)?)\b"
+        r"[^.;]{0,48}\b(?:prohibit(?:ed|s|ing)?|forbidden|not\s+allowed|not\s+performed)\b"
+    ),
+    re.compile(r"\bconfirm\s+no\s+git\s+commits\b"),
+    re.compile(r"\bwere\s+not\s+performed\b"),
+    re.compile(r"\bmention(?:s|ing)?\b.{0,48}\bforbidden\b"),
+)
+
+# Comma-separated prohibition list after an initial no/not/without (Session 42 goal shape).
+_SAFETY_GATE_LIST_PROHIBITION_RE = re.compile(
+    r"(?:^|[.!?]\s*)(?:no|not|without)\b(?:\s*[^,;]+,\s*)+$",
+    re.IGNORECASE,
+)
+
+# Commit-phrase shapes that are imperative unless clearly described as policy text.
+_SAFETY_GATE_IMPERATIVE_COMMIT_PHRASES = frozenset({
+    "commit the change",
+    "commit the",
+    " and commit",
+})
+
+# Forbidden phrases eligible for git/commit prohibition-context allow discrimination.
+_SAFETY_GATE_GIT_COMMIT_PHRASES = frozenset({
+    "git push",
+    "git commit",
+    "commit --amend",
+    "commit the change",
+    "commit the",
+    " and commit",
+    "commit and push",
+    "do not not commit",
+    "do not not run git commit",
+})
+
+
+# Comma split only when followed by an imperative git/commit command (not prohibition lists).
+_SAFETY_GATE_COMMA_IMPERATIVE_SPLIT_RE = re.compile(
+    r",\s*(?="
+    r"(?:run|execute|please|now|git commit\s+-m|"
+    r"git push(?:\s+(?!es\b)|\s*$)|"
+    r"commit the|commit and|stage and|make a git commit"
+    r"))",
+    re.IGNORECASE,
+)
+
+
+def _safety_gate_context_window(blob: str, start: int, phrase: str) -> tuple[str, str, str]:
+    """Return (before, matched, after) lowercase context slices for a phrase hit."""
+    end = start + len(phrase)
+    before = blob[max(0, start - _SAFETY_GATE_CONTEXT_CHARS):start]
+    matched = blob[start:end]
+    after = blob[end:min(len(blob), end + _SAFETY_GATE_CONTEXT_CHARS)]
+    return before, matched, after
+
+
+def _safety_gate_list_prohibition_prefix(before: str) -> bool:
+    """True when the match continues a no/not/without comma-separated prohibition list."""
+    chunk = before[-220:]
+    return bool(_SAFETY_GATE_LIST_PROHIBITION_RE.search(chunk))
+
+
+def _safety_gate_git_occurrence_is_imperative(
+    phrase: str, before: str, matched: str, after: str,
+) -> bool:
+    """True when this git/commit phrase hit is an actual command, not prohibition text."""
+    local = matched + after[:48]
+    if phrase == "git commit":
+        if re.match(r"\s*-m\b", after):
+            return True
+        if re.search(r"[;,]\s*$", before) and not after.startswith("s"):
+            if not re.match(r"\s+is\s+forbidden", after):
+                return True
+    if phrase == "git push":
+        if re.search(r"\bgit push\s+(?:origin|\S+/\S+|\S+)", local):
+            return True
+        if re.search(r"[;,]\s*$", before) and re.search(r"\s+(?:origin|\S+/\S+|\S+)", after[:24]):
+            return True
+    if phrase in _SAFETY_GATE_IMPERATIVE_COMMIT_PHRASES:
+        if re.search(r"[;,]\s*$", before):
+            if not re.search(
+                r"\b(?:prohibit|forbidden|policy|mention(?:s|ing)?|description)\b",
+                before[-48:],
+            ):
+                return True
+    for pat in _SAFETY_GATE_BLOCK_RE:
+        if pat.search(local):
+            return True
+    for pat in _SAFETY_GATE_OVERRIDE_BLOCK_RE:
+        if pat.search(before[-48:] + local):
+            return True
+    return False
+
+
+def _safety_gate_allow_overlaps_occurrence(
+    pattern: re.Pattern[str], local: str, occ_start: int, occ_end: int,
+) -> bool:
+    """True when an allow pattern match covers the current phrase occurrence."""
+    for match in pattern.finditer(local):
+        if match.start() <= occ_start and match.end() >= occ_end - 1:
+            return True
+        if match.start() >= occ_start and match.end() <= occ_end + 8:
+            return True
+    return False
+
+
+def _safety_gate_prohibition_only_match(blob: str, phrase: str, start: int) -> bool:
+    """True when a forbidden phrase hit is clearly prohibition/dry-run text, not a request."""
+    before, matched, after = _safety_gate_context_window(blob, start, phrase)
+    window = before + matched + after
+
+    for pat in _SAFETY_GATE_OVERRIDE_BLOCK_RE:
+        if pat.search(window):
+            return False
+
+    # Git/commit allow discrimination applies only to the git/commit phrase family.
+    # Unrelated forbidden phrases must not be suppressed by nearby git-policy allow cues.
+    if phrase not in _SAFETY_GATE_GIT_COMMIT_PHRASES:
+        return False
+
+    if _safety_gate_git_occurrence_is_imperative(phrase, before, matched, after):
+        return False
+
+    local = before[-64:] + matched + after[:32]
+    occ_start = len(before[-64:])
+    occ_end = occ_start + len(matched)
+
+    for pat in _SAFETY_GATE_ALLOW_RE:
+        if _safety_gate_allow_overlaps_occurrence(pat, local, occ_start, occ_end):
+            return True
+
+    if _safety_gate_list_prohibition_prefix(before):
+        if phrase == "git commit" and after.startswith("s"):
+            return True
+        if phrase in ("git push", "commit --amend"):
+            return True
+
+    if phrase == "git commit" and after.startswith("s"):
+        if re.search(r"\b(?:no|not|without|prohibit|forbidden)\b", before):
+            return True
+
+    if phrase in _SAFETY_GATE_IMPERATIVE_COMMIT_PHRASES:
+        if re.search(r"\b(?:prohibit|forbidden|policy|mention(?:s|ing)?|description)\b", before):
+            return True
+        return False
+
+    return False
+
+
+def _safety_gate_text_segments(blob: str) -> list[str]:
+    """Split combined safety-gate text into independent clauses for per-segment checks."""
+    segments: list[str] = []
+    for line in blob.split("\n"):
+        piece = line.strip()
+        if not piece:
+            continue
+        parts = [piece]
+        for splitter in (
+            re.compile(r"[.!?;]+"),
+            _SAFETY_GATE_COMMA_IMPERATIVE_SPLIT_RE,
+        ):
+            next_parts: list[str] = []
+            for part in parts:
+                for clause in splitter.split(part):
+                    clause = clause.strip()
+                    if clause:
+                        next_parts.append(clause)
+            parts = next_parts
+        segments.extend(parts)
+    return segments
+
+
+def _check_safety_gate_segment(blob: str) -> InvariantResult:
+    """Evaluate one independent clause/segment against INV-023 forbidden phrases."""
+    for phrase, reason in SAFETY_GATE_FORBIDDEN_PHRASES:
+        pos = 0
+        while True:
+            idx = blob.find(phrase, pos)
+            if idx == -1:
+                break
+            if not _safety_gate_prohibition_only_match(blob, phrase, idx):
+                return _fail("INV-023", reason, (phrase,))
+            pos = idx + 1
+    return _ok("INV-023")
 
 
 def check_safety_gate_request(goal: str, content: str) -> InvariantResult:
@@ -440,9 +671,11 @@ def check_safety_gate_request(goal: str, content: str) -> InvariantResult:
     if not parts:
         return _ok("INV-023")
     blob = "\n".join(parts).lower()
-    for phrase, reason in SAFETY_GATE_FORBIDDEN_PHRASES:
-        if phrase in blob:
-            return _fail("INV-023", reason, (phrase,))
+    segments = _safety_gate_text_segments(blob)
+    for segment in segments:
+        result = _check_safety_gate_segment(segment)
+        if not result.ok:
+            return result
     return _ok("INV-023")
 
 

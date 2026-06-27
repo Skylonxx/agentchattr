@@ -188,6 +188,78 @@ class SafetyGatePolicyOverrideTests(unittest.TestCase):
         self.assertEqual(meta.get("model_verdict"), "PASS")
         self.assertEqual(meta.get("effective_verdict"), "BLOCK")
 
+    SESSION_42_GOAL = (
+        "Create a text-only Todo Widget plan for the sdlc-dryrun channel. "
+        "No file edits, shell commands, git commits, MCP calls, or config/data mutations."
+    )
+
+    def test_policy_does_not_override_model_pass_on_safe_negated_goal(self):
+        store = MagicMock()
+        store.get_template.return_value = {
+            "phases": [
+                {
+                    "name": "Safety Gate",
+                    "participants": ["safety_gate"],
+                    "prompt": "Review.",
+                },
+            ],
+        }
+        messages = MagicMock()
+        registry = MagicMock()
+        registry.get_instance.return_value = {"base": "codexsafe"}
+        engine = SessionEngine(store, messages, MagicMock(), registry)
+        engine._get_last_turn_content = MagicMock(
+            return_value="Reviewer confirms text-only dry-run; no git commits performed.")
+
+        session = {
+            "id": 42,
+            "template_id": "sdlc-todo-widget",
+            "channel": "sdlc-dryrun",
+            "current_phase": 0,
+            "current_turn": 0,
+            "goal": self.SESSION_42_GOAL,
+            "cast": {"safety_gate": "codexsafe"},
+        }
+        msg = {"text": "PASS", "sender": "codexsafe"}
+
+        blocked = engine._check_safety_block(session, msg)
+        self.assertFalse(blocked)
+        store.interrupt.assert_not_called()
+
+    def test_model_block_still_blocks_without_policy_override(self):
+        store = MagicMock()
+        store.get_template.return_value = {
+            "phases": [
+                {
+                    "name": "Safety Gate",
+                    "participants": ["safety_gate"],
+                    "prompt": "Review.",
+                },
+            ],
+        }
+        messages = MagicMock()
+        registry = MagicMock()
+        registry.get_instance.return_value = {"base": "codexsafe"}
+        engine = SessionEngine(store, messages, MagicMock(), registry)
+        engine._get_last_turn_content = MagicMock(return_value="safe reviewer text")
+
+        session = {
+            "id": 100,
+            "template_id": "relay-dryrun",
+            "channel": "relay-dryrun",
+            "current_phase": 0,
+            "current_turn": 0,
+            "goal": self.SESSION_42_GOAL,
+            "cast": {"safety_gate": "codexsafe"},
+        }
+        msg = {"text": "BLOCK: unsafe request", "sender": "codexsafe"}
+
+        blocked = engine._check_safety_block(session, msg)
+        self.assertTrue(blocked)
+        meta = messages.add.call_args.kwargs["metadata"]
+        self.assertEqual(meta.get("model_verdict"), "BLOCK")
+        self.assertNotIn("policy_override", meta)
+
 
 if __name__ == "__main__":
     unittest.main()
