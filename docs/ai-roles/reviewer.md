@@ -34,3 +34,17 @@ Codex
 - Return a clear verdict with evidence
 - Flag blockers immediately
 - Non-blocking notes should be actionable and scoped
+
+## Preflight Verification (Review Package)
+
+Canonical policy: [`docs/preflight-workflow-gates.md`](../preflight-workflow-gates.md).
+
+When the phase type requires preflight evidence, verify:
+
+- **Preflight Evidence** section is present with command, manifest ID, baseline HEAD, verdict, exit code, and redaction status
+- Manifest ID matches phase type (e.g. `CODEX_REVIEW_DIRTY_TREE` for dirty-tree Codex review; `COMMIT_EXACT_FILES` for commit reports; `PUSH_ONLY` for push reports)
+- For Codex review: dirty/untracked files match authorized scope and allowlist; no unauthorized files in diff
+- Commit reports reference `COMMIT_EXACT_FILES` gate before exact-file staging; push reports reference `PUSH_ONLY` before push
+- Missing, mismatched, or overclaimed preflight evidence is a **review finding** (REQUEST CHANGES or BLOCKED)
+- Preflight `PASS` is **not** production readiness, live validation success, or commit/push authorization — flag overclaiming
+- CodexSafe, INV-007, RBAC, and `#general` prohibitions remain in force regardless of preflight verdict
