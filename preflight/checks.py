@@ -20,6 +20,41 @@ STATUS_BLOCKED = "BLOCKED"
 PROTECTED_CHANNELS = frozenset({"general", "relay-dryrun", "sdlc-dryrun"})
 _ACTIVE_SESSION_DEFAULT_STATES = frozenset({"active", "waiting", "paused"})
 
+_PROTECTED_COMMIT_PREFIXES = (
+    "config.toml",
+    "config.local.toml",
+    "data/",
+    "session_templates/",
+    "docs/ai-roles/",
+)
+
+
+def _normalize_repo_path(path: str) -> str:
+    return path.replace("\\", "/").strip()
+
+
+def _porcelain_path_sets(snap: GitSnapshot) -> tuple[set[str], set[str]]:
+    """Return (tracked_or_modified_paths, untracked_paths) from porcelain."""
+    tracked: set[str] = set()
+    untracked: set[str] = set()
+    for ln in snap.porcelain.splitlines():
+        if not ln or ln.startswith("!!"):
+            continue
+        path = _normalize_repo_path(ln[3:])
+        if ln.startswith("??"):
+            untracked.add(path)
+        else:
+            tracked.add(path)
+    return tracked, untracked
+
+
+def _path_matches_protected_prefix(path: str) -> bool:
+    norm = _normalize_repo_path(path)
+    return any(
+        norm == prefix or norm.startswith(prefix)
+        for prefix in _PROTECTED_COMMIT_PREFIXES
+    )
+
 
 @dataclass
 class CheckResult:
@@ -202,8 +237,6 @@ def check_git_state(manifest: PhaseManifest, snap: GitSnapshot) -> list[CheckRes
         results.append(_pass("git.branch", f"on branch {snap.branch}"))
 
     if git_cfg["require_clean_tree"]:
-        # Fail-closed: block tracked changes and untracked non-ignored files (`??`).
-        # Ignored-only entries (`!!`) are allowed (e.g. config.local.toml).
         dirty_lines = [
             ln for ln in snap.porcelain.splitlines()
             if ln and not ln.startswith("!!")
@@ -222,6 +255,10 @@ def check_git_state(manifest: PhaseManifest, snap: GitSnapshot) -> list[CheckRes
             ))
         else:
             results.append(_pass("git.clean_tree", "working tree clean"))
+    elif git_cfg.get("approved_dirty_paths") is not None:
+        results.extend(_check_dirty_path_allowlist(git_cfg, snap))
+    elif git_cfg.get("require_exact_dirty_set"):
+        results.extend(_check_exact_dirty_set(git_cfg, snap))
 
     if git_cfg["require_no_staged"]:
         if snap.staged_names:
@@ -232,7 +269,30 @@ def check_git_state(manifest: PhaseManifest, snap: GitSnapshot) -> list[CheckRes
         else:
             results.append(_pass("git.staged", "no staged files"))
 
-    if git_cfg["require_synced_with_remote"]:
+    if git_cfg.get("require_ahead_of_remote"):
+        expected_ahead = int(git_cfg.get("expected_ahead_count", 1))
+        ahead_count = len(snap.ahead_lines)
+        if git_cfg.get("require_head_not_behind_origin", True) and snap.behind_lines:
+            results.append(_block(
+                "git.sync",
+                f"local behind {git_cfg['expected_remote_ref']} by {len(snap.behind_lines)} commit(s)",
+            ))
+        elif ahead_count != expected_ahead:
+            results.append(_block(
+                "git.ahead",
+                f"expected {expected_ahead} commit(s) ahead of {git_cfg['expected_remote_ref']}, got {ahead_count}",
+            ))
+        elif snap.head and snap.remote_head and ahead_count == 0 and snap.head != snap.remote_head:
+            results.append(_block(
+                "git.head",
+                f"HEAD {snap.head} != {git_cfg['expected_remote_ref']} {snap.remote_head}",
+            ))
+        else:
+            results.append(_pass(
+                "git.ahead",
+                f"local ahead of {git_cfg['expected_remote_ref']} by {ahead_count} commit(s)",
+            ))
+    elif git_cfg["require_synced_with_remote"]:
         if snap.ahead_lines:
             results.append(_block(
                 "git.sync",
@@ -262,6 +322,56 @@ def check_git_state(manifest: PhaseManifest, snap: GitSnapshot) -> list[CheckRes
             ))
 
     return results
+
+
+def _check_dirty_path_allowlist(git_cfg: dict[str, Any], snap: GitSnapshot) -> list[CheckResult]:
+    allowlist = {_normalize_repo_path(p) for p in git_cfg.get("approved_dirty_paths", [])}
+    if not allowlist:
+        return [_block("git.dirty_allowlist", "approved_dirty_paths is empty")]
+
+    tracked, untracked = _porcelain_path_sets(snap)
+    dirty = tracked | untracked
+    unauthorized = sorted(dirty - allowlist)
+    if unauthorized:
+        return [_block(
+            "git.dirty_allowlist",
+            f"unauthorized dirty file(s): {', '.join(unauthorized[:5])}",
+        )]
+    if not dirty:
+        return [_pass("git.dirty_allowlist", "no dirty files (allowlist not needed)")]
+    return [_pass(
+        "git.dirty_allowlist",
+        f"dirty files within allowlist ({len(dirty)} file(s))",
+    )]
+
+
+def _check_exact_dirty_set(git_cfg: dict[str, Any], snap: GitSnapshot) -> list[CheckResult]:
+    allowlist = {_normalize_repo_path(p) for p in git_cfg.get("approved_file_allowlist", [])}
+    if not allowlist:
+        return [_block("git.exact_dirty_set", "approved_file_allowlist is empty")]
+
+    tracked, untracked = _porcelain_path_sets(snap)
+    dirty = tracked | untracked
+    for path in dirty:
+        if _path_matches_protected_prefix(path) and path not in allowlist:
+            return [_block(
+                "git.protected_path",
+                f"protected path modified without allowlist entry: {path}",
+            )]
+
+    if dirty != allowlist:
+        extra = sorted(dirty - allowlist)
+        missing = sorted(allowlist - dirty)
+        detail_parts = []
+        if extra:
+            detail_parts.append(f"extra: {', '.join(extra[:5])}")
+        if missing:
+            detail_parts.append(f"missing: {', '.join(missing[:5])}")
+        return [_block(
+            "git.exact_dirty_set",
+            f"dirty set mismatch ({'; '.join(detail_parts)})",
+        )]
+    return [_pass("git.exact_dirty_set", f"dirty set matches allowlist ({len(dirty)} file(s))")]
 
 
 def check_process_and_port(
@@ -517,13 +627,18 @@ def run_all_checks(
     checks.append(check_general_fallback_policy(manifest))
     checks.extend(check_git_state(manifest, git_snap))
 
-    processes = ctx.processes if ctx.processes is not None else []
-    listeners = ctx.port_listeners if ctx.port_listeners is not None else []
-    checks.extend(check_process_and_port(manifest, processes, listeners))
+    if manifest.require_runtime_checks:
+        processes = ctx.processes if ctx.processes is not None else []
+        listeners = ctx.port_listeners if ctx.port_listeners is not None else []
+        checks.extend(check_process_and_port(manifest, processes, listeners))
+        checks.extend(check_active_sessions(manifest, ctx.resolve_data_dir()))
+        checks.extend(check_channel_hygiene(manifest, ctx.resolve_data_dir()))
+        checks.extend(check_sandbox_flow(manifest, ctx))
+    else:
+        checks.append(_pass("runtime.skipped", "runtime checks skipped per manifest"))
+        if manifest.sandbox.get("forbid_flow_enabled"):
+            checks.extend(check_sandbox_flow(manifest, ctx))
 
-    checks.extend(check_active_sessions(manifest, ctx.resolve_data_dir()))
-    checks.extend(check_channel_hygiene(manifest, ctx.resolve_data_dir()))
-    checks.extend(check_sandbox_flow(manifest, ctx))
     checks.extend(check_redaction(manifest))
     return checks
 

@@ -103,6 +103,40 @@ class PhaseManifest:
     def general_fallback_forbidden(self) -> bool:
         return bool(self.raw.get("general_fallback_forbidden", True))
 
+    @property
+    def require_runtime_checks(self) -> bool:
+        return bool(self.raw.get("require_runtime_checks", True))
+
+
+def _validate_string_list(value: object, field_name: str) -> str | None:
+    if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
+        return f"{field_name} must be a list of strings"
+    return None
+
+
+def _validate_optional_git_extensions(git: dict[str, Any]) -> str | None:
+    for key in ("approved_dirty_paths", "approved_file_allowlist"):
+        if key in git:
+            err = _validate_string_list(git[key], f"git.{key}")
+            if err:
+                return err
+    if "expected_ahead_count" in git:
+        count = git["expected_ahead_count"]
+        if not isinstance(count, int) or count < 0:
+            return "git.expected_ahead_count must be a non-negative integer"
+    for key in ("require_ahead_of_remote", "require_head_not_behind_origin", "require_exact_dirty_set"):
+        if key in git and not isinstance(git[key], bool):
+            return f"git.{key} must be a boolean"
+    if git.get("require_clean_tree") is False:
+        has_dirty_paths_key = "approved_dirty_paths" in git
+        has_exact_set = bool(git.get("require_exact_dirty_set"))
+        if not has_dirty_paths_key and not has_exact_set:
+            return (
+                "git.require_clean_tree=false requires approved_dirty_paths "
+                "or require_exact_dirty_set"
+            )
+    return None
+
 
 def _missing_keys(section: dict[str, Any], required: frozenset[str]) -> list[str]:
     return sorted(k for k in required if k not in section)
@@ -137,14 +171,22 @@ def validate_manifest_dict(data: dict[str, Any]) -> tuple[PhaseManifest | None, 
     if not isinstance(phase_id, str) or not phase_id.strip():
         return None, "phase_id must be a non-empty string"
 
+    git_err = _validate_optional_git_extensions(data["git"])
+    if git_err:
+        return None, git_err
+
+    if "require_runtime_checks" in data and not isinstance(data["require_runtime_checks"], bool):
+        return None, "require_runtime_checks must be a boolean"
+
+    runtime_required = bool(data.get("require_runtime_checks", True))
     allowed = data["wrappers"]["allowed"]
     forbidden = data["wrappers"]["forbidden"]
     if not isinstance(allowed, list) or not all(isinstance(x, str) for x in allowed):
         return None, "wrappers.allowed must be a list of strings"
     if not isinstance(forbidden, list) or not all(isinstance(x, str) for x in forbidden):
         return None, "wrappers.forbidden must be a list of strings"
-    if not allowed:
-        return None, "wrappers.allowed must not be empty"
+    if runtime_required and not allowed:
+        return None, "wrappers.allowed must not be empty when require_runtime_checks is true"
 
     overlap = set(allowed) & set(forbidden)
     if overlap:

@@ -177,10 +177,16 @@ def run_preflight(
         git_snap = context.git_snapshot or capture_git_snapshot(root, runner)
 
         if context.processes is None:
-            context.processes = _default_processes()
+            if manifest.require_runtime_checks:
+                context.processes = _default_processes()
+            else:
+                context.processes = []
         if context.port_listeners is None:
-            port = int(manifest.network["expected_port"])
-            context.port_listeners = _default_port_listeners(port)
+            if manifest.require_runtime_checks:
+                port = int(manifest.network["expected_port"])
+                context.port_listeners = _default_port_listeners(port)
+            else:
+                context.port_listeners = []
 
         checks.extend(run_all_checks(manifest, context, git_snap))
         verdict = aggregate_verdict(checks)

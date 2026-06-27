@@ -1,0 +1,40 @@
+{
+  "phase_id": "READ_ONLY_AUDIT",
+  "description": "Git-only preflight for read-only planning and audit phases",
+  "require_runtime_checks": false,
+  "git": {
+    "expected_branch": "main",
+    "require_clean_tree": true,
+    "require_no_staged": true,
+    "require_synced_with_remote": true,
+    "expected_remote_ref": "origin/main",
+    "require_config_local_ignored": true
+  },
+  "wrappers": {
+    "allowed": [],
+    "forbidden": [],
+    "require_all_allowed_running": false
+  },
+  "sessions": {
+    "max_active_count": 0,
+    "active_states": []
+  },
+  "channels": {
+    "required": [],
+    "protected_expectation": [],
+    "forbid_general_session_leak_count": false
+  },
+  "sandbox": {
+    "forbid_flow_enabled": false,
+    "forbid_audit_activity": false
+  },
+  "network": {
+    "expected_port": 8300,
+    "max_listeners": 99,
+    "require_server_when_wrappers_required": false
+  },
+  "redaction": {
+    "require_self_test": true
+  },
+  "general_fallback_forbidden": true
+}

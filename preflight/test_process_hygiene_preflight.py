@@ -346,5 +346,286 @@ class OutputSchemaTests(unittest.TestCase):
         self.assertEqual(report.exit_code, 0)
 
 
+def _git_only_ctx(snap: GitSnapshot | None = None, *, tmp: Path | None = None) -> PreflightContext:
+    local_path = (tmp / "missing_config.local.toml") if tmp else (ROOT / "missing_config.local.toml")
+    return PreflightContext(
+        repo_root=ROOT,
+        git_snapshot=snap or _clean_git(),
+        processes=[],
+        port_listeners=[],
+        config_toml_path=ROOT / "config.toml",
+        config_local_path=local_path,
+    )
+
+
+def _write_manifest_file(manifest_dir: Path, manifest: dict) -> Path:
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    path = manifest_dir / f"{manifest['phase_id']}.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return path
+
+
+def _git_only_manifest_skeleton(phase_id: str, *, git_extra: dict | None = None) -> dict:
+    git = {
+        "expected_branch": "main",
+        "require_clean_tree": True,
+        "require_no_staged": True,
+        "require_synced_with_remote": True,
+        "expected_remote_ref": "origin/main",
+        "require_config_local_ignored": True,
+    }
+    if git_extra:
+        git.update(git_extra)
+    return {
+        "phase_id": phase_id,
+        "description": "test manifest",
+        "require_runtime_checks": False,
+        "git": git,
+        "wrappers": {"allowed": [], "forbidden": [], "require_all_allowed_running": False},
+        "sessions": {"max_active_count": 0, "active_states": []},
+        "channels": {"required": [], "protected_expectation": [], "forbid_general_session_leak_count": False},
+        "sandbox": {"forbid_flow_enabled": False, "forbid_audit_activity": False},
+        "network": {"expected_port": 8300, "max_listeners": 99, "require_server_when_wrappers_required": False},
+        "redaction": {"require_self_test": True},
+        "general_fallback_forbidden": True,
+    }
+
+
+class ReadOnlyAuditManifestTests(unittest.TestCase):
+    def test_read_only_audit_passes(self):
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx())
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertTrue(any(c.id == "runtime.skipped" for c in report.checks))
+        self.assertFalse(any(c.id.startswith("wrappers.") for c in report.checks))
+
+    def test_read_only_audit_blocks_wrong_branch(self):
+        snap = _clean_git()
+        snap.branch = "feature/x"
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.branch" for c in report.checks))
+
+    def test_read_only_audit_blocks_sync_drift_ahead(self):
+        snap = _clean_git()
+        snap.ahead_lines = ["abc commit"]
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.sync" for c in report.checks))
+
+    def test_read_only_audit_blocks_sync_drift_behind(self):
+        snap = _clean_git()
+        snap.behind_lines = ["def commit"]
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+    def test_read_only_audit_blocks_tracked_dirty(self):
+        snap = _clean_git()
+        snap.porcelain = " M app.py"
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.clean_tree" for c in report.checks))
+
+    def test_read_only_audit_blocks_untracked(self):
+        snap = _clean_git()
+        snap.porcelain = "?? scratch.txt"
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+    def test_read_only_audit_blocks_staged(self):
+        snap = _clean_git()
+        snap.staged_names = ["app.py"]
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.staged" for c in report.checks))
+
+    def test_read_only_audit_no_runtime_requirements(self):
+        report = run_preflight("READ_ONLY_AUDIT", ctx=_git_only_ctx())
+        ids = {c.id for c in report.checks}
+        self.assertNotIn("port.listeners", ids)
+        self.assertNotIn("wrappers.required", ids)
+        self.assertNotIn("channels.required", ids)
+        self.assertNotIn("sessions.active_count", ids)
+
+
+class CodexDirtyTreeManifestTests(unittest.TestCase):
+    def _run_codex(self, snap: GitSnapshot, allowlist: list[str]) -> PreflightReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = _git_only_manifest_skeleton(
+                "CODEX_REVIEW_DIRTY_TREE",
+                git_extra={
+                    "require_clean_tree": False,
+                    "approved_dirty_paths": allowlist,
+                },
+            )
+            manifest["sandbox"]["forbid_flow_enabled"] = True
+            mdir = Path(tmp)
+            _write_manifest_file(mdir, manifest)
+            return run_preflight(
+                "CODEX_REVIEW_DIRTY_TREE",
+                ctx=_git_only_ctx(snap, tmp=mdir),
+                manifest_dir=mdir,
+            )
+
+    def test_codex_allows_scoped_dirty_files(self):
+        allowlist = ["preflight/checks.py", "preflight/runner.py"]
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py\n M preflight/runner.py"
+        report = self._run_codex(snap, allowlist)
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertTrue(any(c.id == "git.dirty_allowlist" for c in report.checks))
+
+    def test_codex_blocks_unauthorized_dirty_files(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py\n?? app.py"
+        report = self._run_codex(snap, ["preflight/checks.py"])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.dirty_allowlist" for c in report.checks))
+
+    def test_codex_blocks_staged_when_forbidden(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py"
+        snap.staged_names = ["preflight/checks.py"]
+        report = self._run_codex(snap, ["preflight/checks.py"])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.staged" for c in report.checks))
+
+    def test_codex_empty_allowlist_blocks(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py"
+        report = self._run_codex(snap, [])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+
+class CommitExactFilesManifestTests(unittest.TestCase):
+    def _run_commit(self, snap: GitSnapshot, allowlist: list[str]) -> PreflightReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = _git_only_manifest_skeleton(
+                "COMMIT_EXACT_FILES",
+                git_extra={
+                    "require_clean_tree": False,
+                    "require_exact_dirty_set": True,
+                    "approved_file_allowlist": allowlist,
+                },
+            )
+            manifest["sandbox"]["forbid_flow_enabled"] = True
+            mdir = Path(tmp)
+            _write_manifest_file(mdir, manifest)
+            return run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap, tmp=mdir),
+                manifest_dir=mdir,
+            )
+
+    def test_commit_passes_exact_allowlist(self):
+        allowlist = ["preflight/checks.py", "preflight_manifest.py"]
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py\n?? preflight_manifest.py"
+        report = self._run_commit(snap, allowlist)
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertTrue(any(c.id == "git.exact_dirty_set" for c in report.checks))
+
+    def test_commit_blocks_extra_files(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py\n?? extra.py"
+        report = self._run_commit(snap, ["preflight/checks.py"])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+    def test_commit_blocks_staged_before_staging(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py"
+        snap.staged_names = ["preflight/checks.py"]
+        report = self._run_commit(snap, ["preflight/checks.py"])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.staged" for c in report.checks))
+
+    def test_commit_blocks_protected_config_path(self):
+        snap = _clean_git()
+        snap.porcelain = " M config.toml"
+        report = self._run_commit(snap, ["preflight/checks.py"])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.protected_path" for c in report.checks))
+
+    def test_commit_blocks_data_path_without_allowlist(self):
+        snap = _clean_git()
+        snap.porcelain = "?? data/settings.json"
+        report = self._run_commit(snap, ["preflight/checks.py"])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(
+            c.id in ("git.exact_dirty_set", "git.protected_path")
+            for c in report.checks
+        ))
+
+    def test_commit_empty_allowlist_blocks(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py"
+        report = self._run_commit(snap, [])
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+
+class PushOnlyManifestTests(unittest.TestCase):
+    def test_push_only_passes_one_commit_ahead(self):
+        snap = _clean_git()
+        snap.head = "4000008"
+        snap.remote_head = "3ed690e"
+        snap.ahead_lines = ["4000008 feat(tooling): add fail-closed preflight checker"]
+        report = run_preflight("PUSH_ONLY", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertTrue(any(c.id == "git.ahead" for c in report.checks))
+
+    def test_push_only_blocks_behind_remote(self):
+        snap = _clean_git()
+        snap.behind_lines = ["older commit"]
+        report = run_preflight("PUSH_ONLY", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.sync" for c in report.checks))
+
+    def test_push_only_blocks_unexpected_ahead_count(self):
+        snap = _clean_git()
+        snap.ahead_lines = ["a", "b"]
+        report = run_preflight("PUSH_ONLY", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "git.ahead" for c in report.checks))
+
+    def test_push_only_blocks_dirty_tree(self):
+        snap = _clean_git()
+        snap.ahead_lines = ["4000008 commit"]
+        snap.porcelain = "?? leftover.txt"
+        report = run_preflight("PUSH_ONLY", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+    def test_push_only_blocks_staged_files(self):
+        snap = _clean_git()
+        snap.ahead_lines = ["4000008 commit"]
+        snap.staged_names = ["app.py"]
+        report = run_preflight("PUSH_ONLY", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+
+
+class E5DManifestValidationTests(unittest.TestCase):
+    def test_shipped_manifests_load(self):
+        for phase_id in (
+            "READ_ONLY_AUDIT",
+            "CODEX_REVIEW_DIRTY_TREE",
+            "COMMIT_EXACT_FILES",
+            "PUSH_ONLY",
+            "E4C_SDLC_LIVE",
+        ):
+            manifest, err = load_manifest(phase_id, manifest_dir=MANIFEST_DIR)
+            self.assertIsNone(err, msg=f"{phase_id}: {err}")
+            self.assertIsNotNone(manifest)
+
+    def test_missing_required_field_still_blocks(self):
+        manifest, err = validate_manifest_dict({"phase_id": "INCOMPLETE"})
+        self.assertIsNone(manifest)
+        self.assertIsNotNone(err)
+
+    def test_require_clean_tree_false_without_allowlist_mechanism_fails_validation(self):
+        data = _git_only_manifest_skeleton("BAD", git_extra={"require_clean_tree": False})
+        data["git"].pop("approved_dirty_paths", None)
+        manifest, err = validate_manifest_dict(data)
+        self.assertIsNone(manifest)
+        self.assertIn("require_clean_tree=false", err or "")
+
+
 if __name__ == "__main__":
     unittest.main()
