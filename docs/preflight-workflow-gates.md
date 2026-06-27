@@ -210,22 +210,24 @@ specific remediation action.**
 
 ## 9. Gate-Specific Verification Requirements
 
+### Commit authorization
+
+Before exact-file staging:
+
+1. `COMMIT_EXACT_FILES` preflight `PASS`
+2. Dirty/untracked set exactly matches approved allowlist (via `--allowlist-file` sidecar — see §10)
+3. No staged files before staging when configured
+4. Sandbox flow guard satisfied — `sandbox.flow_start_enabled` must be `false` locally when manifest forbids flow (see §10)
+
 ### Codex review (dirty tree)
 
 Before Codex submission, verify:
 
 1. `Preflight Evidence` present with manifest `CODEX_REVIEW_DIRTY_TREE`
 2. Verdict `PASS` (or phase documents why not)
-3. Dirty files match authorized scope and allowlist
+3. Dirty files match authorized scope and allowlist (via `--allowlist-file` sidecar — see §10)
 4. No unauthorized files in `git diff --name-status`
-
-### Commit authorization
-
-Before exact-file staging:
-
-1. `COMMIT_EXACT_FILES` preflight `PASS`
-2. Dirty/untracked set exactly matches approved allowlist
-3. No staged files before staging when configured
+5. Sandbox flow guard satisfied when manifest forbids flow (see §10)
 
 ### Push authorization
 
@@ -276,7 +278,10 @@ For operational gates, supply a **phase-scoped sidecar JSON** via CLI:
 {
   "manifest_id": "CODEX_REVIEW_DIRTY_TREE",
   "authorization_phase_id": "TOOLING-AGENTCHATTR-V2-EXAMPLE-CODEX-REVIEW",
-  "approved_dirty_paths": ["path/to/approved/file"]
+  "approved_dirty_paths": [
+    "docs/preflight-workflow-gates.md"
+  ],
+  "notes": "Example dirty-tree review allowlist"
 }
 ```
 
@@ -286,7 +291,10 @@ For operational gates, supply a **phase-scoped sidecar JSON** via CLI:
 {
   "manifest_id": "COMMIT_EXACT_FILES",
   "authorization_phase_id": "TOOLING-AGENTCHATTR-V2-EXAMPLE-COMMIT",
-  "approved_file_allowlist": ["path/to/approved/file"]
+  "approved_file_allowlist": [
+    "docs/preflight-workflow-gates.md"
+  ],
+  "notes": "Example exact-file commit allowlist"
 }
 ```
 
@@ -311,6 +319,109 @@ Human output includes a concise `Allowlist: …` line. Full user profile paths a
 
 If an allowlisted path is gitignored, preflight may still BLOCK on exact-set mismatch. Preflight
 does **not** auto-stage or authorize force-add — that remains a separate commit-operator step.
+
+### Sidecar storage convention
+
+- Sidecars must live **outside the repository**.
+- Recommended directory:
+
+```
+C:\Users\Narachat\OneDrive\Ai-Report\claude\allowlists\
+```
+
+- Never commit sidecars to git.
+- Never store sidecars under the repo tree.
+- Treat sidecars as **operator evidence artifacts** alongside phase reports under Ai-Report.
+
+### Naming convention
+
+Recommended basename pattern:
+
+```
+{phase-short-id}-{gate}-allowlist.json
+```
+
+Examples:
+
+```
+e5j-commit-allowlist.json
+e5l-codex-allowlist.json
+e5l-commit-allowlist.json
+```
+
+Guidance:
+
+- Include gate intent in the basename (`commit`, `codex`, etc.).
+- Set `authorization_phase_id` inside the JSON to the coordinator memo ID or full approved phase string (e.g. `TOOLING-AGENTCHATTR-V2-E5L-SIDECAR-OPERATIONALIZATION-DOCS-PATCH`).
+
+### Lifecycle policy
+
+- Create a **fresh sidecar** per authorized phase/gate — one sidecar per commit or Codex authorization.
+- Do **not** reuse stale sidecars after dirty tree, file list, or authorization memo changes.
+- Retain sidecars as audit evidence under Ai-Report until phase closure.
+- Archive or delete only after closure if Owner chooses.
+- Authorization memos must cite the **exact sidecar path** used for preflight dogfood.
+
+### Windows encoding (UTF-8 without BOM)
+
+- Write sidecar JSON as **UTF-8 without BOM**.
+- A UTF-8 BOM causes `allowlist.invalid_json` and preflight `BLOCKED`.
+- Windows PowerShell/editor defaults may add BOM depending on method and version.
+- Prefer a BOM-free writer. Example using Python (no secrets):
+
+```
+@'
+{
+  "manifest_id": "COMMIT_EXACT_FILES",
+  "authorization_phase_id": "TOOLING-AGENTCHATTR-V2-EXAMPLE-COMMIT",
+  "approved_file_allowlist": [
+    "docs/preflight-workflow-gates.md"
+  ],
+  "notes": "Example exact-file commit allowlist"
+}
+'@ | python -c "import sys, pathlib; pathlib.Path(r'C:\Users\Narachat\OneDrive\Ai-Report\claude\allowlists\example-commit-allowlist.json').write_text(sys.stdin.read(), encoding='utf-8')"
+```
+
+### Sandbox flow prerequisite
+
+- `COMMIT_EXACT_FILES` and `CODEX_REVIEW_DIRTY_TREE` may still enforce **sandbox checks** from the official manifest.
+- The sidecar allowlist does **not** bypass sandbox checks.
+- If local `sandbox.flow_start_enabled = true`, commit/Codex preflight may `BLOCKED` on `sandbox.flow_enabled`.
+- `config.local.toml` must remain **ignored/uncommitted** — never stage or commit it.
+- Disabling or re-enabling sandbox flow requires **explicit authorization** in a separate phase memo.
+- Default local posture for commit/Codex preflight work:
+
+```toml
+[sandbox]
+flow_start_enabled = false
+```
+
+(or equivalent existing TOML nesting in `config.local.toml`).
+
+### Local sandbox restoration policy
+
+- Re-enable sandbox flow (`flow_start_enabled = true`) only under an **explicit sandbox-flow or live dogfood authorization**.
+- Do not restore it casually while commit/Codex gates are in flight.
+- A restoration memo must state:
+  - target key (`flow_start_enabled`)
+  - target value (`true` or `false`)
+  - reason for change
+  - whether commit/Codex gates are currently in flight
+- Leaving `flow_start_enabled = false` is preferred during commit/Codex preflight work.
+- Turning it `true` too early can cause unexpected `COMMIT_EXACT_FILES` or `CODEX_REVIEW_DIRTY_TREE` `BLOCKED`.
+
+### Force-add separation
+
+- `force_add_paths` remains **outside preflight** — sidecar schema rejects it.
+- A sidecar allowlist is **not** force-add authorization.
+- Gitignored but tracked paths (e.g. under `docs/`) may require **separate explicit force-add authorization** in the commit memo.
+- If `git add` refuses an approved path because of ignore rules: **halt**, do not use `git add -f`, request separate force-add authorization.
+
+### Manual sidecar creation vs future automation
+
+- **Manual sidecar creation remains acceptable** — operators author JSON per authorization memo.
+- **Helper tooling is deferred** — no in-repo generator in this phase.
+- Any future helper that writes or validates sidecars must be a **separately authorized tooling phase** and reviewed separately from docs or preflight behavior changes.
 
 ---
 

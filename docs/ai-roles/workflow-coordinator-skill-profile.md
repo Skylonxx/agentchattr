@@ -167,10 +167,14 @@ require `PUSH_ONLY` evidence before `git push origin main`. Live validation requ
 PASS in a separately authorized phase before session authorization — preflight PASS alone does not
 authorize the session.
 
-**Rule P8 — Allowlist gap (fail-closed).** `CODEX_REVIEW_DIRTY_TREE` and `COMMIT_EXACT_FILES` ship
-with empty allowlists by design. Do not pretend those gates can PASS without a phase-specific allowlist
-mechanism (future E5I: `--manifest-dir`, `--allowlist-file`, or equivalent). Until then, memos must
-document the dependency explicitly.
+**Rule P8 — Allowlist sidecar (operational).** `CODEX_REVIEW_DIRTY_TREE` and `COMMIT_EXACT_FILES`
+ship with empty allowlists in official manifests by design. Operational gates require a
+**phase-scoped sidecar JSON** via `--allowlist-file` (see [`docs/preflight-workflow-gates.md` §10](../preflight-workflow-gates.md#10-allowlist-sidecar---allowlist-file)).
+Authorization memos must cite the exact sidecar path, `authorization_phase_id`, and approved paths.
+Sidecars live outside the repo under Ai-Report evidence storage; never commit them. Create a fresh
+sidecar per phase; do not reuse stale sidecars. Write UTF-8 without BOM on Windows. Sidecar allowlist
+is not force-add authorization. Commit/Codex gates may still BLOCK on sandbox flow state — see §10
+sandbox prerequisite and restoration policy. Helper tooling for sidecar generation is deferred.
 
 **Rule P9 — Closure memos.** Summarize preflight verdicts, manifest IDs, and baseline HEAD for each
 gate run. State explicitly that preflight PASS is not production readiness.
