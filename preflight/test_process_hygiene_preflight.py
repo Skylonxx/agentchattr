@@ -601,6 +601,415 @@ class PushOnlyManifestTests(unittest.TestCase):
         self.assertEqual(report.verdict, VERDICT_BLOCKED)
 
 
+class AllowlistSidecarTests(unittest.TestCase):
+    def _write_sidecar(self, path: Path, payload: dict) -> Path:
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return path
+
+    def _codex_sidecar(self, paths: list[str], **extra: object) -> dict:
+        data = {
+            "manifest_id": "CODEX_REVIEW_DIRTY_TREE",
+            "authorization_phase_id": "TOOLING-TEST-CODEX",
+            "approved_dirty_paths": paths,
+        }
+        data.update(extra)
+        return data
+
+    def _commit_sidecar(self, paths: list[str], **extra: object) -> dict:
+        data = {
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TOOLING-TEST-COMMIT",
+            "approved_file_allowlist": paths,
+        }
+        data.update(extra)
+        return data
+
+    def test_sidecar_pass_codex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "codex.json",
+                self._codex_sidecar(["preflight/checks.py", "preflight/runner.py"]),
+            )
+            snap = _clean_git()
+            snap.porcelain = "?? preflight/checks.py\n M preflight/runner.py"
+            report = run_preflight(
+                "CODEX_REVIEW_DIRTY_TREE",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertIsNotNone(report.allowlist)
+        self.assertEqual(report.allowlist["path_count"], 2)
+
+    def test_sidecar_pass_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "commit.json",
+                self._commit_sidecar(["preflight/checks.py", "preflight_manifest.py"]),
+            )
+            snap = _clean_git()
+            snap.porcelain = "?? preflight/checks.py\n?? preflight_manifest.py"
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertTrue(any(c.id == "git.exact_dirty_set" for c in report.checks))
+
+    def test_sidecar_manifest_id_mismatch_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "bad.json",
+                self._commit_sidecar(["preflight/checks.py"]),
+            )
+            report = run_preflight(
+                "CODEX_REVIEW_DIRTY_TREE",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.manifest_mismatch" for c in report.checks))
+
+    def test_sidecar_wrong_field_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "bad.json",
+                {
+                    "manifest_id": "COMMIT_EXACT_FILES",
+                    "authorization_phase_id": "TOOLING-TEST-COMMIT",
+                    "approved_dirty_paths": ["preflight/checks.py"],
+                },
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.field_forbidden" for c in report.checks))
+
+    def test_sidecar_missing_file_blocked(self):
+        report = run_preflight(
+            "COMMIT_EXACT_FILES",
+            ctx=_git_only_ctx(),
+            allowlist_file=ROOT / "does-not-exist-allowlist.json",
+        )
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.file_missing" for c in report.checks))
+
+    def test_sidecar_invalid_json_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "bad.json"
+            sidecar.write_text("{not json", encoding="utf-8")
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.invalid_json" for c in report.checks))
+
+    def test_sidecar_empty_list_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "empty.json",
+                self._commit_sidecar([]),
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_wildcard_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "wild.json",
+                self._commit_sidecar(["preflight/*.py"]),
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_absolute_path_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "abs.json",
+                self._commit_sidecar(["/etc/passwd"]),
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_traversal_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "trav.json",
+                self._commit_sidecar(["../outside.py"]),
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_unc_path_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "unc.json",
+                self._commit_sidecar(["\\\\server\\share\\file.py"]),
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_windows_drive_path_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "drive.json",
+                self._commit_sidecar(["C:\\Windows\\System32\\cmd.exe"]),
+            )
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_backslash_normalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "win.json",
+                self._commit_sidecar(["preflight\\checks.py"]),
+            )
+            snap = _clean_git()
+            snap.porcelain = "?? preflight/checks.py"
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_PASS)
+
+    def test_sidecar_unknown_keys_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._commit_sidecar(["preflight/checks.py"])
+            payload["force_add_paths"] = ["docs/x.md"]
+            sidecar = self._write_sidecar(Path(tmp) / "unknown.json", payload)
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_unsupported_manifest_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "ro.json",
+                self._commit_sidecar(["preflight/checks.py"]),
+            )
+            report = run_preflight(
+                "READ_ONLY_AUDIT",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.unsupported_manifest" for c in report.checks))
+
+    def test_backward_compat_without_sidecar_codex_empty_blocks(self):
+        snap = _clean_git()
+        snap.porcelain = "?? preflight/checks.py"
+        report = run_preflight("CODEX_REVIEW_DIRTY_TREE", ctx=_git_only_ctx(snap))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertIsNone(report.allowlist)
+        self.assertTrue(any(c.id == "git.dirty_allowlist" for c in report.checks))
+
+    def test_json_output_includes_allowlist_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "meta.json",
+                self._commit_sidecar(["preflight/checks.py"]),
+            )
+            snap = _clean_git()
+            snap.porcelain = "?? preflight/checks.py"
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+            payload = json.loads(format_json(report))
+        self.assertIn("allowlist", payload)
+        self.assertEqual(payload["allowlist"]["source_basename"], "meta.json")
+        self.assertEqual(payload["allowlist"]["fields_applied"], ["approved_file_allowlist"])
+
+    def test_human_output_includes_allowlist_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "human.json",
+                self._commit_sidecar(["preflight/checks.py"]),
+            )
+            snap = _clean_git()
+            snap.porcelain = "?? preflight/checks.py"
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+            text = format_human(report)
+        self.assertIn("Allowlist: human.json", text)
+        self.assertIn("authorization_phase_id=TOOLING-TEST-COMMIT", text)
+
+    def test_force_add_paths_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = {
+                "manifest_id": "COMMIT_EXACT_FILES",
+                "authorization_phase_id": "TEST",
+                "approved_file_allowlist": ["preflight/checks.py"],
+                "force_add_paths": ["docs/x.md"],
+            }
+            sidecar = self._write_sidecar(Path(tmp) / "force.json", payload)
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def _run_sidecar_raw(self, payload: dict) -> PreflightReport:
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = Path(tmp) / "raw.json"
+            sidecar.write_text(json.dumps(payload), encoding="utf-8")
+            return run_preflight(
+                payload.get("manifest_id", "COMMIT_EXACT_FILES"),
+                ctx=_git_only_ctx(),
+                allowlist_file=sidecar,
+            )
+
+    def test_sidecar_rejects_integer_path_entry(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": [123],
+        })
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_rejects_boolean_path_entry(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": [True],
+        })
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_rejects_null_path_entry(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": [None],
+        })
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_rejects_dot_path(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": ["."],
+        })
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_rejects_bare_dotdot_path(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": [".."],
+        })
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.path_invalid" for c in report.checks))
+
+    def test_sidecar_normalizes_leading_dot_slash_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "dot-slash.json",
+                self._commit_sidecar(["./docs/preflight-workflow-gates.md"]),
+            )
+            snap = _clean_git()
+            snap.porcelain = " M docs/preflight-workflow-gates.md"
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_PASS)
+
+    def test_sidecar_both_arrays_present_blocked(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_dirty_paths": ["preflight/checks.py"],
+            "approved_file_allowlist": ["preflight/runner.py"],
+        })
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_neither_array_present_blocked(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+        })
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_non_list_allowlist_blocked(self):
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": "preflight/checks.py",
+        })
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+    def test_sidecar_duplicate_paths_deduped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sidecar = self._write_sidecar(
+                Path(tmp) / "dup.json",
+                self._commit_sidecar([
+                    "preflight/checks.py",
+                    "preflight/checks.py",
+                ]),
+            )
+            snap = _clean_git()
+            snap.porcelain = "?? preflight/checks.py"
+            report = run_preflight(
+                "COMMIT_EXACT_FILES",
+                ctx=_git_only_ctx(snap),
+                allowlist_file=sidecar,
+            )
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertEqual(report.allowlist["path_count"], 1)
+
+    def test_sidecar_max_path_count_blocked(self):
+        paths = [f"preflight/file_{i}.py" for i in range(65)]
+        report = self._run_sidecar_raw({
+            "manifest_id": "COMMIT_EXACT_FILES",
+            "authorization_phase_id": "TEST",
+            "approved_file_allowlist": paths,
+        })
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "allowlist.schema" for c in report.checks))
+
+
 class E5DManifestValidationTests(unittest.TestCase):
     def test_shipped_manifests_load(self):
         for phase_id in (

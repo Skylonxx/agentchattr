@@ -6,6 +6,8 @@ Manifests are explicit allowlists. Missing required fields fail closed.
 from __future__ import annotations
 
 import json
+import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -230,3 +232,230 @@ def list_known_phases(*, manifest_dir: Path | None = None) -> list[str]:
     if not base.is_dir():
         return []
     return sorted(p.stem for p in base.glob("*.json"))
+
+
+# --- Phase-scoped allowlist sidecar (E5J) ---
+
+ALLOWLIST_SUPPORTED_MANIFESTS = frozenset({
+    "CODEX_REVIEW_DIRTY_TREE",
+    "COMMIT_EXACT_FILES",
+})
+
+ALLOWLIST_SIDECAR_KEYS = frozenset({
+    "manifest_id",
+    "authorization_phase_id",
+    "approved_dirty_paths",
+    "approved_file_allowlist",
+    "notes",
+})
+
+ALLOWLIST_MAX_PATH_COUNT = 64
+
+_WILDCARD_RE = re.compile(r"[*?]")
+
+
+@dataclass(frozen=True)
+class AllowlistSidecar:
+    manifest_id: str
+    authorization_phase_id: str
+    approved_dirty_paths: tuple[str, ...] | None = None
+    approved_file_allowlist: tuple[str, ...] | None = None
+    source_basename: str = ""
+
+
+def _normalize_allowlist_path(path: str) -> str:
+    return path.replace("\\", "/").strip()
+
+
+def validate_repo_relative_path(path: str, repo_root: Path) -> tuple[str | None, str | None]:
+    """Validate and normalize a repo-relative allowlist path. Returns (normalized, error)."""
+    if not isinstance(path, str) or not path.strip():
+        return None, "path must be a non-empty string"
+
+    raw = path.strip()
+    if _WILDCARD_RE.search(raw):
+        return None, f"wildcards not allowed in path: {raw!r}"
+
+    norm = _normalize_allowlist_path(raw)
+    if norm.startswith("/"):
+        return None, f"absolute path not allowed: {raw!r}"
+    if re.match(r"^[A-Za-z]:", norm):
+        return None, f"drive path not allowed: {raw!r}"
+    if norm.startswith("//") or norm.startswith("\\\\"):
+        return None, f"UNC path not allowed: {raw!r}"
+
+    while norm.startswith("./"):
+        norm = norm[2:]
+
+    if not norm:
+        return None, "path is empty after normalization"
+
+    parts = norm.split("/")
+    if any(p == ".." for p in parts):
+        return None, f"path traversal not allowed: {raw!r}"
+    if any(p == "." for p in parts):
+        return None, f"invalid path segment in: {raw!r}"
+    if any(p == "" for p in parts):
+        return None, f"invalid path segment in: {raw!r}"
+
+    try:
+        resolved = (repo_root / norm).resolve()
+        resolved.relative_to(repo_root.resolve())
+    except (ValueError, OSError):
+        return None, f"path resolves outside repo root: {raw!r}"
+
+    return norm, None
+
+
+def _validate_path_list(
+    paths: object,
+    *,
+    repo_root: Path,
+) -> tuple[tuple[str, ...] | None, str | None]:
+    if not isinstance(paths, list):
+        return None, "allowlist must be a list of strings"
+    if not paths:
+        return None, "allowlist must not be empty"
+    if len(paths) > ALLOWLIST_MAX_PATH_COUNT:
+        return None, f"allowlist exceeds maximum of {ALLOWLIST_MAX_PATH_COUNT} entries"
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for entry in paths:
+        if not isinstance(entry, str):
+            return None, "allowlist path entries must be strings"
+        norm, err = validate_repo_relative_path(entry, repo_root)
+        if err:
+            return None, err
+        assert norm is not None
+        key = norm.lower() if sys.platform == "win32" else norm
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(norm)
+
+    if not normalized:
+        return None, "allowlist must not be empty after normalization"
+    return tuple(normalized), None
+
+
+def load_allowlist_sidecar(
+    path: Path,
+    phase_id: str,
+    repo_root: Path,
+) -> tuple[AllowlistSidecar | None, dict[str, Any] | None, str | None, str | None]:
+    """Load and validate sidecar JSON. Returns (sidecar, metadata, check_id, detail)."""
+    if not path.is_file():
+        return None, None, "allowlist.file_missing", f"allowlist file not found: {path.name}"
+
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, None, "allowlist.file_missing", f"allowlist file unreadable: {exc}"
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return None, None, "allowlist.invalid_json", f"invalid allowlist JSON: {exc}"
+
+    if not isinstance(data, dict):
+        return None, None, "allowlist.invalid_json", "allowlist root must be a JSON object"
+
+    unknown = sorted(k for k in data if k not in ALLOWLIST_SIDECAR_KEYS)
+    if unknown:
+        return None, None, "allowlist.schema", f"unknown sidecar keys: {', '.join(unknown)}"
+
+    manifest_id = data.get("manifest_id")
+    if not isinstance(manifest_id, str) or not manifest_id.strip():
+        return None, None, "allowlist.schema", "manifest_id must be a non-empty string"
+    if manifest_id.strip() != phase_id.strip():
+        return None, None, "allowlist.manifest_mismatch", (
+            f"sidecar manifest_id {manifest_id!r} != --phase {phase_id!r}"
+        )
+
+    auth_phase = data.get("authorization_phase_id")
+    if not isinstance(auth_phase, str) or not auth_phase.strip():
+        return None, None, "allowlist.schema", "authorization_phase_id must be a non-empty string"
+
+    has_dirty = "approved_dirty_paths" in data
+    has_exact = "approved_file_allowlist" in data
+    if has_dirty and has_exact:
+        return None, None, "allowlist.schema", "sidecar must not include both allowlist arrays"
+    if not has_dirty and not has_exact:
+        return None, None, "allowlist.schema", "sidecar must include exactly one allowlist array"
+
+    phase = phase_id.strip()
+    dirty_paths: tuple[str, ...] | None = None
+    file_allowlist: tuple[str, ...] | None = None
+    fields_applied: list[str] = []
+
+    if phase == "CODEX_REVIEW_DIRTY_TREE":
+        if has_exact:
+            return None, None, "allowlist.field_forbidden", (
+                "approved_file_allowlist is not allowed for CODEX_REVIEW_DIRTY_TREE"
+            )
+        dirty_paths, err = _validate_path_list(data["approved_dirty_paths"], repo_root=repo_root)
+        if err:
+            if "must be strings" in err:
+                check_id = "allowlist.schema"
+            elif any(token in err for token in ("path", "wildcard", "traversal", "segment", "absolute", "drive", "UNC")):
+                check_id = "allowlist.path_invalid"
+            else:
+                check_id = "allowlist.schema"
+            return None, None, check_id, err
+        fields_applied = ["approved_dirty_paths"]
+    elif phase == "COMMIT_EXACT_FILES":
+        if has_dirty:
+            return None, None, "allowlist.field_forbidden", (
+                "approved_dirty_paths is not allowed for COMMIT_EXACT_FILES"
+            )
+        file_allowlist, err = _validate_path_list(data["approved_file_allowlist"], repo_root=repo_root)
+        if err:
+            if "must be strings" in err:
+                check_id = "allowlist.schema"
+            elif any(token in err for token in ("path", "wildcard", "traversal", "segment", "absolute", "drive", "UNC")):
+                check_id = "allowlist.path_invalid"
+            else:
+                check_id = "allowlist.schema"
+            return None, None, check_id, err
+        fields_applied = ["approved_file_allowlist"]
+    else:
+        return None, None, "allowlist.unsupported_manifest", (
+            f"manifest {phase!r} does not support --allowlist-file"
+        )
+
+    path_count = len(dirty_paths or file_allowlist or ())
+    metadata = {
+        "source_basename": path.name,
+        "authorization_phase_id": auth_phase.strip(),
+        "fields_applied": fields_applied,
+        "path_count": path_count,
+    }
+    sidecar = AllowlistSidecar(
+        manifest_id=phase,
+        authorization_phase_id=auth_phase.strip(),
+        approved_dirty_paths=dirty_paths,
+        approved_file_allowlist=file_allowlist,
+        source_basename=path.name,
+    )
+    return sidecar, metadata, None, None
+
+
+def merge_allowlist_into_manifest(
+    manifest: PhaseManifest,
+    sidecar: AllowlistSidecar,
+) -> tuple[PhaseManifest | None, str | None]:
+    """Deep-copy official manifest and inject validated allowlist paths only."""
+    import copy
+
+    raw = copy.deepcopy(manifest.raw)
+    git = raw.setdefault("git", {})
+    if sidecar.approved_dirty_paths is not None:
+        git["approved_dirty_paths"] = list(sidecar.approved_dirty_paths)
+    if sidecar.approved_file_allowlist is not None:
+        git["approved_file_allowlist"] = list(sidecar.approved_file_allowlist)
+
+    merged, err = validate_manifest_dict(raw)
+    if merged is None:
+        return None, err or "failed to merge allowlist into manifest"
+    return merged, None

@@ -23,7 +23,13 @@ from preflight.checks import (
     run_all_checks,
 )
 from preflight.redaction import scrub_preflight_output
-from preflight_manifest import PhaseManifest, load_manifest
+from preflight_manifest import (
+    ALLOWLIST_SUPPORTED_MANIFESTS,
+    PhaseManifest,
+    load_allowlist_sidecar,
+    load_manifest,
+    merge_allowlist_into_manifest,
+)
 
 EXIT_PASS = 0
 EXIT_BLOCKED = 1
@@ -134,15 +140,22 @@ class PreflightReport:
     blocked_reasons: list[str]
     exit_code: int
     baseline: str = ""
+    allowlist: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "phase": scrub_preflight_output(self.phase),
             "verdict": self.verdict,
             "baseline": scrub_preflight_output(self.baseline),
             "checks": [c.to_dict() for c in self.checks],
             "blocked_reasons": [scrub_preflight_output(r) for r in self.blocked_reasons],
         }
+        if self.allowlist is not None:
+            payload["allowlist"] = {
+                k: scrub_preflight_output(v) if isinstance(v, str) else v
+                for k, v in self.allowlist.items()
+            }
+        return payload
 
 
 def run_preflight(
@@ -152,16 +165,45 @@ def run_preflight(
     ctx: PreflightContext | None = None,
     git_runner: SubprocessGitRunner | None = None,
     manifest_dir: Path | None = None,
+    allowlist_file: Path | None = None,
 ) -> PreflightReport:
     """Execute all preflight checks for a phase. Fail-closed on any error."""
     phase = phase_id.strip() if phase_id else ""
     root = repo_root or ROOT
+    allowlist_meta: dict[str, Any] | None = None
 
     try:
         manifest, manifest_err = load_manifest(phase, manifest_dir=manifest_dir)
         checks: list[CheckResult] = [check_manifest_known(manifest, manifest_err)]
 
-        if manifest is None:
+        if allowlist_file is not None:
+            if phase not in ALLOWLIST_SUPPORTED_MANIFESTS:
+                checks.append(CheckResult(
+                    "allowlist.unsupported_manifest",
+                    VERDICT_BLOCKED,
+                    f"manifest {phase!r} does not support --allowlist-file",
+                ))
+            elif manifest is None:
+                pass
+            else:
+                sidecar, meta, err_id, err_detail = load_allowlist_sidecar(
+                    allowlist_file, phase, root,
+                )
+                if err_id:
+                    checks.append(CheckResult(err_id, VERDICT_BLOCKED, err_detail or err_id))
+                elif sidecar is not None:
+                    merged, merge_err = merge_allowlist_into_manifest(manifest, sidecar)
+                    if merge_err or merged is None:
+                        checks.append(CheckResult(
+                            "allowlist.schema",
+                            VERDICT_BLOCKED,
+                            merge_err or "failed to merge allowlist",
+                        ))
+                    else:
+                        manifest = merged
+                        allowlist_meta = meta
+
+        if manifest is None or any(c.status == VERDICT_BLOCKED for c in checks):
             verdict = VERDICT_BLOCKED
             reasons = blocked_reasons(checks)
             return PreflightReport(
@@ -170,6 +212,7 @@ def run_preflight(
                 checks=checks,
                 blocked_reasons=reasons,
                 exit_code=EXIT_BLOCKED,
+                allowlist=allowlist_meta,
             )
 
         context = ctx or PreflightContext(repo_root=root)
@@ -201,6 +244,7 @@ def run_preflight(
             blocked_reasons=reasons,
             exit_code=exit_code,
             baseline=baseline,
+            allowlist=allowlist_meta,
         )
     except Exception as exc:
         detail = scrub_preflight_output(f"internal preflight error: {exc}")
@@ -221,6 +265,16 @@ def format_human(report: PreflightReport) -> str:
     ]
     if report.baseline:
         lines.append(f"Baseline: {scrub_preflight_output(report.baseline)}")
+    if report.allowlist:
+        meta = report.allowlist
+        fields = ",".join(meta.get("fields_applied", []))
+        lines.append(
+            "Allowlist: "
+            f"{scrub_preflight_output(meta.get('source_basename', ''))} "
+            f"(authorization_phase_id={scrub_preflight_output(meta.get('authorization_phase_id', ''))}, "
+            f"fields={scrub_preflight_output(fields)}, "
+            f"paths={meta.get('path_count', 0)})"
+        )
     lines.append("")
     lines.append("Checks:")
     for check in report.checks:
@@ -258,9 +312,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--phase", required=True, help="Phase manifest ID (e.g. E4C_SDLC_LIVE)")
     parser.add_argument("--format", choices=("human", "json"), default="human")
     parser.add_argument("--repo-root", default=str(ROOT), help="Repository root path")
+    parser.add_argument(
+        "--allowlist-file",
+        default=None,
+        help="Phase-scoped allowlist sidecar JSON (CODEX_REVIEW_DIRTY_TREE / COMMIT_EXACT_FILES only)",
+    )
     args = parser.parse_args(argv)
 
-    report = run_preflight(args.phase, repo_root=Path(args.repo_root))
+    allowlist_path = Path(args.allowlist_file) if args.allowlist_file else None
+    report = run_preflight(
+        args.phase,
+        repo_root=Path(args.repo_root),
+        allowlist_file=allowlist_path,
+    )
     if args.format == "json":
         print(format_json(report))
     else:

@@ -243,26 +243,74 @@ Before live session authorization:
 
 ---
 
-## 10. Allowlist Operational Gap (Fail-Closed by Design)
+## 10. Allowlist Sidecar (`--allowlist-file`)
 
-`CODEX_REVIEW_DIRTY_TREE` and `COMMIT_EXACT_FILES` **ship with empty allowlists** in the repository.
-This is **intentional fail-closed behavior** — they BLOCK until a phase-specific allowlist is supplied.
+`CODEX_REVIEW_DIRTY_TREE` and `COMMIT_EXACT_FILES` **ship with empty allowlists** in the
+repository. This remains **intentional fail-closed** when `--allowlist-file` is omitted.
 
-Mandatory dirty-tree and exact-file gates therefore require **phase-specific allowlist injection**.
-E5H does not implement this mechanism.
+For operational gates, supply a **phase-scoped sidecar JSON** via CLI:
 
-### Future E5I (proposed)
+```
+.\.venv\Scripts\python.exe -m preflight `
+  --phase COMMIT_EXACT_FILES `
+  --allowlist-file C:\path\to\phase-allowlist.json `
+  --format json
+```
 
-A future bounded phase should consider CLI or config design such as:
+### Rules
 
-- `--manifest-dir` (load phase-specific manifest copy from a temp directory)
-- `--allowlist-file` (inject approved paths without committing manifest state)
-- Another explicit, non-committed, phase-scoped override mechanism
+- Official manifests in `preflight_manifests/` remain **fixed** — sidecar does not replace manifests.
+- Sidecar may inject **only**:
+  - `git.approved_dirty_paths` for `CODEX_REVIEW_DIRTY_TREE`
+  - `git.approved_file_allowlist` for `COMMIT_EXACT_FILES`
+- **No** `--manifest-dir`, env override, or stdin allowlist.
+- **`force_add_paths` is outside preflight** — commit authorization memos handle exact force-add.
+- Missing, invalid, mismatched, or unsafe sidecar → **BLOCKED** (exit `1`).
+- Wildcards, absolute paths, drive/UNC paths, and `..` traversal are rejected.
 
-Until E5I is authorized and implemented:
+### Sidecar schema
 
-- Workflow memos must **not** claim Codex/commit preflight gates can PASS without a supplied allowlist mechanism
-- Coordinators must document the allowlist in phase authorization and note the E5I dependency when mandating those gates
+**CODEX_REVIEW_DIRTY_TREE:**
+
+```json
+{
+  "manifest_id": "CODEX_REVIEW_DIRTY_TREE",
+  "authorization_phase_id": "TOOLING-AGENTCHATTR-V2-EXAMPLE-CODEX-REVIEW",
+  "approved_dirty_paths": ["path/to/approved/file"]
+}
+```
+
+**COMMIT_EXACT_FILES:**
+
+```json
+{
+  "manifest_id": "COMMIT_EXACT_FILES",
+  "authorization_phase_id": "TOOLING-AGENTCHATTR-V2-EXAMPLE-COMMIT",
+  "approved_file_allowlist": ["path/to/approved/file"]
+}
+```
+
+Optional: `notes` (scrubbed in output if needed). Unknown keys fail closed.
+
+### JSON evidence
+
+When `--allowlist-file` is used, JSON output includes:
+
+```json
+"allowlist": {
+  "source_basename": "phase-allowlist.json",
+  "authorization_phase_id": "TOOLING-...",
+  "fields_applied": ["approved_file_allowlist"],
+  "path_count": 5
+}
+```
+
+Human output includes a concise `Allowlist: …` line. Full user profile paths are not exposed.
+
+### Ignored files
+
+If an allowlisted path is gitignored, preflight may still BLOCK on exact-set mismatch. Preflight
+does **not** auto-stage or authorize force-add — that remains a separate commit-operator step.
 
 ---
 
