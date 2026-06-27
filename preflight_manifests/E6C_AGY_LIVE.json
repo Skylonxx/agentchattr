@@ -1,0 +1,53 @@
+{
+  "phase_id": "E6C_AGY_LIVE",
+  "description": "E6C AGY single direct-mention live validation preflight (AGY-only store_exec, dedicated agy-live-validation channel; not authorized by this manifest alone)",
+  "git": {
+    "expected_branch": "main",
+    "require_clean_tree": true,
+    "require_no_staged": true,
+    "require_synced_with_remote": true,
+    "expected_remote_ref": "origin/main",
+    "require_config_local_ignored": true
+  },
+  "wrappers": {
+    "allowed": ["agy"],
+    "forbidden": [
+      "codex",
+      "codex_reviewer",
+      "codexsafe",
+      "codex_coordinator",
+      "claude",
+      "claude_dryrun",
+      "gemini",
+      "kimi",
+      "qwen",
+      "kilo",
+      "codebuddy",
+      "copilot",
+      "minimax"
+    ],
+    "require_all_allowed_running": true
+  },
+  "sessions": {
+    "max_active_count": 0,
+    "active_states": ["active", "waiting", "paused"]
+  },
+  "channels": {
+    "required": ["agy-live-validation"],
+    "protected_expectation": ["general", "relay-dryrun", "sdlc-dryrun"],
+    "forbid_general_session_leak_count": true
+  },
+  "sandbox": {
+    "forbid_flow_enabled": true,
+    "forbid_audit_activity": true
+  },
+  "network": {
+    "expected_port": 8300,
+    "max_listeners": 1,
+    "require_server_when_wrappers_required": true
+  },
+  "redaction": {
+    "require_self_test": true
+  },
+  "general_fallback_forbidden": true
+}

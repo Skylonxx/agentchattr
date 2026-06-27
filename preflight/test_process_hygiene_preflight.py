@@ -56,6 +56,19 @@ def _e4c_wrappers_running(*, include_server: bool = True) -> list[ProcessInfo]:
     return procs
 
 
+def _e6c_wrappers_running(*, include_server: bool = True) -> list[ProcessInfo]:
+    procs = [
+        ProcessInfo(100, r"C:\tools\agentchattr\repo\.venv\python.exe wrapper.py agy"),
+    ]
+    if include_server:
+        procs.insert(0, ProcessInfo(99, r"C:\tools\agentchattr\repo\.venv\python.exe run.py"))
+    return procs
+
+
+def _e6c_channels() -> list[str]:
+    return ["general", "relay-dryrun", "sdlc-dryrun", "agy-live-validation"]
+
+
 def _write_settings(data_dir: Path, channels: list[str]) -> None:
     data_dir.mkdir(parents=True, exist_ok=True)
     (data_dir / "settings.json").write_text(
@@ -84,6 +97,24 @@ def _base_ctx(
         data_dir=data_dir,
         git_snapshot=git_snapshot or _clean_git(),
         processes=processes if processes is not None else _e4c_wrappers_running(),
+        port_listeners=port_listeners if port_listeners is not None else [PortListener(8300, 99)],
+        config_toml_path=ROOT / "config.toml",
+        config_local_path=data_dir / "missing_config.local.toml",
+    )
+
+
+def _base_e6c_ctx(
+    data_dir: Path,
+    *,
+    git_snapshot: GitSnapshot | None = None,
+    processes: list[ProcessInfo] | None = None,
+    port_listeners: list[PortListener] | None = None,
+) -> PreflightContext:
+    return PreflightContext(
+        repo_root=ROOT,
+        data_dir=data_dir,
+        git_snapshot=git_snapshot or _clean_git(),
+        processes=processes if processes is not None else _e6c_wrappers_running(),
         port_listeners=port_listeners if port_listeners is not None else [PortListener(8300, 99)],
         config_toml_path=ROOT / "config.toml",
         config_local_path=data_dir / "missing_config.local.toml",
@@ -1141,6 +1172,157 @@ class StaleCandidatesPreflightTests(unittest.TestCase):
         self.assertEqual(report.verdict, VERDICT_PASS)
 
 
+class E6CAgyLiveManifestTests(unittest.TestCase):
+    """E6C AGY live-validation preflight manifest governance shape."""
+
+    def test_e6c_manifest_loads(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        self.assertIsNotNone(manifest)
+        assert manifest is not None
+        self.assertEqual(manifest.phase_id, "E6C_AGY_LIVE")
+        self.assertNotEqual(manifest.phase_id, "E4C_SDLC_LIVE")
+
+    def test_e6c_requires_agy_live_validation_channel(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertIn("agy-live-validation", manifest.channels["required"])
+
+    def test_e6c_allows_agy_wrapper_only(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertEqual(manifest.wrappers["allowed"], ["agy"])
+        self.assertNotIn("codex", manifest.wrappers["allowed"])
+        self.assertNotIn("codex_reviewer", manifest.wrappers["allowed"])
+        self.assertNotIn("codexsafe", manifest.wrappers["allowed"])
+
+    def test_e6c_forbids_sdlc_and_broad_wrappers(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        forbidden = set(manifest.wrappers["forbidden"])
+        self.assertIn("codex", forbidden)
+        self.assertIn("codex_reviewer", forbidden)
+        self.assertIn("codexsafe", forbidden)
+        self.assertIn("claude", forbidden)
+        self.assertIn("gemini", forbidden)
+        self.assertIn("agy", manifest.wrappers["allowed"])
+        self.assertNotIn("agy", forbidden)
+
+    def test_e6c_general_fallback_forbidden(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertTrue(manifest.general_fallback_forbidden)
+        self.assertTrue(manifest.channels["forbid_general_session_leak_count"])
+
+    def test_e6c_sandbox_flow_disabled_expectation(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertTrue(manifest.sandbox["forbid_flow_enabled"])
+        self.assertTrue(manifest.sandbox["forbid_audit_activity"])
+
+    def test_e6c_redaction_self_test_required(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertTrue(manifest.redaction["require_self_test"])
+
+    def test_e6c_git_hygiene_required(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        git = manifest.git
+        self.assertTrue(git["require_clean_tree"])
+        self.assertTrue(git["require_no_staged"])
+        self.assertTrue(git["require_synced_with_remote"])
+        self.assertTrue(git["require_config_local_ignored"])
+
+    def test_e6c_zero_active_sessions_required(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertEqual(manifest.sessions["max_active_count"], 0)
+
+    def test_e6c_network_expects_server_port(self):
+        manifest, err = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err)
+        assert manifest is not None
+        self.assertEqual(manifest.network["expected_port"], 8300)
+        self.assertTrue(manifest.network["require_server_when_wrappers_required"])
+
+    def test_full_e6c_fixture_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, _e6c_channels())
+            report = run_preflight("E6C_AGY_LIVE", ctx=_base_e6c_ctx(data))
+        self.assertEqual(report.verdict, VERDICT_PASS)
+        self.assertEqual(report.exit_code, 0)
+        ids = {c.id for c in report.checks}
+        self.assertIn("policy.general_fallback", ids)
+        self.assertIn("redaction.self_test", ids)
+
+    def test_e6c_forbidden_codex_wrapper_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, _e6c_channels())
+            procs = _e6c_wrappers_running()
+            procs.append(ProcessInfo(200, r"python wrapper.py codex"))
+            report = run_preflight("E6C_AGY_LIVE", ctx=_base_e6c_ctx(data, processes=procs))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "wrappers.forbidden" for c in report.checks))
+
+    def test_e6c_required_agy_missing_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, _e6c_channels())
+            procs = [ProcessInfo(99, r"python run.py")]
+            report = run_preflight("E6C_AGY_LIVE", ctx=_base_e6c_ctx(data, processes=procs))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "wrappers.required" for c in report.checks))
+
+    def test_e6c_missing_agy_channel_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, ["general", "relay-dryrun", "sdlc-dryrun"])
+            report = run_preflight("E6C_AGY_LIVE", ctx=_base_e6c_ctx(data))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "channels.required" for c in report.checks))
+
+    def test_e6c_active_sessions_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, _e6c_channels())
+            _write_sessions(data, [{"id": 1, "state": "active", "channel": "agy-live-validation"}])
+            report = run_preflight("E6C_AGY_LIVE", ctx=_base_e6c_ctx(data))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "sessions.active_count" for c in report.checks))
+
+    def test_e6c_sandbox_audit_activity_blocked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data = Path(tmp)
+            _write_settings(data, _e6c_channels())
+            (data / "sandbox_flow_audit.jsonl").write_text('{"result":"reject"}\n', encoding="utf-8")
+            report = run_preflight("E6C_AGY_LIVE", ctx=_base_e6c_ctx(data))
+        self.assertEqual(report.verdict, VERDICT_BLOCKED)
+        self.assertTrue(any(c.id == "sandbox.audit" for c in report.checks))
+
+    def test_e6c_not_reusing_e4c_manifest(self):
+        e4c, err4 = load_manifest("E4C_SDLC_LIVE", manifest_dir=MANIFEST_DIR)
+        e6c, err6 = load_manifest("E6C_AGY_LIVE", manifest_dir=MANIFEST_DIR)
+        self.assertIsNone(err4)
+        self.assertIsNone(err6)
+        assert e4c is not None and e6c is not None
+        self.assertIn("agy", e4c.wrappers["forbidden"])
+        self.assertNotIn("agy", e6c.wrappers["forbidden"])
+        self.assertIn("sdlc-dryrun", e4c.channels["required"])
+        self.assertIn("agy-live-validation", e6c.channels["required"])
+        self.assertNotIn("agy-live-validation", e4c.channels["required"])
+
+
 class E5DManifestValidationTests(unittest.TestCase):
     def test_shipped_manifests_load(self):
         for phase_id in (
@@ -1149,6 +1331,7 @@ class E5DManifestValidationTests(unittest.TestCase):
             "COMMIT_EXACT_FILES",
             "PUSH_ONLY",
             "E4C_SDLC_LIVE",
+            "E6C_AGY_LIVE",
         ):
             manifest, err = load_manifest(phase_id, manifest_dir=MANIFEST_DIR)
             self.assertIsNone(err, msg=f"{phase_id}: {err}")
