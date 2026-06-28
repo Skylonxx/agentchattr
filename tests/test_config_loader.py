@@ -294,6 +294,12 @@ class LoadConfigOriginIntegrationTests(unittest.TestCase):
         origins = config_loader.build_allowed_origins(config)
         self.assertIn("http://192.168.1.113:8300", origins)
 
+    def test_workspace_profiles_loaded_from_committed_config(self):
+        config = config_loader.load_config(ROOT)
+        profiles = config_loader.get_workspace_profiles(config)
+        self.assertIn("agentchattr-scratch", profiles)
+        self.assertIsInstance(profiles["agentchattr-scratch"].get("workspace_root"), str)
+
 
 if __name__ == "__main__":
     unittest.main()

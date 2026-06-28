@@ -221,6 +221,13 @@ def load_config(root: Path | None = None) -> dict:
                 config["sandbox"] = config_sandbox
             config_sandbox.update(local_sandbox)
 
+        # workspace_profiles must not be broadened via config.local.toml (Phase 2).
+        if local.get("workspace_profiles"):
+            print(
+                "  Warning: Ignoring workspace_profiles from config.local.toml "
+                "(workspace policy cannot be broadened locally)",
+            )
+
         # Merge [server] — local may override host/port for LAN binding (gitignored).
         local_server = local.get("server")
         if isinstance(local_server, dict) and local_server:
@@ -239,3 +246,11 @@ def load_config(root: Path | None = None) -> dict:
     _apply_env_overrides(config)
 
     return config
+
+
+def get_workspace_profiles(cfg: dict) -> dict[str, dict]:
+    """Return server-approved workspace profiles from committed config only."""
+    raw = cfg.get("workspace_profiles")
+    if not isinstance(raw, dict):
+        return {}
+    return {profile_id: profile for profile_id, profile in raw.items() if isinstance(profile, dict)}

@@ -139,7 +139,10 @@ class SessionStore:
     # --- Session lifecycle ---
 
     def create(self, template_id: str, channel: str, cast: dict,
-               started_by: str, goal: str = "") -> dict | None:
+               started_by: str, goal: str = "",
+               workspace_policy: dict | None = None,
+               workspace_policy_hash: str | None = None,
+               workspace_policy_version: int | None = None) -> dict | None:
         """Create and persist a new session run."""
         tmpl = self._templates.get(template_id)
         if not tmpl:
@@ -167,6 +170,12 @@ class SessionStore:
                 "output_message_id": None,
                 "goal": goal.strip()[:500],
             }
+            if workspace_policy is not None:
+                session["workspace_policy"] = dict(workspace_policy)
+            if workspace_policy_hash is not None:
+                session["workspace_policy_hash"] = workspace_policy_hash
+            if workspace_policy_version is not None:
+                session["workspace_policy_version"] = workspace_policy_version
             self._next_id += 1
             self._sessions.append(session)
             self._save()

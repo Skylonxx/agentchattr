@@ -227,7 +227,10 @@ class SessionEngine:
     # --- Public API ---
 
     def start_session(self, template_id: str, channel: str, cast: dict,
-                      started_by: str, goal: str = "") -> dict | None:
+                      started_by: str, goal: str = "",
+                      workspace_policy: dict | None = None,
+                      workspace_policy_hash: str | None = None,
+                      workspace_policy_version: int | None = None) -> dict | None:
         """Start a new session. Returns the session dict or None on failure."""
         # Central safety-role guard (fail-closed). A restricted dry-run agent
         # (claude_dryrun) must never be cast into a safety/verdict-parsed role;
@@ -264,13 +267,18 @@ class SessionEngine:
                         cast_guard.code, cast_guard.reason)
             return None
 
-        session = self._store.create(
-            template_id=template_id,
-            channel=channel,
-            cast=cast,
-            started_by=started_by,
-            goal=goal,
-        )
+        create_kwargs = {
+            "template_id": template_id,
+            "channel": channel,
+            "cast": cast,
+            "started_by": started_by,
+            "goal": goal,
+        }
+        if workspace_policy is not None:
+            create_kwargs["workspace_policy"] = workspace_policy
+            create_kwargs["workspace_policy_hash"] = workspace_policy_hash
+            create_kwargs["workspace_policy_version"] = workspace_policy_version
+        session = self._store.create(**create_kwargs)
         if not session:
             return None
 
@@ -1577,4 +1585,6 @@ class SessionEngine:
                     session["current_agent"] = session.get("cast", {}).get(role)
             session["flow_coordinator"] = bool(tmpl.get("flow_coordinator"))
             session["coordinator_loop"] = bool(tmpl.get("coordinator_loop"))
+        from workspace_policy import workspace_policy_read_summary
+        session["workspace_policy_summary"] = workspace_policy_read_summary(session)
         return session

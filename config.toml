@@ -217,3 +217,12 @@ AGY reviewer mode:
 # AGY 1.0.10 --print emits zero stdout; extract reply from brain transcript.
 run_mode = "store_exec"
 print_timeout = 120
+
+# Server-approved workspace profiles (Phase 2 — validation/metadata only).
+# UI/API cannot submit arbitrary workspace roots; profiles are the authority source.
+[workspace_profiles.agentchattr-scratch]
+workspace_root = "C:/tools/agentchattr-scratch"
+allowed_modes = ["scratch-readonly", "read-only"]
+default_mode = "scratch-readonly"
+max_mode = "read-only"
+default_forbidden_paths = [".git/**"]

@@ -24,6 +24,8 @@ from agents import AgentTrigger
 from registry import RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
+from config_loader import get_workspace_profiles
+import workspace_policy as workspace_policy_mod
 from safety_invariants import (
     build_sandbox_flow_channel_name,
     check_sandbox_config,
@@ -2852,7 +2854,34 @@ async def start_session(request: Request):
                 status_code=400,
             )
 
-    session = session_engine.start_session(template_id, channel, cast, started_by, goal)
+    profiles = get_workspace_profiles(config or {})
+    template_policy = tmpl.get("workspace_policy") if isinstance(tmpl.get("workspace_policy"), dict) else None
+    policy_result = workspace_policy_mod.resolve_session_workspace_policy(
+        profiles=profiles,
+        template_policy=template_policy,
+        start_body=body,
+    )
+    if not policy_result.ok:
+        return JSONResponse(
+            {
+                "error": "invalid workspace policy",
+                "code": policy_result.code,
+                "details": list(policy_result.errors),
+            },
+            status_code=400,
+        )
+    policy_fields = workspace_policy_mod.build_session_workspace_policy_fields(policy_result.policy)
+
+    session = session_engine.start_session(
+        template_id,
+        channel,
+        cast,
+        started_by,
+        goal,
+        workspace_policy=policy_fields["workspace_policy"],
+        workspace_policy_hash=policy_fields["workspace_policy_hash"],
+        workspace_policy_version=policy_fields["workspace_policy_version"],
+    )
     if not session:
         return JSONResponse({"error": "could not start session (one may already be active)"}, status_code=409)
 
@@ -2866,6 +2895,7 @@ async def start_session(request: Request):
     )
     session_engine.emit_current_phase_banner(session)
 
+    session = session_engine._enrich(session)
     return JSONResponse(session)
 
 

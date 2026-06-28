@@ -7,6 +7,7 @@ Missing policy resolves to safe ``scratch-readonly`` defaults.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any
 
 SCHEMA_VERSION = 1
+SESSION_POLICY_VERSION = 1
 MAX_WRITE_FILES = 32
 MAX_FORBIDDEN_PATHS = 64
 MAX_READ_PATHS = 16
@@ -868,3 +870,128 @@ def strip_internal_policy_keys(policy: dict[str, Any]) -> dict[str, Any]:
     out.pop("_profile_max_mode", None)
     out.pop("_profile_allowed_write_files", None)
     return out
+
+
+def extract_policy_start_fields(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Extract workspace policy fields from a session start request body.
+
+    Returns ``(start_payload, client_error)``. Policy authority is never parsed
+    from ``goal`` or other free-text fields — only explicit payload keys count.
+    """
+    if not isinstance(body, dict):
+        return None, None
+
+    policy_keys = (
+        "workspace_profile",
+        "profile_id",
+        "workspace_mode",
+        "mode",
+        "write_files",
+        "expected_head",
+        "workspace_root",
+    )
+    if not any(key in body for key in policy_keys):
+        return None, None
+
+    if body.get("workspace_root"):
+        return None, "start payload cannot specify workspace_root"
+
+    payload: dict[str, Any] = {}
+    profile_id = body.get("workspace_profile") or body.get("profile_id")
+    if profile_id is not None:
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            return None, "workspace_profile must be a non-empty string"
+        payload["profile_id"] = profile_id.strip()
+
+    mode = body.get("workspace_mode")
+    if mode is None and "mode" in body:
+        mode = body.get("mode")
+    if mode is not None:
+        payload["workspace_mode"] = mode
+
+    if "write_files" in body:
+        payload["write_files"] = body["write_files"]
+
+    if "expected_head" in body:
+        payload["expected_head"] = body["expected_head"]
+
+    return payload, None
+
+
+def resolve_session_workspace_policy(
+    *,
+    profiles: dict[str, dict[str, Any]] | None = None,
+    template_policy: dict[str, Any] | None = None,
+    start_body: dict[str, Any] | None = None,
+    local_override: dict[str, Any] | None = None,
+) -> PolicyValidationResult:
+    """Resolve workspace policy for session start (Phase 2 metadata wiring)."""
+    start_body = start_body or {}
+    start_payload, field_err = extract_policy_start_fields(start_body)
+    if field_err:
+        return PolicyValidationResult(False, errors=(field_err,), code="PAYLOAD_REJECTED")
+
+    profile_id: str | None = None
+    if start_payload:
+        profile_id = start_payload.get("profile_id")
+    if not profile_id and template_policy:
+        profile_id = template_policy.get("profile_id") or template_policy.get("workspace_profile")
+
+    return resolve_workspace_policy(
+        profiles=profiles,
+        profile_id=profile_id,
+        template_policy=template_policy,
+        start_payload=start_payload,
+        local_override=local_override,
+    )
+
+
+def persistable_workspace_policy(policy: dict[str, Any]) -> dict[str, Any]:
+    """Canonical immutable snapshot suitable for session persistence."""
+    return strip_internal_policy_keys(policy)
+
+
+def compute_workspace_policy_hash(policy: dict[str, Any]) -> str:
+    """Deterministic SHA-256 hash of the canonical persisted policy snapshot."""
+    canonical = persistable_workspace_policy(policy)
+    blob = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def build_session_workspace_policy_fields(policy: dict[str, Any]) -> dict[str, Any]:
+    """Build immutable session policy metadata fields after validation."""
+    snapshot = persistable_workspace_policy(policy)
+    return {
+        "workspace_policy": snapshot,
+        "workspace_policy_hash": compute_workspace_policy_hash(snapshot),
+        "workspace_policy_version": SESSION_POLICY_VERSION,
+    }
+
+
+def workspace_policy_read_summary(session: dict[str, Any]) -> dict[str, Any]:
+    """Read-only policy summary for API/session bar display (no authority)."""
+    policy = session.get("workspace_policy")
+    if not isinstance(policy, dict):
+        return {
+            "mode": "scratch-readonly",
+            "profile_id": None,
+            "workspace_root": None,
+            "write_files": [],
+            "write_files_count": 0,
+            "expected_head": None,
+            "hash": session.get("workspace_policy_hash"),
+            "version": session.get("workspace_policy_version"),
+        }
+
+    workspace = policy.get("workspace") or {}
+    write_files = list(policy.get("write_files") or [])
+    return {
+        "mode": policy.get("mode"),
+        "profile_id": policy.get("policy_id"),
+        "workspace_root": workspace.get("root"),
+        "write_files": write_files,
+        "write_files_count": len(write_files),
+        "expected_head": workspace.get("expected_head"),
+        "hash": session.get("workspace_policy_hash"),
+        "version": session.get("workspace_policy_version"),
+    }
