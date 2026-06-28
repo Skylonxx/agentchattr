@@ -939,6 +939,20 @@ def _policy_blocker_for_exec_item(item, *, data_dir, config) -> str | None:
     )
 
 
+def _resolve_exec_cwd(item, *, data_dir, config, default_cwd) -> str:
+    """Resolve effective subprocess cwd from verified session workspace policy."""
+    from config_loader import get_workspace_profiles
+    from workspace_policy_runtime import resolve_exec_cwd_for_item
+
+    return resolve_exec_cwd_for_item(
+        item if isinstance(item, dict) else None,
+        data_dir=data_dir,
+        config=config,
+        default_cwd=default_cwd,
+        profiles=get_workspace_profiles(config or {}),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Relay outcome markers (fail-loud: a relay turn never silently posts nothing)
 # ---------------------------------------------------------------------------
@@ -1088,6 +1102,13 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
                     print(f"  > {agent} failed to relay policy blocker: {exc}")
             continue
 
+        effective_cwd = _resolve_exec_cwd(
+            item,
+            data_dir=data_dir,
+            config=config,
+            default_cwd=cwd,
+        )
+
         # Reply channel: relay turns carry it in relay_meta.channel; direct-mention
         # turns carry it in the work item's "channel" field (set by the queue watcher
         # from the @mention's source channel). Falls back to "general" only when
@@ -1122,7 +1143,7 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
         proc = None
         try:
             proc = subprocess.run(
-                cmd, cwd=cwd, env=run_env,
+                cmd, cwd=effective_cwd, env=run_env,
                 input=prompt.encode("utf-8") if relay else None,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 timeout=EXEC_TIMEOUT_SECS,

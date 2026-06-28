@@ -260,7 +260,11 @@ def get_workspace_policy_config(cfg: dict) -> dict:
     """Return workspace policy runtime config (safe defaults when missing)."""
     section = cfg.get("workspace_policy")
     if not isinstance(section, dict):
-        return {"runtime_enforcement_enabled": False}
+        return {
+            "runtime_enforcement_enabled": False,
+            "read_only_external_cwd_enabled": False,
+        }
     return {
         "runtime_enforcement_enabled": bool(section.get("runtime_enforcement_enabled")),
+        "read_only_external_cwd_enabled": bool(section.get("read_only_external_cwd_enabled")),
     }

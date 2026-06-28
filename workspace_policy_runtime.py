@@ -70,6 +70,26 @@ def is_runtime_enforcement_enabled(cfg: dict | None) -> bool:
     return bool(section.get("runtime_enforcement_enabled"))
 
 
+def is_read_only_external_cwd_enabled(cfg: dict | None) -> bool:
+    section = (cfg or {}).get("workspace_policy")
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("read_only_external_cwd_enabled"))
+
+
+def normalize_workspace_root(path: str) -> str:
+    """Normalize an absolute workspace root for comparison and subprocess cwd."""
+    if not path or not isinstance(path, str):
+        return ""
+    text = path.strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).resolve())
+    except (OSError, ValueError):
+        return text.replace("\\", "/")
+
+
 def is_session_triggered_work(
     *,
     relay_meta: dict[str, Any] | None = None,
@@ -287,17 +307,96 @@ def resolve_role_cwd(
     *,
     enforcement_enabled: bool = False,
     default_scratch: str = DEFAULT_SCRATCH_CWD,
+    profiles: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Resolve cwd for a session role. Phase 3B remains scratch/default-only."""
+    """Resolve cwd for a session role from canonical policy (fail-closed)."""
     if not enforcement_enabled:
         return default_scratch
 
     canonical = policy if isinstance(policy, dict) else wp.default_scratch_readonly_policy()
-    role = normalize_session_role(session_role)
-    _ = wp.role_permission_for(canonical, role)
+    mode = canonical.get("mode")
 
-    # Phase 3B: never route to external workspace roots; scratch/default only.
-    return default_scratch
+    if mode == "scratch-readonly":
+        return default_scratch
+
+    if mode != "read-only":
+        return default_scratch
+
+    workspace = canonical.get("workspace") or {}
+    root = workspace.get("root")
+    if not root or not isinstance(root, str):
+        return default_scratch
+
+    role = normalize_session_role(session_role)
+    perms = wp.role_permission_for(canonical, role)
+    if not perms:
+        return default_scratch
+
+    fs = perms.get("filesystem", "none")
+    if fs not in ("read", "none"):
+        return default_scratch
+
+    normalized_root = normalize_workspace_root(root)
+    if not normalized_root:
+        return default_scratch
+
+    profile_id = canonical.get("policy_id")
+    if profiles and profile_id:
+        profile = profiles.get(profile_id)
+        if not profile:
+            return default_scratch
+        expected = profile.get("workspace_root")
+        if expected and normalize_workspace_root(str(expected)) != normalized_root:
+            return default_scratch
+
+    if not Path(normalized_root).is_dir():
+        return default_scratch
+
+    return normalized_root
+
+
+def resolve_exec_cwd_for_item(
+    item: dict[str, Any] | None,
+    *,
+    data_dir: str | Path | None,
+    config: dict | None,
+    default_cwd: str,
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> str:
+    """Resolve subprocess cwd for a queue item (verified read-only external roots only)."""
+    if not is_read_only_external_cwd_enabled(config):
+        return default_cwd
+    if not isinstance(item, dict):
+        return default_cwd
+
+    wpc = item.get("workspace_policy_context")
+    if not isinstance(wpc, dict):
+        return default_cwd
+
+    verify = verify_session_workspace_policy(
+        relay_meta=item.get("relay_meta"),
+        workspace_policy_context=wpc,
+        data_dir=data_dir,
+        enforcement_enabled=True,
+    )
+    if not verify.ok:
+        return default_cwd
+
+    policy = canonical_policy_from_queue_context(
+        queue_context=wpc,
+        data_dir=data_dir,
+    )
+    if not policy:
+        return default_cwd
+
+    role = wpc.get("session_role") or "developer"
+    return resolve_role_cwd(
+        policy,
+        str(role),
+        enforcement_enabled=True,
+        default_scratch=default_cwd,
+        profiles=profiles,
+    )
 
 
 def _split_command_segments(command_line: str) -> list[str]:

@@ -227,6 +227,17 @@ default_mode = "scratch-readonly"
 max_mode = "read-only"
 default_forbidden_paths = [".git/**"]
 
+[workspace_profiles.twinpet-pos]
+workspace_root = "C:/Users/Narachat/twinpet-pos"
+allowed_modes = ["read-only"]
+default_mode = "read-only"
+max_mode = "read-only"
+require_git_repo = true
+default_forbidden_paths = [".git/**"]
+
 # Phase 3B runtime enforcement (default OFF — metadata verification scaffolding only).
+# read_only_external_cwd_enabled routes verified read-only session turns to approved
+# external profile roots (e.g. twinpet-pos). Does not enable writes or docs-only.
 [workspace_policy]
 runtime_enforcement_enabled = false
+read_only_external_cwd_enabled = true

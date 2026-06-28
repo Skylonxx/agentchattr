@@ -19,19 +19,51 @@ SCRATCH = wpr.DEFAULT_SCRATCH_CWD
 TWINPET = "C:/Users/Narachat/twinpet-pos"
 
 
-def _session_with_policy(mode="scratch-readonly", root=None):
+def _session_with_policy(mode="scratch-readonly", root=None, profile_id=None):
     policy = wp.default_scratch_readonly_policy()
-    if mode != "scratch-readonly":
-        policy = dict(policy)
-        policy["mode"] = mode
-        policy["workspace"] = dict(policy.get("workspace") or {})
-        policy["workspace"]["root"] = root
+    if mode != "scratch-readonly" or root or profile_id:
+        if mode != "scratch-readonly":
+            profiles = {
+                "twinpet-pos": {
+                    "workspace_root": root or TWINPET,
+                    "allowed_modes": ["read-only"],
+                    "default_mode": "read-only",
+                    "max_mode": "read-only",
+                },
+            }
+            pid = profile_id or "twinpet-pos"
+            resolved = wp.resolve_workspace_policy(
+                profiles=profiles,
+                profile_id=pid,
+                start_payload={"workspace_mode": mode} if mode != "scratch-readonly" else None,
+            )
+            if not resolved.ok:
+                raise AssertionError(resolved.errors)
+            policy = resolved.policy
+        else:
+            policy = dict(policy)
+            if root:
+                policy["workspace"] = dict(policy.get("workspace") or {})
+                policy["workspace"]["root"] = root
     fields = wp.build_session_workspace_policy_fields(policy)
     return {
         "id": 42,
         "template_id": "test",
         "channel": "general",
         **fields,
+    }
+
+
+def _twinpet_profiles() -> dict:
+    return {
+        "twinpet-pos": {
+            "workspace_root": TWINPET,
+            "allowed_modes": ["read-only"],
+            "default_mode": "read-only",
+            "max_mode": "read-only",
+            "require_git_repo": True,
+            "default_forbidden_paths": [".git/**"],
+        },
     }
 
 
@@ -199,12 +231,235 @@ class RoleCwdTests(unittest.TestCase):
         cwd = wpr.resolve_role_cwd(None, "developer", enforcement_enabled=False)
         self.assertEqual(cwd, SCRATCH)
 
-    def test_enforcement_on_still_scratch_in_phase_3b(self):
+    def test_scratch_readonly_policy_stays_scratch_when_enforcement_on(self):
         policy = wp.default_scratch_readonly_policy()
         for role in ("coordinator", "developer", "reviewer", "ui_lead", "safety_gate"):
             cwd = wpr.resolve_role_cwd(policy, role, enforcement_enabled=True)
             self.assertEqual(cwd, SCRATCH)
-            self.assertNotEqual(cwd, TWINPET)
+
+    def test_read_only_profile_resolves_external_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = tmp.replace("\\", "/")
+            profiles = {
+                "test-repo": {
+                    "workspace_root": root,
+                    "allowed_modes": ["read-only"],
+                    "default_mode": "read-only",
+                    "max_mode": "read-only",
+                },
+            }
+            resolved = wp.resolve_workspace_policy(
+                profiles=profiles,
+                profile_id="test-repo",
+                start_payload={"workspace_mode": "read-only"},
+            )
+            self.assertTrue(resolved.ok, resolved.errors)
+            policy = resolved.policy
+            for role in ("coordinator", "developer", "reviewer", "ui_lead", "safety_gate"):
+                cwd = wpr.resolve_role_cwd(
+                    policy, role, enforcement_enabled=True, profiles=profiles,
+                )
+                self.assertEqual(Path(cwd), Path(root).resolve())
+
+    def test_twinpet_read_only_resolves_when_path_exists(self):
+        if not Path(TWINPET).is_dir():
+            self.skipTest("Twinpet path not present on this machine")
+        resolved = wp.resolve_workspace_policy(
+            profiles=_twinpet_profiles(),
+            profile_id="twinpet-pos",
+            start_payload={"workspace_mode": "read-only"},
+        )
+        self.assertTrue(resolved.ok, resolved.errors)
+        policy = resolved.policy
+        cwd = wpr.resolve_role_cwd(
+            policy, "reviewer",
+            enforcement_enabled=True,
+            profiles=_twinpet_profiles(),
+        )
+        self.assertEqual(Path(cwd), Path(TWINPET).resolve())
+
+    def test_read_only_rejects_mismatched_profile_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = tmp.replace("\\", "/")
+            profiles = {"test-repo": {
+                "workspace_root": root,
+                "allowed_modes": ["read-only"],
+                "default_mode": "read-only",
+                "max_mode": "read-only",
+            }}
+            resolved = wp.resolve_workspace_policy(
+                profiles=profiles,
+                profile_id="test-repo",
+                start_payload={"workspace_mode": "read-only"},
+            )
+            policy = dict(resolved.policy)
+            policy["workspace"] = dict(policy.get("workspace") or {})
+            policy["workspace"]["root"] = "C:/other/path"
+            cwd = wpr.resolve_role_cwd(
+                policy, "developer", enforcement_enabled=True, profiles=profiles,
+            )
+            self.assertEqual(cwd, SCRATCH)
+
+    def test_docs_only_mode_does_not_route_external_cwd(self):
+        profiles = {
+            "example": {
+                "workspace_root": "C:/tmp/example",
+                "allowed_modes": ["read-only", "docs-only"],
+                "default_mode": "read-only",
+                "max_mode": "docs-only",
+                "allowed_write_files": ["Task.md"],
+                "default_write_files": ["Task.md"],
+            },
+        }
+        resolved = wp.resolve_workspace_policy(
+            profiles=profiles,
+            profile_id="example",
+            start_payload={"workspace_mode": "docs-only", "write_files": ["Task.md"]},
+        )
+        self.assertTrue(resolved.ok, resolved.errors)
+        cwd = wpr.resolve_role_cwd(
+            resolved.policy, "developer", enforcement_enabled=True, profiles=profiles,
+        )
+        self.assertEqual(cwd, SCRATCH)
+
+
+class TwinpetProfilePolicyTests(unittest.TestCase):
+    def test_twinpet_profile_resolves_read_only(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_profiles(),
+            profile_id="twinpet-pos",
+            start_payload={"workspace_mode": "read-only"},
+        )
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.policy["mode"], "read-only")
+        self.assertEqual(
+            wpr.normalize_workspace_root(result.policy["workspace"]["root"]),
+            wpr.normalize_workspace_root(TWINPET),
+        )
+        self.assertEqual(result.policy.get("write_files"), [])
+
+    def test_twinpet_docs_only_rejected(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_profiles(),
+            profile_id="twinpet-pos",
+            start_payload={"workspace_mode": "docs-only"},
+        )
+        self.assertFalse(result.ok)
+
+    def test_twinpet_write_files_rejected(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_profiles(),
+            profile_id="twinpet-pos",
+            start_payload={"workspace_mode": "read-only", "write_files": ["Task.md"]},
+        )
+        self.assertFalse(result.ok)
+
+    def test_unknown_profile_fails_closed(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_profiles(),
+            profile_id="unknown-repo",
+            start_payload={"workspace_mode": "read-only"},
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "UNKNOWN_PROFILE")
+
+    def test_arbitrary_workspace_root_in_payload_rejected(self):
+        payload, err = wp.extract_policy_start_fields(
+            {"workspace_root": "C:/Users/Evil/other"},
+        )
+        self.assertIsNone(payload)
+        self.assertIn("workspace_root", err or "")
+
+
+class ExecCwdResolutionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.data_dir = Path(self.tmp.name)
+        self.external = Path(self.tmp.name) / "external-repo"
+        self.external.mkdir()
+        self.root = str(self.external).replace("\\", "/")
+        self.profiles = {
+            "test-repo": {
+                "workspace_root": self.root,
+                "allowed_modes": ["read-only"],
+                "default_mode": "read-only",
+                "max_mode": "read-only",
+            },
+        }
+        resolved = wp.resolve_workspace_policy(
+            profiles=self.profiles,
+            profile_id="test-repo",
+            start_payload={"workspace_mode": "read-only"},
+        )
+        self.policy = resolved.policy
+        fields = wp.build_session_workspace_policy_fields(self.policy)
+        self.session = {"id": 7, "template_id": "test", **fields}
+        (self.data_dir / "session_runs.json").write_text(
+            json.dumps([self.session]), encoding="utf-8",
+        )
+        self.ctx = wpr.build_session_queue_workspace_context(
+            self.session, "reviewer", 0, 0,
+        )
+        self.cfg = {
+            "workspace_policy": {
+                "runtime_enforcement_enabled": False,
+                "read_only_external_cwd_enabled": True,
+            },
+            "workspace_profiles": self.profiles,
+        }
+        self.default_cwd = SCRATCH
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_resolves_verified_read_only_session_to_external_root(self):
+        item = {
+            "prompt": "sealed",
+            "relay_meta": {"session_id": 7, "relay_mode": True, "disable_mcp": True},
+            "workspace_policy_context": self.ctx,
+        }
+        cwd = wpr.resolve_exec_cwd_for_item(
+            item,
+            data_dir=self.data_dir,
+            config=self.cfg,
+            default_cwd=self.default_cwd,
+            profiles=self.profiles,
+        )
+        self.assertEqual(Path(cwd), self.external.resolve())
+
+    def test_flag_off_keeps_default_cwd(self):
+        item = {
+            "workspace_policy_context": self.ctx,
+            "relay_meta": {"session_id": 7, "relay_mode": True, "disable_mcp": True},
+        }
+        cfg = {"workspace_policy": {"read_only_external_cwd_enabled": False}}
+        cwd = wpr.resolve_exec_cwd_for_item(
+            item, data_dir=self.data_dir, config=cfg,
+            default_cwd=self.default_cwd, profiles=self.profiles,
+        )
+        self.assertEqual(cwd, self.default_cwd)
+
+    def test_hash_mismatch_falls_back_to_default_cwd(self):
+        bad_ctx = dict(self.ctx)
+        bad_ctx["policy_hash"] = "0" * 64
+        item = {"workspace_policy_context": bad_ctx}
+        cwd = wpr.resolve_exec_cwd_for_item(
+            item, data_dir=self.data_dir, config=self.cfg,
+            default_cwd=self.default_cwd, profiles=self.profiles,
+        )
+        self.assertEqual(cwd, self.default_cwd)
+
+    def test_wrapper_resolve_exec_cwd_helper(self):
+        import wrapper
+
+        item = {
+            "workspace_policy_context": self.ctx,
+            "relay_meta": {"session_id": 7, "relay_mode": True, "disable_mcp": True},
+        }
+        cwd = wrapper._resolve_exec_cwd(
+            item, data_dir=self.data_dir, config=self.cfg, default_cwd=self.default_cwd,
+        )
+        self.assertEqual(Path(cwd), self.external.resolve())
 
 
 class CommandGuardTests(unittest.TestCase):
@@ -495,12 +750,18 @@ class ConfigFlagTests(unittest.TestCase):
         self.assertFalse(wpr.is_runtime_enforcement_enabled({}))
         self.assertFalse(wpr.is_runtime_enforcement_enabled({"workspace_policy": {}}))
 
+    def test_read_only_external_cwd_default_off(self):
+        self.assertFalse(wpr.is_read_only_external_cwd_enabled({}))
+        self.assertFalse(wpr.is_read_only_external_cwd_enabled({"workspace_policy": {}}))
+
     def test_config_loader_helper(self):
         import config_loader
 
         cfg = config_loader.load_config(ROOT)
         wp_cfg = config_loader.get_workspace_policy_config(cfg)
         self.assertFalse(wp_cfg["runtime_enforcement_enabled"])
+        self.assertTrue(wp_cfg["read_only_external_cwd_enabled"])
+        self.assertIn("twinpet-pos", config_loader.get_workspace_profiles(cfg))
 
 
 if __name__ == "__main__":
