@@ -943,6 +943,11 @@ class _FakeRegistry:
     def get_instance(self, name):
         return self._agents.get(name)
 
+    def get_base_config(self, base):
+        if str(base).lower() == "agy":
+            return {"run_mode": "store_exec"}
+        return {}
+
 
 class TestBlockHaltsDownstream(unittest.TestCase):
     def _make_engine(self, session, template, registry_agents=None):

@@ -7,6 +7,9 @@ import time
 from session_relay import (
     build_relay_prompt,
     build_safety_gate_prompt,
+    build_coordinator_loop_prompt,
+    build_coordinator_loop_ui_lead_prompt,
+    coordinator_loop_worker_output_contract,
     is_relay_eligible,
     make_relay_queue_entry,
     parse_safety_verdict,
@@ -274,8 +277,13 @@ class SessionEngine:
         log.info("Session %d started: %s in #%s", session["id"],
                  session["template_name"], channel)
 
-        # Flow-coordinator sessions: initialize FlowState and run intake
+        # Coordinator-loop sessions: initialize loop state and trigger coordinator
         tmpl = self._store.get_template(template_id)
+        if tmpl and tmpl.get("coordinator_loop"):
+            self._init_coordinator_loop(session, goal)
+            return session
+
+        # Flow-coordinator sessions: initialize FlowState and run intake
         if tmpl and tmpl.get("flow_coordinator"):
             self._init_flow_coordinator(session, goal)
             return session
@@ -344,13 +352,35 @@ class SessionEngine:
         Only re-trigger 'active' sessions. 'waiting' sessions already had
         their trigger sent before the restart — re-triggering would
         double-queue the same participant.
+
+        Coordinator-loop sessions with missing/corrupt persisted state fail
+        closed (interrupt, no trigger). Terminal coordinator-loop phases are
+        not re-triggered. Waiting-session restart for coordinator_loop is
+        intentionally not re-queued (same active-only semantics as linear
+        sessions).
         """
+        from coordinator_loop import CoordinatorPhase
+
         for session in self._store.list_all():
             if session.get("state") == "active":
                 log.info("Resuming session %d (%s) from phase %d, turn %d",
                          session["id"], session.get("template_name", "?"),
                          session["current_phase"], session["current_turn"])
-                self._trigger_current(session)
+                tmpl = self._store.get_template(session.get("template_id", ""))
+                if tmpl and tmpl.get("coordinator_loop"):
+                    cls = self._load_coordinator_loop_state(session)
+                    if cls is None:
+                        self._interrupt_coordinator_loop_state_failure(session)
+                        continue
+                    if cls.phase in (
+                        CoordinatorPhase.FINAL,
+                        CoordinatorPhase.BLOCKER,
+                        CoordinatorPhase.HALTED,
+                    ):
+                        continue
+                    self._trigger_coordinator_loop(session)
+                else:
+                    self._trigger_current(session)
 
     def _is_agent(self, name: str) -> bool:
         """Check if name belongs to a registered agent (not a human)."""
@@ -523,6 +553,11 @@ class SessionEngine:
             self._store.interrupt(session["id"], "template not found")
             return
 
+        # Coordinator-loop sessions use hub routing instead of linear advance.
+        if tmpl.get("coordinator_loop"):
+            self._advance_coordinator_loop(session, message_id)
+            return
+
         # Flow-coordinator sessions use verdict-driven routing instead of
         # linear forward advance. Delegate entirely to avoid mixing paths.
         # Fail closed: if a flow-coordinator template is missing its flow_state
@@ -633,6 +668,10 @@ class SessionEngine:
         """Trigger the agent whose turn it is."""
         tmpl = self._store.get_template(session["template_id"])
         if not tmpl:
+            return
+
+        if tmpl.get("coordinator_loop"):
+            self._trigger_coordinator_loop(session)
             return
 
         phases = tmpl.get("phases", [])
@@ -1110,6 +1149,404 @@ class SessionEngine:
         )
         self._trigger_current(session)
 
+    # --- Coordinator loop wiring (opt-in via coordinator_loop: true) ---
+
+    def _load_coordinator_loop_state(self, session: dict):
+        """Load coordinator loop state from session. Returns None if missing/corrupt."""
+        from coordinator_loop import CoordinatorLoopState
+
+        raw = session.get("coordinator_loop_state")
+        if not raw:
+            return None
+        try:
+            return CoordinatorLoopState.from_dict(raw)
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def _interrupt_coordinator_loop_state_failure(self, session: dict,
+                                                  detail: str = "") -> None:
+        """Fail closed when coordinator_loop_state is missing or corrupt."""
+        session_id = session["id"]
+        reason = (
+            "coordinator loop: coordinator_loop_state missing or corrupt "
+            "(fail-closed)"
+        )
+        if detail:
+            reason = f"{reason}: {detail}"
+        channel = session.get("channel", "general")
+        self._messages.add(
+            sender="system",
+            text=reason,
+            msg_type="session_coord_state_error",
+            channel=channel,
+            metadata={
+                "session_id": session_id,
+                "error": "coordinator_loop_state missing or corrupt",
+            },
+        )
+        log.warning("Session %d: %s", session_id, reason)
+        self._store.interrupt(session_id, reason)
+
+    def _init_coordinator_loop(self, session: dict, goal: str):
+        """Initialize coordinator loop state and trigger coordinator intake."""
+        from coordinator_loop import on_session_start
+
+        cls, action = on_session_start(goal or session.get("goal", ""))
+        self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+        self._route_coordinator_loop_action(session, action)
+
+    def _advance_coordinator_loop(self, session: dict, message_id: int):
+        """Advance a coordinator-loop session based on role output."""
+        from coordinator_loop import (
+            COORDINATOR_ROLE,
+            CoordinatorAction,
+            CoordinatorPhase,
+            on_coordinator_output,
+            on_worker_output,
+        )
+
+        cls = self._load_coordinator_loop_state(session)
+        if cls is None:
+            log.warning("Session %d: corrupt/missing coordinator_loop_state",
+                        session["id"])
+            self._interrupt_coordinator_loop_state_failure(session)
+            return
+
+        if cls.phase in (
+            CoordinatorPhase.FINAL,
+            CoordinatorPhase.BLOCKER,
+            CoordinatorPhase.HALTED,
+        ):
+            return
+
+        tmpl = self._store.get_template(session["template_id"])
+        if not tmpl:
+            self._store.interrupt(session["id"], "template not found")
+            return
+
+        phases = tmpl.get("phases", [])
+        phase_idx = session["current_phase"]
+        if phase_idx >= len(phases):
+            return
+
+        role = phases[phase_idx]["participants"][0]
+        output = session.get("_last_msg", {}).get("text", "")
+        channel = session.get("channel", "general")
+
+        if role == COORDINATOR_ROLE and cls.awaiting_role != COORDINATOR_ROLE:
+            self._route_coordinator_loop_action(
+                session,
+                CoordinatorAction(
+                    target_role=cls.awaiting_role,
+                    prompt_context=session.get("coordinator_loop_worker_prompt", ""),
+                    routing_body=session.get("coordinator_loop_worker_prompt", ""),
+                ),
+            )
+            return
+
+        if role != COORDINATOR_ROLE and cls.awaiting_role != role:
+            log.warning(
+                "Session %d: out-of-turn worker output ignored (expected %r, got %r)",
+                session["id"], cls.awaiting_role, role,
+            )
+            return
+
+        if role == COORDINATOR_ROLE:
+            action = on_coordinator_output(cls, output)
+        else:
+            action = on_worker_output(cls, role, output)
+
+        worker_prompt = None
+        safety_artifact = None
+        if not action.is_terminal and action.target_role != COORDINATOR_ROLE:
+            worker_prompt = action.routing_body or action.prompt_context
+            if action.target_role == "safety_gate":
+                safety_artifact = worker_prompt or session.get("goal", "")
+
+        self._store.update_coordinator_loop_state(
+            session["id"],
+            cls.to_dict(),
+            worker_prompt=worker_prompt,
+            safety_artifact=safety_artifact,
+        )
+
+        msg_type = (
+            "session_coord_routing" if role == COORDINATOR_ROLE
+            else "session_coord_verdict"
+        )
+        self._messages.add(
+            sender="system",
+            text=f"[coordinator_loop][{role}] -> {action.target_role or action.terminal_kind}",
+            msg_type=msg_type,
+            channel=channel,
+            metadata={
+                "session_id": session["id"],
+                "role": role,
+                "target_role": action.target_role,
+                "phase": cls.phase.value,
+                "terminal": action.is_terminal,
+            },
+        )
+
+        if action.is_terminal:
+            self._handle_coordinator_loop_terminal(session, cls, message_id, action)
+            return
+
+        self._route_coordinator_loop_action(session, action)
+
+    def _handle_coordinator_loop_terminal(self, session: dict, cls, message_id: int,
+                                          action):
+        """Complete or interrupt a coordinator-loop session at FINAL/BLOCKER."""
+        channel = session.get("channel", "general")
+        session_id = session["id"]
+
+        if action.terminal_kind == "final":
+            self._messages.add(
+                sender="system",
+                text=f"Coordinator loop complete: {action.prompt_context[:500]}",
+                msg_type="session_coord_final",
+                channel=channel,
+                metadata={
+                    "session_id": session_id,
+                    "phase": cls.phase.value,
+                    "terminal_kind": "final",
+                },
+            )
+            self._store.complete(session_id, message_id)
+            return
+
+        reason = action.prompt_context or cls.blocker_reason or "blocked"
+        self._messages.add(
+            sender="system",
+            text=f"Coordinator loop BLOCKER: {reason[:500]}",
+            msg_type="session_coord_blocker",
+            channel=channel,
+            metadata={
+                "session_id": session_id,
+                "phase": cls.phase.value,
+                "terminal_kind": "blocker",
+                "blocker_reason": reason,
+            },
+        )
+        self._store.interrupt(session_id, f"coordinator loop: {reason}")
+
+    def _route_coordinator_loop_action(self, session: dict, action):
+        """Set session to target role phase and trigger the agent."""
+        session_id = session["id"]
+        session = self._store.get(session_id)
+        if not session or session.get("state") in ("complete", "interrupted"):
+            return
+
+        tmpl = self._store.get_template(session["template_id"])
+        if not tmpl:
+            return
+
+        if action.is_terminal:
+            cls = self._load_coordinator_loop_state(session)
+            if cls is None:
+                self._interrupt_coordinator_loop_state_failure(session)
+                return
+            self._handle_coordinator_loop_terminal(session, cls, None, action)
+            return
+
+        target = action.target_role
+        phases = tmpl.get("phases", [])
+
+        target_phase = None
+        for i, phase in enumerate(phases):
+            if target in phase.get("participants", []):
+                target_phase = i
+                break
+
+        if target_phase is None:
+            log.warning("Session %d: no phase found for coordinator target '%s'",
+                        session_id, target)
+            self._store.interrupt(
+                session_id,
+                f"coordinator loop: no phase for '{target}'")
+            return
+
+        worker_prompt = action.routing_body or action.prompt_context
+        safety_artifact = None
+        if target == "safety_gate":
+            safety_artifact = worker_prompt or session.get("goal", "")
+
+        if worker_prompt is not None or safety_artifact is not None:
+            self._store.update_coordinator_loop_state(
+                session_id,
+                session.get("coordinator_loop_state", {}),
+                worker_prompt=worker_prompt,
+                safety_artifact=safety_artifact,
+            )
+            session = self._store.get(session_id) or session
+
+        session = self._store.set_phase_and_turn(session_id, target_phase, 0)
+        if not session:
+            return
+
+        channel = session.get("channel", "general")
+        phase_obj = phases[target_phase]
+        self._messages.add(
+            sender="system",
+            text=f"Phase: {phase_obj['name']}",
+            msg_type="session_phase",
+            channel=channel,
+            metadata={
+                "session_id": session_id,
+                "phase": target_phase,
+                "phase_name": phase_obj["name"],
+            },
+        )
+        self._trigger_coordinator_loop(session)
+
+    def _trigger_coordinator_loop(self, session: dict):
+        """Trigger the current coordinator-loop participant with role-aware prompts."""
+        from coordinator_loop import CoordinatorPhase
+
+        tmpl = self._store.get_template(session["template_id"])
+        if not tmpl:
+            return
+
+        cls = self._load_coordinator_loop_state(session)
+        if cls is None:
+            self._interrupt_coordinator_loop_state_failure(session)
+            return
+
+        if cls.phase in (
+            CoordinatorPhase.FINAL,
+            CoordinatorPhase.BLOCKER,
+            CoordinatorPhase.HALTED,
+        ):
+            return
+
+        phases = tmpl.get("phases", [])
+        phase_idx = session["current_phase"]
+        turn_idx = session["current_turn"]
+        if phase_idx >= len(phases):
+            return
+
+        phase = phases[phase_idx]
+        participants = phase.get("participants", [])
+        if turn_idx >= len(participants):
+            return
+
+        role = participants[turn_idx]
+        cast = session.get("cast", {})
+        agent = cast.get(role)
+        if not agent:
+            self._store.interrupt(session["id"], f"no agent for role '{role}'")
+            return
+
+        if not self._is_agent(agent):
+            self._store.set_waiting(session["id"], agent)
+            return
+
+        self._store.set_waiting(session["id"], agent)
+        agent_base = self._get_agent_base(agent)
+        channel = session.get("channel", "general")
+        worker_prompt = session.get("coordinator_loop_worker_prompt", "")
+
+        if role == "coordinator":
+            from coordinator_loop import coordinator_allowed_tokens
+
+            allowed = coordinator_allowed_tokens(cls)
+            prompt = build_coordinator_loop_prompt(
+                session_name=tmpl.get("name", "?"),
+                goal=session.get("goal", ""),
+                task_description=cls.task_description,
+                last_role=cls.last_role,
+                last_output_summary=cls.last_output_summary,
+                awaiting_role=cls.awaiting_role,
+                developer_round=cls.developer_round,
+                ui_round=cls.ui_round,
+                review_round=cls.review_round,
+                safety_round=cls.safety_round,
+                allowed_tokens=allowed,
+                instruction=worker_prompt or phase.get("prompt", ""),
+            )
+            if is_relay_eligible(agent_base):
+                relay_entry = make_relay_queue_entry(
+                    prompt=prompt,
+                    session_id=session["id"],
+                    phase=phase_idx,
+                    turn=turn_idx,
+                    role=role,
+                    channel=channel,
+                )
+                self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+            else:
+                self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            return
+
+        if role.lower() in _SAFETY_GATE_ROLES:
+            content = session.get("coordinator_loop_safety_artifact")
+            if not content:
+                content = self._get_last_turn_content(session, channel)
+            prompt = build_safety_gate_prompt(
+                session_name=tmpl.get("name", "?"),
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                content_to_review=content,
+                agent_base=agent_base,
+            )
+            relay_entry = make_relay_queue_entry(
+                prompt=prompt,
+                session_id=session["id"],
+                phase=phase_idx,
+                turn=turn_idx,
+                role=role,
+                channel=channel,
+            )
+            self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+            return
+
+        instruction = worker_prompt or phase.get("prompt", "")
+        if self._agent_uses_store_exec(agent):
+            prompt = build_coordinator_loop_ui_lead_prompt(
+                session_name=tmpl.get("name", "?"),
+                channel=channel,
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                phase_index=phase_idx,
+                total_phases=len(phases),
+                instruction=instruction,
+                context_messages=self._get_recent_context(channel),
+            )
+            self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            return
+
+        context_messages = self._get_recent_context(channel)
+        prompt = build_relay_prompt(
+            session_name=tmpl.get("name", "?"),
+            goal=session.get("goal", ""),
+            phase_name=phase["name"],
+            phase_index=phase_idx,
+            total_phases=len(phases),
+            role=role,
+            instruction=instruction,
+            context_messages=context_messages,
+            agent_base=agent_base,
+        )
+        contract = coordinator_loop_worker_output_contract(role)
+        if contract:
+            prompt = f"{prompt}\n\n{contract}"
+        relay_entry = make_relay_queue_entry(
+            prompt=prompt,
+            session_id=session["id"],
+            phase=phase_idx,
+            turn=turn_idx,
+            role=role,
+            channel=channel,
+        )
+        self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+
+    def is_coordinator_loop_session(self, session: dict) -> bool:
+        """True if the session's template opts in to coordinator-loop routing."""
+        tmpl = self._store.get_template(session.get("template_id", ""))
+        if not tmpl:
+            return False
+        return bool(tmpl.get("coordinator_loop"))
+
     def is_flow_coordinator_session(self, session: dict) -> bool:
         """True if the session's template opts in to flow-coordinator routing.
 
@@ -1139,4 +1576,5 @@ class SessionEngine:
                     session["current_role"] = role
                     session["current_agent"] = session.get("cast", {}).get(role)
             session["flow_coordinator"] = bool(tmpl.get("flow_coordinator"))
+            session["coordinator_loop"] = bool(tmpl.get("coordinator_loop"))
         return session

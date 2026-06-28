@@ -327,6 +327,30 @@ class SessionStore:
         self._fire("update", result)
         return result
 
+    def update_coordinator_loop_state(
+        self,
+        session_id: int,
+        cls_state: dict,
+        *,
+        worker_prompt: str | None = None,
+        safety_artifact: str | None = None,
+    ) -> dict | None:
+        """Persist coordinator loop state and optional worker/safety prompt payloads."""
+        with self._lock:
+            session = self._find(session_id)
+            if not session:
+                return None
+            session["coordinator_loop_state"] = cls_state
+            if worker_prompt is not None:
+                session["coordinator_loop_worker_prompt"] = worker_prompt
+            if safety_artifact is not None:
+                session["coordinator_loop_safety_artifact"] = safety_artifact
+            session["updated_at"] = time.time()
+            self._save()
+            result = dict(session)
+        self._fire("update", result)
+        return result
+
     def set_phase_and_turn(self, session_id: int, phase: int, turn: int,
                            message_id: int | None = None) -> dict | None:
         """Set session to an arbitrary phase/turn (for flow-coordinator routing)."""
@@ -402,5 +426,8 @@ def validate_session_template(tmpl: dict) -> list[str]:
         errors.append("No phase marked as 'is_output: true'")
     elif output_count > 1:
         errors.append(f"Multiple phases marked as output ({output_count}, expected 1)")
+
+    if tmpl.get("flow_coordinator") and tmpl.get("coordinator_loop"):
+        errors.append("cannot set both flow_coordinator and coordinator_loop")
 
     return errors

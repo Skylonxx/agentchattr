@@ -139,6 +139,112 @@ def build_safety_gate_prompt(
     return "\n\n".join(lines)
 
 
+def build_coordinator_loop_prompt(
+    *,
+    session_name: str,
+    goal: str,
+    task_description: str,
+    last_role: str,
+    last_output_summary: str,
+    awaiting_role: str,
+    developer_round: int,
+    ui_round: int,
+    review_round: int,
+    safety_round: int,
+    allowed_tokens: list[str],
+    instruction: str = "",
+) -> str:
+    """Build a coordinator routing prompt with strict first-line token contract."""
+    lines = [
+        "OUTPUT CONTRACT (strict — first non-empty line is routing metadata):",
+        "Emit exactly ONE routing token on the first non-empty line, then your prompt body.",
+        "Allowed tokens for this turn:",
+    ]
+    for token in allowed_tokens:
+        lines.append(f"  {token}")
+    lines.extend([
+        "",
+        "Do not emit multiple routing tokens.",
+        "Do not route worker-to-worker; you alone dispatch the next role.",
+        "",
+        f"SESSION: {session_name}",
+    ])
+    if goal:
+        lines.append(f"GOAL: {goal}")
+    if task_description:
+        lines.append(f"TASK: {task_description}")
+    lines.extend([
+        f"AWAITING: {awaiting_role}",
+        f"ROUNDS: developer={developer_round} ui={ui_round} review={review_round} safety={safety_round}",
+    ])
+    if last_role:
+        lines.append(f"LAST ROLE: {last_role}")
+    if last_output_summary:
+        lines.append(f"LAST OUTPUT (summary): {last_output_summary[:500]}")
+    if instruction:
+        lines.append(f"INSTRUCTION: {instruction}")
+    lines.extend([
+        "",
+        "Respond with plain text only. Do not use MCP tools.",
+    ])
+    return "\n\n".join(lines)
+
+
+def build_coordinator_loop_ui_lead_prompt(
+    *,
+    session_name: str,
+    channel: str,
+    goal: str,
+    phase_name: str,
+    phase_index: int,
+    total_phases: int,
+    instruction: str,
+    context_messages: list[dict] | None = None,
+) -> str:
+    """Headless UI lead prompt for coordinator_loop (strict UX_APPROVED contract)."""
+    lines = [
+        f"SESSION: {session_name}",
+        f"CHANNEL: #{channel}",
+    ]
+    if goal:
+        lines.append(f"GOAL: {goal}")
+    lines.append(f"PHASE: {phase_name} ({phase_index + 1}/{total_phases})")
+    lines.append("YOUR ROLE: ui_lead (UI/UX reviewer)")
+    lines.append(f"INSTRUCTION: {instruction}")
+    if context_messages:
+        lines.append("")
+        lines.append("CONTEXT (recent channel messages):")
+        for msg in context_messages[-10:]:
+            sender = msg.get("sender", "?")
+            text = msg.get("text", "")
+            lines.append(f"  [{sender}]: {text}")
+    lines.extend([
+        "",
+        "OUTPUT CONTRACT (strict — headless store_exec; plain text only):",
+        "First line MUST be exactly one of:",
+        "UX_APPROVED",
+        "REQUEST UX CHANGES",
+        "BLOCKED",
+        "PASS WITH NOTES is NOT valid in coordinator_loop.",
+        "Do not use tools, shell, git, MCP, or file edits.",
+    ])
+    return "\n\n".join(lines)
+
+
+def coordinator_loop_worker_output_contract(role: str) -> str:
+    """Return the strict first-line output contract for a coordinator_loop worker."""
+    if role == "developer":
+        return (
+            "OUTPUT CONTRACT: First line MUST be READY_FOR_COORDINATOR, then your body."
+        )
+    if role == "reviewer":
+        return (
+            "OUTPUT CONTRACT: First line MUST be one of: "
+            "PASS, PASS WITH NOTES, REQUEST CHANGES, BLOCKED."
+        )
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Relay queue metadata
 # ---------------------------------------------------------------------------

@@ -1,0 +1,41 @@
+{
+  "id": "project-readonly-coordinator-loop",
+  "name": "Project Read-Only Coordinator Loop",
+  "description": "Generic read-only multi-agent coordinator loop with hub routing.",
+  "roles": ["coordinator", "developer", "ui_lead", "reviewer", "safety_gate"],
+  "user_required": false,
+  "coordinator_loop": true,
+  "phases": [
+    {
+      "name": "Coordinator",
+      "participants": ["coordinator"],
+      "prompt": "Intake and route via CLASSIFY/NEXT/FINAL/BLOCKER tokens.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Developer",
+      "participants": ["developer"],
+      "prompt": "Implement per coordinator instruction. Read-only.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "UI Lead",
+      "participants": ["ui_lead"],
+      "prompt": "Review UX per coordinator instruction. Read-only.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Reviewer",
+      "participants": ["reviewer"],
+      "prompt": "Engineering review per coordinator instruction. Read-only.",
+      "turn_order": "sequential"
+    },
+    {
+      "name": "Safety Gate",
+      "participants": ["safety_gate"],
+      "prompt": "Final boundary gate. Strict PASS/BLOCK only.",
+      "turn_order": "sequential",
+      "is_output": true
+    }
+  ]
+}
