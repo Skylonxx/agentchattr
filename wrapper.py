@@ -563,6 +563,21 @@ def _inject_with_supported_kwargs(inject_fn, text: str, **kwargs):
     return inject_fn(text, **supported)
 
 
+def _build_queue_work_item(
+    prompt: str,
+    *,
+    channel: str = "general",
+    relay_meta=None,
+    workspace_policy_context=None,
+) -> dict:
+    item = {"prompt": prompt, "channel": channel or "general"}
+    if isinstance(relay_meta, dict):
+        item["relay_meta"] = relay_meta
+    if isinstance(workspace_policy_context, dict):
+        item["workspace_policy_context"] = workspace_policy_context
+    return item
+
+
 def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = False, trigger_flag=None,
                    server_port: int = 8300, agent_name: str = "", get_token_fn=None,
                    refresh_interval: int = 10, suppress_identity_hint: bool = False,
@@ -621,6 +636,7 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # The structured relay_meta is authoritative — it carries the
                     # full sealed-prompt + MCP-disable contract from the server.
                     relay_meta, relay_prompt = _extract_relay_turn(lines)
+                    wpc = _extract_workspace_policy_context(lines)
 
                     # Relay session turns are SEALED: the server (session_relay.py)
                     # already built the complete prompt. Do NOT append role text,
@@ -630,7 +646,10 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # structured relay_meta so the exec runner can disable MCP.
                     if relay_meta is not None and relay_prompt:
                         _inject_with_supported_kwargs(
-                            inject_fn, relay_prompt, relay_meta=relay_meta)
+                            inject_fn, relay_prompt,
+                            relay_meta=relay_meta,
+                            workspace_policy_context=wpc,
+                        )
                         time.sleep(1)
                         continue
 
@@ -719,7 +738,11 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                     # detection in CLIs (Claude Code shows "[Pasted text +N]")
                     # which can break injection of long session prompts
                     _inject_with_supported_kwargs(
-                        inject_fn, prompt.replace("\n", " "), channel=channel)
+                        inject_fn, prompt.replace("\n", " "),
+                        channel=channel,
+                        workspace_policy_context=wpc,
+                        relay_meta=_extract_relay_meta_from_lines(lines),
+                    )
         except Exception:
             try:
                 agent_label, qpath = get_identity_fn()
@@ -843,6 +866,79 @@ def _extract_relay_turn(lines: list[str]) -> tuple[dict | None, str]:
     return None, ""
 
 
+def _extract_workspace_policy_context(lines: list[str]) -> dict | None:
+    """Return workspace_policy_context from queue batch if present."""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        wpc = data.get("workspace_policy_context")
+        if isinstance(wpc, dict):
+            return wpc
+    return None
+
+
+def _extract_relay_meta_from_lines(lines: list[str]) -> dict | None:
+    """Return relay_meta from queue batch if present."""
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        meta = data.get("relay_meta")
+        if isinstance(meta, dict):
+            return meta
+    return None
+
+
+def _verify_workspace_policy_context(
+    workspace_policy_context: dict | None,
+    *,
+    data_dir,
+    config: dict | None,
+    relay_meta: dict | None = None,
+) -> str | None:
+    """Return blocker token when verification fails; None when allowed."""
+    from workspace_policy_runtime import (
+        is_runtime_enforcement_enabled,
+        verify_session_workspace_policy,
+    )
+    if not is_runtime_enforcement_enabled(config):
+        return None
+    result = verify_session_workspace_policy(
+        relay_meta=relay_meta,
+        workspace_policy_context=workspace_policy_context,
+        data_dir=data_dir,
+        enforcement_enabled=True,
+    )
+    if result.ok:
+        return None
+    return result.blocker or "BLOCKER:policy_verification_failed"
+
+
+def _policy_blocker_for_exec_item(item, *, data_dir, config) -> str | None:
+    """Return policy blocker for a queue work item before subprocess execution."""
+    if not isinstance(item, dict):
+        return None
+    return _verify_workspace_policy_context(
+        item.get("workspace_policy_context"),
+        data_dir=data_dir,
+        config=config,
+        relay_meta=item.get("relay_meta"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Relay outcome markers (fail-loud: a relay turn never silently posts nothing)
 # ---------------------------------------------------------------------------
@@ -907,7 +1003,7 @@ def _resolve_relay_reply(*, timed_out: bool, errored: bool,
 def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
                    exec_args=None, trigger_flag=None, running_flag=None,
                    data_dir=None, no_restart=False,
-                   server_port=8300, get_token_fn=None):
+                   server_port=8300, get_token_fn=None, config=None):
     """Headless run loop: on each @mention, invoke ``codex exec <prompt>``
     instead of driving an interactive TUI.
 
@@ -931,10 +1027,15 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             _output_file = Path(exec_args[_i + 1])
             break
 
-    def _enqueue(text, relay_meta=None, channel=""):
+    def _enqueue(text, relay_meta=None, channel="", workspace_policy_context=None):
         if running_flag is not None:
             running_flag[0] = True
-        work.put({"prompt": text, "relay_meta": relay_meta, "channel": channel})
+        work.put(_build_queue_work_item(
+            text,
+            channel=channel,
+            relay_meta=relay_meta,
+            workspace_policy_context=workspace_policy_context,
+        ))
 
     start_watcher(_enqueue)
 
@@ -957,9 +1058,35 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
         if isinstance(item, dict):
             prompt = item.get("prompt", "")
             relay_meta = item.get("relay_meta")
+            workspace_policy_context = item.get("workspace_policy_context")
         else:
             prompt = item
             relay_meta = None
+            workspace_policy_context = None
+
+        blocker = _policy_blocker_for_exec_item(
+            item,
+            data_dir=data_dir,
+            config=config,
+        )
+        if blocker:
+            reply_channel = (
+                (relay_meta or {}).get("channel")
+                or (item.get("channel", "") if isinstance(item, dict) else "")
+                or "general"
+            )
+            print(f"  > {agent} workspace policy blocked: {blocker}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        blocker,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay policy blocker: {exc}")
+            continue
 
         # Reply channel: relay turns carry it in relay_meta.channel; direct-mention
         # turns carry it in the work item's "channel" field (set by the queue watcher
@@ -1372,7 +1499,12 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
     def _enqueue(text, channel="", **kwargs):
         if running_flag is not None:
             running_flag[0] = True
-        work.put({"prompt": text, "channel": channel or "general"})
+        work.put(_build_queue_work_item(
+            text,
+            channel=kwargs.get("channel", channel),
+            relay_meta=kwargs.get("relay_meta"),
+            workspace_policy_context=kwargs.get("workspace_policy_context"),
+        ))
 
     start_watcher(_enqueue)
 
@@ -1436,7 +1568,12 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
     def _enqueue(text, channel="", **kwargs):
         if running_flag is not None:
             running_flag[0] = True
-        work.put({"prompt": text, "channel": channel or "general"})
+        work.put(_build_queue_work_item(
+            text,
+            channel=kwargs.get("channel", channel),
+            relay_meta=kwargs.get("relay_meta"),
+            workspace_policy_context=kwargs.get("workspace_policy_context"),
+        ))
 
     start_watcher(_enqueue)
 
@@ -1752,7 +1889,12 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
     def _enqueue(text, relay_meta=None, channel="", **kwargs):
         if running_flag is not None:
             running_flag[0] = True
-        work.put({"prompt": text, "relay_meta": relay_meta, "channel": channel or "general"})
+        work.put(_build_queue_work_item(
+            text,
+            channel=kwargs.get("channel", channel),
+            relay_meta=relay_meta or kwargs.get("relay_meta"),
+            workspace_policy_context=kwargs.get("workspace_policy_context"),
+        ))
 
     start_watcher(_enqueue)
 
@@ -2286,6 +2428,7 @@ def main():
                 no_restart=args.no_restart,
                 server_port=server_port,
                 get_token_fn=get_token,
+                config=config,
             )
         elif run_mode == "print_exec":
             run_agent_claude_print_exec(

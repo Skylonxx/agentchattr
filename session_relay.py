@@ -285,6 +285,7 @@ def make_relay_queue_entry(
     turn: int,
     role: str,
     channel: str = "general",
+    workspace_policy_context: dict | None = None,
 ) -> dict:
     """Build a queue entry dict for a relay session turn.
 
@@ -309,6 +310,8 @@ def make_relay_queue_entry(
         "prompt": prompt,
         "relay_meta": meta.to_dict(),
     }
+    if workspace_policy_context:
+        entry["workspace_policy_context"] = dict(workspace_policy_context)
     return entry
 
 

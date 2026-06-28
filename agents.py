@@ -27,6 +27,15 @@ def _valid_relay_entry(relay_entry) -> bool:
     return bool(meta.get("relay_mode")) and bool(meta.get("disable_mcp"))
 
 
+def _attach_workspace_policy_context(entry: dict, kwargs: dict) -> dict:
+    wpc = kwargs.get("workspace_policy_context")
+    if isinstance(wpc, dict):
+        out = dict(entry)
+        out["workspace_policy_context"] = dict(wpc)
+        return out
+    return entry
+
+
 class AgentTrigger:
     def __init__(self, registry, data_dir: str = "./data"):
         self._registry = registry
@@ -73,6 +82,8 @@ class AgentTrigger:
             if job_id is not None:
                 entry["job_id"] = job_id
 
+        entry = _attach_workspace_policy_context(entry, kwargs)
+
         with open(queue_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
 
@@ -101,6 +112,8 @@ class AgentTrigger:
                 entry["prompt"] = custom_prompt.strip()
             if job_id is not None:
                 entry["job_id"] = job_id
+
+        entry = _attach_workspace_policy_context(entry, kwargs)
 
         with open(queue_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")

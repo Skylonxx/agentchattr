@@ -862,6 +862,11 @@ def _matches_forbidden(rel_path: str, pattern: str) -> bool:
     return path == pat
 
 
+def path_matches_forbidden(path: str, pattern: str) -> bool:
+    """Return True when ``path`` matches a forbidden path pattern."""
+    return _matches_forbidden(path, pattern)
+
+
 def strip_internal_policy_keys(policy: dict[str, Any]) -> dict[str, Any]:
     """Remove resolver-only keys before persistence/display."""
     out = dict(policy)

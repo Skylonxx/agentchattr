@@ -346,6 +346,28 @@ class SessionEngine:
             return None
         return self._get_expected_agent(session)
 
+    def _session_workspace_policy_context(
+        self, session: dict, role: str, phase_idx: int, turn_idx: int,
+    ) -> dict:
+        from workspace_policy_runtime import build_session_queue_workspace_context
+        return build_session_queue_workspace_context(
+            session, role, phase_idx, turn_idx,
+        )
+
+    def _make_relay_queue_entry(self, *, prompt: str, session: dict, phase_idx: int,
+                                turn_idx: int, role: str, channel: str) -> dict:
+        return make_relay_queue_entry(
+            prompt=prompt,
+            session_id=session["id"],
+            phase=phase_idx,
+            turn=turn_idx,
+            role=role,
+            channel=channel,
+            workspace_policy_context=self._session_workspace_policy_context(
+                session, role, phase_idx, turn_idx,
+            ),
+        )
+
     def list_active(self) -> list[dict]:
         """List all active/waiting/paused sessions, enriched for the frontend."""
         active = []
@@ -721,7 +743,12 @@ class SessionEngine:
             log.info("Session %d: triggering %s (%s) for phase '%s'",
                      session["id"], agent, role, phase["name"])
             try:
-                self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+                self._trigger.trigger_sync(
+                    agent, channel=channel, prompt=prompt,
+                    workspace_policy_context=self._session_workspace_policy_context(
+                        session, role, phase_idx, turn_idx,
+                    ),
+                )
             except Exception as exc:
                 log.error("Session %d: failed to trigger %s: %s",
                           session["id"], agent, exc)
@@ -754,11 +781,11 @@ class SessionEngine:
                 agent_base=agent_base,
             )
 
-        relay_entry = make_relay_queue_entry(
+        relay_entry = self._make_relay_queue_entry(
             prompt=prompt,
-            session_id=session["id"],
-            phase=phase_idx,
-            turn=turn_idx,
+            session=session,
+            phase_idx=phase_idx,
+            turn_idx=turn_idx,
             role=role,
             channel=channel,
         )
@@ -1473,17 +1500,23 @@ class SessionEngine:
                 instruction=worker_prompt or phase.get("prompt", ""),
             )
             if is_relay_eligible(agent_base):
-                relay_entry = make_relay_queue_entry(
+                relay_entry = self._make_relay_queue_entry(
                     prompt=prompt,
-                    session_id=session["id"],
-                    phase=phase_idx,
-                    turn=turn_idx,
+                    session=session,
+                    phase_idx=phase_idx,
+                    turn_idx=turn_idx,
                     role=role,
                     channel=channel,
                 )
                 self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
             else:
-                self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+                wpc = self._session_workspace_policy_context(
+                    session, role, phase_idx, turn_idx,
+                )
+                self._trigger.trigger_sync(
+                    agent, channel=channel, prompt=prompt,
+                    workspace_policy_context=wpc,
+                )
             return
 
         if role.lower() in _SAFETY_GATE_ROLES:
@@ -1497,11 +1530,11 @@ class SessionEngine:
                 content_to_review=content,
                 agent_base=agent_base,
             )
-            relay_entry = make_relay_queue_entry(
+            relay_entry = self._make_relay_queue_entry(
                 prompt=prompt,
-                session_id=session["id"],
-                phase=phase_idx,
-                turn=turn_idx,
+                session=session,
+                phase_idx=phase_idx,
+                turn_idx=turn_idx,
                 role=role,
                 channel=channel,
             )
@@ -1520,7 +1553,12 @@ class SessionEngine:
                 instruction=instruction,
                 context_messages=self._get_recent_context(channel),
             )
-            self._trigger.trigger_sync(agent, channel=channel, prompt=prompt)
+            self._trigger.trigger_sync(
+                agent, channel=channel, prompt=prompt,
+                workspace_policy_context=self._session_workspace_policy_context(
+                    session, role, phase_idx, turn_idx,
+                ),
+            )
             return
 
         context_messages = self._get_recent_context(channel)
@@ -1538,11 +1576,11 @@ class SessionEngine:
         contract = coordinator_loop_worker_output_contract(role)
         if contract:
             prompt = f"{prompt}\n\n{contract}"
-        relay_entry = make_relay_queue_entry(
+        relay_entry = self._make_relay_queue_entry(
             prompt=prompt,
-            session_id=session["id"],
-            phase=phase_idx,
-            turn=turn_idx,
+            session=session,
+            phase_idx=phase_idx,
+            turn_idx=turn_idx,
             role=role,
             channel=channel,
         )

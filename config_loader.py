@@ -254,3 +254,13 @@ def get_workspace_profiles(cfg: dict) -> dict[str, dict]:
     if not isinstance(raw, dict):
         return {}
     return {profile_id: profile for profile_id, profile in raw.items() if isinstance(profile, dict)}
+
+
+def get_workspace_policy_config(cfg: dict) -> dict:
+    """Return workspace policy runtime config (safe defaults when missing)."""
+    section = cfg.get("workspace_policy")
+    if not isinstance(section, dict):
+        return {"runtime_enforcement_enabled": False}
+    return {
+        "runtime_enforcement_enabled": bool(section.get("runtime_enforcement_enabled")),
+    }

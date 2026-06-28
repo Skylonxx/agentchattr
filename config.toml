@@ -226,3 +226,7 @@ allowed_modes = ["scratch-readonly", "read-only"]
 default_mode = "scratch-readonly"
 max_mode = "read-only"
 default_forbidden_paths = [".git/**"]
+
+# Phase 3B runtime enforcement (default OFF — metadata verification scaffolding only).
+[workspace_policy]
+runtime_enforcement_enabled = false
