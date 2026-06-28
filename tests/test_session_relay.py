@@ -2897,7 +2897,7 @@ class _RunClaudeRelayHarness(unittest.TestCase):
             return wrapper._ScratchResult(False, None, "unsafe")
 
         def start_watcher(inject_fn):
-            inject_fn(prompt, relay_meta=relay_meta)
+            inject_fn(prompt, relay_meta=relay_meta, channel="general")
 
         run_env = env if env is not None else {
             "PATH": "/bin", "MCP_SERVER_URL": "http://x", "ANTHROPIC_API_KEY": "sk-ant-x",
@@ -3034,12 +3034,16 @@ class TestClaudeRelayRunner(_RunClaudeRelayHarness):
         self.assertEqual(len(sub_calls), 0)
         self.assertEqual(relayed, [])
 
-    def test_non_relay_item_refused(self):
-        proc = MagicMock(returncode=0, stdout=_claude_success_stdout(), stderr=b"")
+    def test_non_relay_item_uses_direct_print_fallback(self):
+        proc = MagicMock(returncode=0, stdout=b"CLAUDE_GENERAL_OK", stderr=b"")
         relayed, sub_calls = self._run_once(
             activated=True, fake_proc=proc, relay_meta=None, prompt="plain hello")
-        self.assertEqual(len(sub_calls), 0)
-        self.assertEqual(relayed, [])
+        self.assertEqual(len(sub_calls), 1)
+        self.assertEqual(len(relayed), 1)
+        self.assertEqual(relayed[0]["text"], "CLAUDE_GENERAL_OK")
+        self.assertEqual(relayed[0]["channel"], "general")
+        cmd = sub_calls[0]["args"][0]
+        self.assertEqual(cmd[:4], ["claude", "--print", "--tools", ""])
 
     def test_relay_meta_without_disable_mcp_refused(self):
         meta = {"relay_mode": True, "disable_mcp": False, "channel": "relay-dryrun"}

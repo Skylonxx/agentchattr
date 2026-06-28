@@ -18,7 +18,7 @@ class ClaudePrintCommandTests(unittest.TestCase):
         cmd, stdin_payload = wrapper._build_claude_print_command(
             "claude.cmd", "Reply exactly: OK", use_stdin=True)
 
-        self.assertEqual(cmd, ["claude.cmd", "--print"])
+        self.assertEqual(cmd, ["claude.cmd", "--print", "--tools", ""])
         self.assertEqual(stdin_payload, b"Reply exactly: OK")
         self.assertNotIn("Reply exactly: OK", " ".join(cmd))
 
@@ -26,7 +26,7 @@ class ClaudePrintCommandTests(unittest.TestCase):
         cmd, stdin_payload = wrapper._build_claude_print_command(
             "claude.cmd", "Reply exactly: OK", use_stdin=False)
 
-        self.assertEqual(cmd, ["claude.cmd", "--print", "Reply exactly: OK"])
+        self.assertEqual(cmd, ["claude.cmd", "--print", "--tools", "", "Reply exactly: OK"])
         self.assertIsNone(stdin_payload)
 
 
@@ -69,7 +69,7 @@ class ClaudePrintExecTests(unittest.TestCase):
         self.assertEqual(captured[0]["channel"], "sandbox-flow-test")
         self.assertEqual(captured[0]["text"], "Claude says hi")
         self.assertEqual(mock_run.call_args.kwargs["input"], b"Prompt body")
-        self.assertEqual(mock_run.call_args.args[0], ["claude.cmd", "--print"])
+        self.assertEqual(mock_run.call_args.args[0], ["claude.cmd", "--print", "--tools", ""])
 
     def test_print_exec_handles_non_zero_exit_without_crashing(self):
         proc = type("Proc", (), {

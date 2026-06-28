@@ -83,10 +83,20 @@ class AgyTranscriptExtractionFailClosedTests(unittest.TestCase):
             (tdir / "transcript.jsonl").write_text("{bad json\nnot verdict\n", encoding="utf-8")
             self.assertEqual(_extract_agy_reply(conv, agy_data_dir=tmp), "")
 
-    def test_non_verdict_plain_text_not_used_as_fallback(self):
+    def test_safe_non_verdict_plain_text_used_as_fallback(self):
         with tempfile.TemporaryDirectory() as tmp:
             conv = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee"
-            _write_transcript(Path(tmp), conv, ["Some unrelated log line without verdict token"])
+            _write_transcript(Path(tmp), conv, ["AGY_GENERAL_OK"])
+            self.assertEqual(_extract_agy_reply(conv, agy_data_dir=tmp), "AGY_GENERAL_OK")
+
+    def test_unsafe_non_verdict_plain_text_not_used_as_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conv = "cccccccc-bbbb-cccc-dddd-eeeeeeeeeeee"
+            listing = (
+                "Created At: 2026\n"
+                '{"name": "codex-cwd", "isDir": true, "sizeBytes": 0}\n'
+            )
+            _write_transcript(Path(tmp), conv, [listing])
             self.assertEqual(_extract_agy_reply(conv, agy_data_dir=tmp), "")
 
     def test_verdict_reply_still_extracted(self):

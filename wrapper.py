@@ -1211,6 +1211,11 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     if verdict_replies:
         return verdict_replies[-1]
 
+    for reply in reversed(model_replies):
+        relay_text, fail_marker = _prepare_agy_relay_text(reply)
+        if relay_text and fail_marker is None:
+            return relay_text
+
     return ""
 
 
@@ -1265,8 +1270,94 @@ def _build_agy_store_command(command: str, prompt: str, print_timeout: int, *,
 def _build_claude_print_command(command: str, prompt: str, *, use_stdin: bool = True):
     """Build a Claude ``--print`` invocation and optional stdin payload."""
     if use_stdin:
-        return [command, "--print"], prompt.encode("utf-8")
-    return [command, "--print", prompt], None
+        return [command, "--print", "--tools", ""], prompt.encode("utf-8")
+    return [command, "--print", "--tools", "", prompt], None
+
+
+def _run_claude_direct_print_turn(
+    *,
+    command,
+    cwd,
+    env,
+    agent,
+    prompt,
+    reply_channel,
+    server_port,
+    get_token_fn,
+    log_path=None,
+):
+    """Run one direct ``claude --print`` turn and relay to the source channel."""
+    import subprocess
+
+    cmd, stdin_payload = _build_claude_print_command(command, prompt, use_stdin=True)
+    print(f"  > {agent} direct print-exec triggered ({len(prompt)} chars) -> #{reply_channel}")
+
+    timed_out = False
+    errored = False
+    proc = None
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            input=stdin_payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=EXEC_TIMEOUT_SECS,
+        )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        print(f"  > {agent} direct print-exec timed out ({EXEC_TIMEOUT_SECS}s)")
+    except Exception as exc:  # noqa: BLE001
+        errored = True
+        print(f"  > {agent} direct print-exec error: {exc}")
+
+    returncode = None
+    captured = ""
+    stderr_text = ""
+    if proc is not None:
+        returncode = proc.returncode
+        print(f"  > {agent} direct print-exec finished (exit {proc.returncode})")
+        captured = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+
+    if log_path:
+        try:
+            with open(log_path, "ab") as lf:
+                header = (
+                    f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} direct print-exec ===\n"
+                    f"channel={reply_channel} prompt_len={len(prompt)}\n"
+                )
+                lf.write(header.encode("utf-8", "replace"))
+                if captured:
+                    lf.write(b"stdout: ")
+                    lf.write(captured.encode("utf-8", "replace"))
+                    lf.write(b"\n")
+                if stderr_text:
+                    lf.write(b"stderr: ")
+                    lf.write(stderr_text.encode("utf-8", "replace"))
+                    lf.write(b"\n")
+        except Exception:
+            pass
+
+    if not get_token_fn:
+        return
+
+    if timed_out:
+        reply = f"[claude --print timed out after {EXEC_TIMEOUT_SECS}s]"
+    elif errored:
+        reply = "[claude --print failed to start]"
+    elif captured:
+        reply = _format_relay_reply(captured)
+    elif returncode not in (None, 0):
+        reply = f"[claude --print failed (exit {returncode})]"
+    else:
+        reply = "[claude produced no reply]"
+    try:
+        _relay_to_chat(server_port, get_token_fn(), reply, channel=reply_channel)
+        print(f"  > {agent} reply relayed ({len(reply)} chars) -> #{reply_channel}")
+    except Exception as exc:
+        print(f"  > {agent} relay failed: {exc}")
 
 
 def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
@@ -1275,7 +1366,6 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
                                 server_port=8300, get_token_fn=None):
     """Headless Claude runner using ``claude --print`` with stdin payloads."""
     import queue as _queue
-    import subprocess
 
     work: "_queue.Queue[dict]" = _queue.Queue()
 
@@ -1308,74 +1398,17 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
             prompt = item
             reply_channel = "general"
 
-        cmd, stdin_payload = _build_claude_print_command(
-            command, prompt, use_stdin=True)
-        print(f"  > {agent} print-exec triggered ({len(prompt)} chars)")
-
-        timed_out = False
-        errored = False
-        proc = None
-        try:
-            proc = subprocess.run(
-                cmd,
-                cwd=cwd,
-                env=env,
-                input=stdin_payload,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=EXEC_TIMEOUT_SECS,
-            )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            print(f"  > {agent} print-exec timed out ({EXEC_TIMEOUT_SECS}s)")
-        except Exception as exc:  # noqa: BLE001
-            errored = True
-            print(f"  > {agent} print-exec error: {exc}")
-
-        returncode = None
-        captured = ""
-        stderr_text = ""
-        if proc is not None:
-            returncode = proc.returncode
-            print(f"  > {agent} print-exec finished (exit {proc.returncode})")
-            captured = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
-            stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
-
-        if log_path:
-            try:
-                with open(log_path, "ab") as lf:
-                    header = (
-                        f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} print-exec ===\n"
-                        f"channel={reply_channel} prompt_len={len(prompt)}\n"
-                    )
-                    lf.write(header.encode("utf-8", "replace"))
-                    if captured:
-                        lf.write(b"stdout: ")
-                        lf.write(captured.encode("utf-8", "replace"))
-                        lf.write(b"\n")
-                    if stderr_text:
-                        lf.write(b"stderr: ")
-                        lf.write(stderr_text.encode("utf-8", "replace"))
-                        lf.write(b"\n")
-            except Exception:
-                pass
-
-        if get_token_fn:
-            if timed_out:
-                reply = f"[claude --print timed out after {EXEC_TIMEOUT_SECS}s]"
-            elif errored:
-                reply = "[claude --print failed to start]"
-            elif captured:
-                reply = _format_relay_reply(captured)
-            elif returncode not in (None, 0):
-                reply = f"[claude --print failed (exit {returncode})]"
-            else:
-                reply = "[claude produced no reply]"
-            try:
-                _relay_to_chat(server_port, get_token_fn(), reply, channel=reply_channel)
-                print(f"  > {agent} reply relayed ({len(reply)} chars) -> #{reply_channel}")
-            except Exception as exc:
-                print(f"  > {agent} relay failed: {exc}")
+        _run_claude_direct_print_turn(
+            command=command,
+            cwd=cwd,
+            env=env,
+            agent=agent,
+            prompt=prompt,
+            reply_channel=reply_channel,
+            server_port=server_port,
+            get_token_fn=get_token_fn,
+            log_path=log_path,
+        )
 
         if running_flag is not None and work.empty():
             running_flag[0] = False
@@ -1698,17 +1731,11 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
                            trigger_flag=None, running_flag=None, data_dir=None,
                            no_restart=False, server_port=8300, get_token_fn=None,
                            scratch_root=CLAUDE_SCRATCH_ROOT):
-    """DORMANT headless Claude relay runner (text-in/text-out, no tools/MCP).
+    """Headless Claude relay runner with direct #general fallback.
 
-    Each queued item must be a valid relay turn (relay_meta with disable_mcp and
-    a non-#general channel). The runner: hard-off-switch check -> channel check
-    -> scratch validate -> sealed ``claude -p ... --tools "" --strict-mcp-config``
-    via stdin (no argv prompt) with a stripped child env -> resolve JSON outcome
-    to reply/marker -> relay EXACTLY ONCE to relay_meta.channel. It never falls
-    back to #general and never parses Claude output as a safety verdict.
-
-    Not reachable unless run_mode == "claude_relay" AND CLAUDE_RELAY_ACTIVATED is
-    True AND the agent is relay-eligible — none of which hold in Phase A.
+    Valid relay turns (relay_meta with disable_mcp and a non-#general channel)
+    use the sealed ``claude -p ... --tools ""`` path. Direct @mentions without
+    relay_meta fall back to ``claude --print`` and reply on the source channel.
     """
     import queue as _queue
     import subprocess
@@ -1722,10 +1749,10 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
 
     work: "_queue.Queue[dict]" = _queue.Queue()
 
-    def _enqueue(text, relay_meta=None):
+    def _enqueue(text, relay_meta=None, channel="", **kwargs):
         if running_flag is not None:
             running_flag[0] = True
-        work.put({"prompt": text, "relay_meta": relay_meta})
+        work.put({"prompt": text, "relay_meta": relay_meta, "channel": channel or "general"})
 
     start_watcher(_enqueue)
 
@@ -1743,17 +1770,32 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
         except Exception as exc:  # noqa: BLE001
             print(f"  > {agent} claude relay failed: {exc}")
 
-    def _process_item(prompt, relay_meta):
+    def _process_item(prompt, relay_meta, channel="general"):
         """Handle one queue item. Uses ``return`` (never ``continue``) so the
         outer loop always reaches its no_restart check — a refusal must not
         leave the loop blocked on an empty queue."""
+        if relay_meta is None:
+            print(f"  > {agent} using direct print-exec fallback for #{channel}")
+            _run_claude_direct_print_turn(
+                command=command,
+                cwd=cwd,
+                env=env,
+                agent=agent,
+                prompt=prompt,
+                reply_channel=channel or "general",
+                server_port=server_port,
+                get_token_fn=get_token_fn,
+                log_path=log_path,
+            )
+            return
+
         # 1. STRICT relay gate (NOT _should_disable_mcp). A full relay turn is
         #    required: relay_mode is True AND disable_mcp is True AND a valid
-        #    non-#general channel. Anything malformed/non-relay is refused with
-        #    NO launch and NO post (fail-closed; never #general).
+        #    non-#general channel. Malformed session relay metadata is refused
+        #    with NO launch (fail-closed; no direct fallback).
         if not _claude_relay_meta_ok(relay_meta):
             print(f"  > {agent} claude refused: invalid/non-relay metadata "
-                  f"(no Claude launch, no #general fallback)")
+                  f"(no Claude launch, no direct fallback)")
             return
 
         # Channel is guaranteed valid (non-empty, non-#general) by the gate above.
@@ -1857,12 +1899,14 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
         if isinstance(item, dict):
             prompt = item.get("prompt", "")
             relay_meta = item.get("relay_meta")
+            channel = item.get("channel", "general")
         else:
             prompt = item
             relay_meta = None
+            channel = "general"
 
         try:
-            _process_item(prompt, relay_meta)
+            _process_item(prompt, relay_meta, channel=channel)
         finally:
             if running_flag is not None and work.empty():
                 running_flag[0] = False
@@ -2115,7 +2159,8 @@ def main():
     # Exec mode runs are stateless fresh contexts with proxy-assigned identity,
     # so the "reclaim your previous identity" hint is never applicable and only
     # provokes an unnecessary chat_claim. Suppress it.
-    _suppress_identity_hint = agent_cfg.get("run_mode", "tui") in ("exec", "store_exec", "print_exec")
+    _suppress_identity_hint = agent_cfg.get("run_mode", "tui") in (
+        "exec", "store_exec", "print_exec", "claude_relay")
     _trigger_flag = [False]  # shared: queue watcher sets True, activity checker reads
     _refresh_interval = 10  # default; overridden per-trigger by server settings
 
