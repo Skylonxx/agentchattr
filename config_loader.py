@@ -35,6 +35,48 @@ SAFE_LOCAL_AGENT_OVERRIDE_KEYS = frozenset({
     "strip_env",
 })
 
+_ALLOWED_ORIGIN_PREFIXES = ("http://", "https://")
+
+
+def validate_allowed_origins_extra(extra) -> list[str]:
+    """Validate explicit extra Origin allowlist entries (exact-match only).
+
+    Rejects wildcards, empty strings, and non-http(s) schemes.
+    """
+    if extra is None:
+        return []
+    if not isinstance(extra, list):
+        raise ValueError("server.allowed_origins_extra must be an array")
+    result: list[str] = []
+    for i, item in enumerate(extra):
+        if not isinstance(item, str):
+            raise ValueError(f"allowed_origins_extra[{i}] must be a string")
+        origin = item.strip()
+        if not origin:
+            raise ValueError(f"allowed_origins_extra[{i}] must not be empty")
+        if "*" in origin:
+            raise ValueError(f"allowed_origins_extra[{i}] must not contain wildcards")
+        if not origin.startswith(_ALLOWED_ORIGIN_PREFIXES):
+            raise ValueError(
+                f"allowed_origins_extra[{i}] must start with http:// or https://",
+            )
+        result.append(origin)
+    return result
+
+
+def build_allowed_origins(cfg: dict) -> frozenset[str]:
+    """Build the strict Origin allowlist for security middleware."""
+    server = cfg.get("server", {}) if isinstance(cfg.get("server"), dict) else {}
+    port = server.get("port", 8300)
+    origins = {
+        f"http://127.0.0.1:{port}",
+        f"http://localhost:{port}",
+    }
+    extra_raw = server.get("allowed_origins_extra", [])
+    for origin in validate_allowed_origins_extra(extra_raw):
+        origins.add(origin)
+    return frozenset(origins)
+
 
 # Mapping: env var name → (config section, key, is_int)
 _ENV_OVERRIDES = [
@@ -154,6 +196,12 @@ def load_config(root: Path | None = None) -> dict:
     with open(config_path, "rb") as f:
         config = tomllib.load(f)
 
+    server = config.get("server")
+    if isinstance(server, dict) and "allowed_origins_extra" in server:
+        config.setdefault("server", {})["allowed_origins_extra"] = (
+            validate_allowed_origins_extra(server["allowed_origins_extra"])
+        )
+
     local_path = root / "config.local.toml"
     if local_path.exists():
         with open(local_path, "rb") as f:
@@ -172,6 +220,21 @@ def load_config(root: Path | None = None) -> dict:
                 config_sandbox = {}
                 config["sandbox"] = config_sandbox
             config_sandbox.update(local_sandbox)
+
+        # Merge [server] — local may override host/port for LAN binding (gitignored).
+        local_server = local.get("server")
+        if isinstance(local_server, dict) and local_server:
+            config_server = config.setdefault("server", {})
+            if not isinstance(config_server, dict):
+                config_server = {}
+                config["server"] = config_server
+            for key in ("host", "port", "data_dir"):
+                if key in local_server:
+                    config_server[key] = local_server[key]
+            if "allowed_origins_extra" in local_server:
+                config_server["allowed_origins_extra"] = validate_allowed_origins_extra(
+                    local_server["allowed_origins_extra"],
+                )
 
     _apply_env_overrides(config)
 

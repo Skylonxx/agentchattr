@@ -140,6 +140,41 @@ class ConfigLoaderLocalAgentOverrideTests(unittest.TestCase):
         self.assertEqual(sandbox["flow_start_max_active"], 2)
         self.assertEqual(sandbox["flow_start_output_root"], "C:/local")
 
+    def test_local_server_allowed_origins_extra_merged_and_validated(self):
+        config, _ = self._load_from_temp(
+            base_toml="""
+            [server]
+            port = 8300
+            host = "127.0.0.1"
+            """,
+            local_toml="""
+            [server]
+            host = "0.0.0.0"
+            allowed_origins_extra = ["http://192.168.1.113:8300"]
+            """,
+        )
+
+        self.assertEqual(config["server"]["host"], "0.0.0.0")
+        self.assertEqual(
+            config["server"]["allowed_origins_extra"],
+            ["http://192.168.1.113:8300"],
+        )
+        origins = config_loader.build_allowed_origins(config)
+        self.assertIn("http://192.168.1.113:8300", origins)
+
+    def test_local_server_rejects_wildcard_allowed_origins_extra(self):
+        with self.assertRaises(ValueError):
+            self._load_from_temp(
+                base_toml="""
+                [server]
+                port = 8300
+                """,
+                local_toml="""
+                [server]
+                allowed_origins_extra = ["*"]
+                """,
+            )
+
     def test_unknown_local_run_mode_remains_subject_to_invariant_guard(self):
         config, _ = self._load_from_temp(
             base_toml="""
@@ -156,6 +191,108 @@ class ConfigLoaderLocalAgentOverrideTests(unittest.TestCase):
         run_mode = config["agents"]["claude"]["run_mode"]
         self.assertEqual(run_mode, "totally_invalid_mode")
         self.assertFalse(safety_invariants.check_run_mode_known(run_mode).ok)
+
+
+def _origin_blocked(origin: str | None, allowed: frozenset[str]) -> bool:
+    """Mirror the middleware origin rejection condition in app.py."""
+    return bool(origin and origin not in allowed)
+
+
+class ValidateAllowedOriginsExtraTests(unittest.TestCase):
+    def test_empty_or_missing_is_allowed(self):
+        self.assertEqual(config_loader.validate_allowed_origins_extra(None), [])
+        self.assertEqual(config_loader.validate_allowed_origins_extra([]), [])
+
+    def test_valid_lan_origin_accepted(self):
+        out = config_loader.validate_allowed_origins_extra(
+            ["http://192.168.1.113:8300"],
+        )
+        self.assertEqual(out, ["http://192.168.1.113:8300"])
+
+    def test_wildcard_rejected(self):
+        with self.assertRaises(ValueError):
+            config_loader.validate_allowed_origins_extra(["*"])
+        with self.assertRaises(ValueError):
+            config_loader.validate_allowed_origins_extra(["http://192.168.*:8300"])
+
+    def test_empty_string_rejected(self):
+        with self.assertRaises(ValueError):
+            config_loader.validate_allowed_origins_extra([""])
+
+    def test_malformed_scheme_rejected(self):
+        with self.assertRaises(ValueError):
+            config_loader.validate_allowed_origins_extra(["ftp://192.168.1.113:8300"])
+
+    def test_non_string_rejected(self):
+        with self.assertRaises(ValueError):
+            config_loader.validate_allowed_origins_extra([8300])
+
+
+class BuildAllowedOriginsTests(unittest.TestCase):
+    def test_default_localhost_only(self):
+        origins = config_loader.build_allowed_origins({"server": {"port": 8300}})
+        self.assertEqual(
+            origins,
+            frozenset({"http://127.0.0.1:8300", "http://localhost:8300"}),
+        )
+
+    def test_configured_lan_origin_allowed(self):
+        origins = config_loader.build_allowed_origins(
+            {
+                "server": {
+                    "port": 8300,
+                    "allowed_origins_extra": ["http://192.168.1.113:8300"],
+                },
+            },
+        )
+        self.assertIn("http://192.168.1.113:8300", origins)
+        self.assertIn("http://127.0.0.1:8300", origins)
+        self.assertIn("http://localhost:8300", origins)
+
+    def test_port_override_reflected_in_defaults(self):
+        origins = config_loader.build_allowed_origins({"server": {"port": 8310}})
+        self.assertIn("http://127.0.0.1:8310", origins)
+        self.assertIn("http://localhost:8310", origins)
+
+    def test_random_unconfigured_origin_rejected(self):
+        origins = config_loader.build_allowed_origins(
+            {
+                "server": {
+                    "port": 8300,
+                    "allowed_origins_extra": ["http://192.168.1.113:8300"],
+                },
+            },
+        )
+        self.assertFalse(_origin_blocked("http://192.168.1.113:8300", origins))
+        self.assertTrue(_origin_blocked("http://192.168.1.244:8300", origins))
+        self.assertTrue(_origin_blocked("http://evil.example:8300", origins))
+
+    def test_localhost_origins_allowed(self):
+        origins = config_loader.build_allowed_origins({"server": {"port": 8300}})
+        self.assertFalse(_origin_blocked("http://127.0.0.1:8300", origins))
+        self.assertFalse(_origin_blocked("http://localhost:8300", origins))
+
+    def test_missing_extra_preserves_default_behavior(self):
+        origins = config_loader.build_allowed_origins({"server": {}})
+        self.assertEqual(len(origins), 2)
+
+    def test_lan_origin_passes_before_token_check(self):
+        origins = config_loader.build_allowed_origins(
+            {
+                "server": {
+                    "port": 8300,
+                    "allowed_origins_extra": ["http://192.168.1.113:8300"],
+                },
+            },
+        )
+        self.assertFalse(_origin_blocked("http://192.168.1.113:8300", origins))
+
+
+class LoadConfigOriginIntegrationTests(unittest.TestCase):
+    def test_repo_local_config_includes_lan_origin(self):
+        config = config_loader.load_config(ROOT)
+        origins = config_loader.build_allowed_origins(config)
+        self.assertIn("http://192.168.1.113:8300", origins)
 
 
 if __name__ == "__main__":

@@ -331,13 +331,11 @@ _PUBLIC_PREFIXES = ("/", "/static/")
 
 def _install_security_middleware(token: str, cfg: dict):
     """Add token validation and origin checking middleware to the app."""
+    from config_loader import build_allowed_origins
+
     import app as _self
     _self.session_token = token
-    port = cfg.get("server", {}).get("port", 8300)
-    allowed_origins = {
-        f"http://127.0.0.1:{port}",
-        f"http://localhost:{port}",
-    }
+    allowed_origins = build_allowed_origins(cfg)
 
     class SecurityMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
