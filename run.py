@@ -54,6 +54,14 @@ def main():
 
     config = load_config(ROOT)
 
+    from build_info import read_build_info
+    build = read_build_info()
+    logging.getLogger(__name__).info(
+        "agentchattr starting version=%s git_commit=%s",
+        build.get("version") or "(unknown)",
+        build.get("git_commit") or "(unknown)",
+    )
+
     # --- Security: generate a random session token (in-memory only) ---
     session_token = secrets.token_hex(32)
 

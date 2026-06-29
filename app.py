@@ -1779,9 +1779,23 @@ async def api_send(request: Request):
 
 @app.get("/api/status")
 async def get_status():
+    from build_info import read_build_info
     status = agents.get_status()
     status["paused"] = any(router.is_paused(ch) for ch in room_settings.get("channels", ["general"]))
+    status.update(read_build_info())
     return status
+
+
+@app.get("/api/health")
+async def health():
+    """Lightweight liveness + build identity (no secrets)."""
+    from build_info import read_build_info
+    info = read_build_info()
+    return {
+        "ok": True,
+        "version": info.get("version", ""),
+        "git_commit": info.get("git_commit", ""),
+    }
 
 
 @app.get("/api/settings")

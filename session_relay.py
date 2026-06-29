@@ -407,15 +407,23 @@ def coordinator_loop_worker_output_contract(role: str, *, workspace_bound: bool 
     if role == "developer":
         lines = [
             "OUTPUT CONTRACT (first non-empty line is authoritative):",
-            "  PROGRESS — still working / running prechecks (not final)",
-            "  BLOCKER: <reason> — hard stop (wrong cwd, HEAD mismatch, forbidden write, etc.)",
-            "  READY_FOR_COORDINATOR — work ready for coordinator routing",
-            "  PASS / PASS_WITH_NOTES / REQUEST_CHANGES / FAIL — developer verdict",
-            "  WORKER_TIMEOUT — infrastructure timeout only (do not use for normal work)",
+            "For progress updates, first line must be exactly:",
+            "  PROGRESS",
+            "For blockers, first line must be:",
+            "  BLOCKER:",
+            "For handoff, first line must be:",
+            "  READY_FOR_COORDINATOR",
+            "For final completion, first line must be one of:",
+            "  PASS",
+            "  PASS_WITH_NOTES",
+            "  REQUEST_CHANGES",
+            "  FAIL",
+            "Infrastructure timeout only (do not use for normal work):",
+            "  WORKER_TIMEOUT",
         ]
         if workspace_bound:
             lines.append(
-                "While running prechecks or reading files, prefix with PROGRESS on line 1."
+                "Legacy plain progress phrases are tolerated, but prefer PROGRESS on line 1."
             )
         return "\n".join(lines)
     if role == "ui_lead":

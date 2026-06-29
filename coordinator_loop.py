@@ -50,17 +50,37 @@ DEVELOPER_RECOGNIZED_TOKENS = frozenset({
     "FAIL",
 })
 
-_PROGRESS_LEGACY_MARKERS = (
-    "starting precheck",
-    "running preflight",
+_PROGRESS_PREFIX_RE = re.compile(
+    r"^(?:starting|running)\s+prechecks?\b",
+    re.IGNORECASE,
+)
+
+_PROGRESS_INDICATOR_MARKERS = (
     "verifying workspace",
-    "verifying git",
-    "git head",
-    "working tree",
+    "checking workspace",
+    "checking git head",
+    "verifying git head",
+    "checking clean working tree",
+    "verifying clean working tree",
+    "working tree status",
+    "clean working tree",
     "reading ",
     "inspecting ",
     "analyzing ",
+    "running preflight",
     "preflight",
+)
+
+_BLOCKER_INDICATOR_MARKERS = (
+    "wrong cwd",
+    "expected head mismatch",
+    "dirty tree",
+    "forbidden write",
+    "policy mismatch",
+    "git write command",
+    "permission denied",
+    "shell escape",
+    "safety_gate block",
 )
 
 
@@ -435,16 +455,33 @@ def on_coordinator_output(state: CoordinatorLoopState, text: str) -> Coordinator
     return _malformed_coordinator(state, "unhandled routing kind")
 
 
-def _looks_like_legacy_progress(first: str) -> bool:
-    """Heuristic for interim worker status lines during long Prompt Memo tasks."""
+def _looks_like_blocker_line(first: str) -> bool:
+    """Heuristic blocker lines — must win over progress normalization."""
     if not first:
+        return False
+    low = first.lower().strip()
+    if low.startswith("blocker:") or low.startswith("blocked:"):
+        return True
+    return any(marker in low for marker in _BLOCKER_INDICATOR_MARKERS)
+
+
+def _looks_like_progress_line(first: str) -> bool:
+    """Case-insensitive interim worker status during long Prompt Memo tasks."""
+    if not first or _looks_like_blocker_line(first):
         return False
     low = first.lower().strip()
     if low in ("progress", "in progress"):
         return True
     if low.startswith("progress:") or low.startswith("progress "):
         return True
-    return any(marker in low for marker in _PROGRESS_LEGACY_MARKERS)
+    if _PROGRESS_PREFIX_RE.match(first.strip()):
+        return True
+    return any(marker in low for marker in _PROGRESS_INDICATOR_MARKERS)
+
+
+def _looks_like_legacy_progress(first: str) -> bool:
+    """Backward-compatible alias for diagnostics and callers."""
+    return _looks_like_progress_line(first)
 
 
 def _normalize_worker_token(first: str) -> str:
@@ -493,7 +530,10 @@ def _parse_developer_verdict(text: str) -> tuple[str, str]:
             return "BLOCKER", reason or first
         return first_norm, _body_after_first_line(text)
 
-    if _looks_like_legacy_progress(first):
+    if _looks_like_blocker_line(first):
+        return "BLOCKER", first if first else _body_after_first_line(text)
+
+    if _looks_like_progress_line(first):
         return "PROGRESS", first if first else _body_after_first_line(text)
 
     return "AMBIGUOUS", first or "empty developer output"
@@ -504,9 +544,9 @@ def _parse_ui_lead_verdict(text: str) -> tuple[str, str]:
     first_norm = _normalize_worker_token(first)
     if first_norm == "WORKER_TIMEOUT":
         return first_norm, _body_after_first_line(text)
-    if first_norm == "PROGRESS" or _looks_like_legacy_progress(first):
+    if first_norm == "PROGRESS" or _looks_like_progress_line(first):
         return "PROGRESS", first if first else _body_after_first_line(text)
-    if first_norm == "BLOCKER":
+    if first_norm == "BLOCKER" or _looks_like_blocker_line(first):
         reason = first[len("BLOCKER:"):].strip() if first.startswith("BLOCKER:") else _body_after_first_line(text)
         return "BLOCKER", reason or first
     if first in ("UX_APPROVED", "REQUEST UX CHANGES", "BLOCKED"):

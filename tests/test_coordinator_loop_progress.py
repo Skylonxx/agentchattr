@@ -6,9 +6,26 @@ import unittest
 
 from coordinator_loop import (
     CoordinatorLoopState,
+    _looks_like_blocker_line,
+    _looks_like_progress_line,
     _parse_developer_verdict,
     build_ambiguous_worker_diagnostic,
     on_worker_output,
+)
+
+PROGRESS_PHRASES = (
+    "Starting prechecks: verifying workspace, git HEAD, and clean working tree.",
+    "Starting prechecks: verifying workspace, Git HEAD, and working tree status.",
+    "Verifying workspace, git head, and clean working tree.",
+    "Running prechecks before analysis.",
+    "PROGRESS",
+)
+
+BLOCKER_PHRASES = (
+    "BLOCKER: expected head mismatch",
+    "wrong cwd during precheck",
+    "dirty tree before analysis",
+    "permission denied while verifying workspace",
 )
 
 
@@ -18,11 +35,44 @@ class DeveloperProgressParsingTests(unittest.TestCase):
         self.assertEqual(token, "PROGRESS")
         self.assertIn("Running prechecks", notes)
 
+    def test_exact_failed_phrase_is_progress(self):
+        text = "Starting prechecks: verifying workspace, git HEAD, and clean working tree."
+        token, notes = _parse_developer_verdict(text)
+        self.assertEqual(token, "PROGRESS")
+        self.assertEqual(notes, text)
+
+    def test_git_head_case_insensitive(self):
+        for phrase in (
+            "Starting prechecks: verifying workspace, Git HEAD, and clean working tree.",
+            "Starting prechecks: verifying workspace, git HEAD, and clean working tree.",
+            "Starting prechecks: verifying workspace, git head, and clean working tree.",
+            "Starting prechecks: verifying workspace, GIT HEAD, and clean working tree.",
+        ):
+            with self.subTest(phrase=phrase):
+                token, _ = _parse_developer_verdict(phrase)
+                self.assertEqual(token, "PROGRESS")
+
+    def test_all_required_progress_phrases(self):
+        for phrase in PROGRESS_PHRASES:
+            with self.subTest(phrase=phrase):
+                token, _ = _parse_developer_verdict(phrase)
+                self.assertEqual(token, "PROGRESS", msg=phrase)
+
     def test_starting_prechecks_legacy_phrase_is_progress(self):
         text = "Starting prechecks: verifying workspace, Git HEAD, and working tree status."
         token, notes = _parse_developer_verdict(text)
         self.assertEqual(token, "PROGRESS")
         self.assertIn("Starting prechecks", notes)
+
+    def test_verifying_workspace_phrase_is_progress(self):
+        token, _ = _parse_developer_verdict(
+            "Verifying workspace, git head, and clean working tree."
+        )
+        self.assertEqual(token, "PROGRESS")
+
+    def test_running_prechecks_phrase_is_progress(self):
+        token, _ = _parse_developer_verdict("Running prechecks before analysis.")
+        self.assertEqual(token, "PROGRESS")
 
     def test_ready_for_coordinator_still_works(self):
         token, _ = _parse_developer_verdict("READY_FOR_COORDINATOR\nDone.\n")
@@ -32,6 +82,14 @@ class DeveloperProgressParsingTests(unittest.TestCase):
         token, notes = _parse_developer_verdict("BLOCKER: wrong cwd\n")
         self.assertEqual(token, "BLOCKER")
         self.assertIn("wrong cwd", notes)
+
+    def test_blocker_phrases_not_progress(self):
+        for phrase in BLOCKER_PHRASES:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(_looks_like_blocker_line(phrase))
+                self.assertFalse(_looks_like_progress_line(phrase))
+                token, _ = _parse_developer_verdict(phrase)
+                self.assertEqual(token, "BLOCKER", msg=phrase)
 
     def test_worker_timeout_still_recognized(self):
         token, _ = _parse_developer_verdict("WORKER_TIMEOUT\ninfra\n")
@@ -54,6 +112,14 @@ class DeveloperProgressRoutingTests(unittest.TestCase):
         state.awaiting_role = "developer"
         return state
 
+    def test_exact_failed_phrase_routes_non_terminal(self):
+        phrase = "Starting prechecks: verifying workspace, git HEAD, and clean working tree."
+        state = self._dev_state()
+        action = on_worker_output(state, "developer", phrase)
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "coordinator")
+        self.assertIn("PROGRESS", action.prompt_context)
+
     def test_progress_routes_to_coordinator_not_terminal(self):
         state = self._dev_state()
         action = on_worker_output(
@@ -75,6 +141,12 @@ class DeveloperProgressRoutingTests(unittest.TestCase):
     def test_blocker_terminates(self):
         state = self._dev_state()
         action = on_worker_output(state, "developer", "BLOCKER: expected HEAD mismatch\n")
+        self.assertTrue(action.is_terminal)
+        self.assertEqual(action.terminal_kind, "blocker")
+
+    def test_heuristic_blocker_terminates(self):
+        state = self._dev_state()
+        action = on_worker_output(state, "developer", "wrong cwd during precheck")
         self.assertTrue(action.is_terminal)
         self.assertEqual(action.terminal_kind, "blocker")
 
