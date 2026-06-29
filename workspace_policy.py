@@ -452,6 +452,10 @@ def _profile_to_policy(profile_id: str, profile: dict[str, Any]) -> dict[str, An
         "report_paths": report_paths,
         "external_report_write_roots": report_roots,
         "analysis_report_only": bool(profile.get("analysis_report_only", False)),
+        "on_demand_snapshots": bool(profile.get("on_demand_snapshots", False)),
+        "suggested_initial_snapshot_paths": list(
+            profile.get("suggested_initial_snapshot_paths") or []
+        ),
         "role_permissions": dict(_default_role_permissions(default_mode)),
         "enforcement": {
             "fail_closed": True,

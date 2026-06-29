@@ -1481,13 +1481,13 @@ def validate_initial_developer_preflight(
     if not (prompt_memo_body or "").strip():
         return False, "BLOCKER: developer initial prompt missing prompt memo"
     if not isinstance(policy, dict):
-        return False, "BLOCKER: developer initial prompt missing source snapshots"
+        return False, "BLOCKER: developer initial prompt missing workspace policy"
     read_paths = [
         p for p in (policy.get("read_paths") or [])
         if isinstance(p, str) and p.strip()
     ]
     if not read_paths:
-        return False, "BLOCKER: developer initial prompt missing source snapshots"
+        return False, "BLOCKER: developer initial prompt missing read path allowlist"
     roots = list(external_report_write_roots or resolve_external_report_write_roots(policy))
     if not roots:
         return False, "BLOCKER: external report write permission not enabled"
@@ -1538,15 +1538,21 @@ def build_initial_developer_report_prompt(
         lines.extend(["", "EXPECTED HEAD:", expected_head])
     lines.extend([
         "",
-        "READ-ONLY SNAPSHOTS:",
-        "agentchattr injects AUTOMATED PRECHECK RESULTS and READ-ONLY FILE SNAPSHOT",
-        "before this turn. Use injected snapshot content only; do not inspect the repo directly.",
+        "ON-DEMAND SOURCE ACCESS:",
+        "agentchattr injects AUTOMATED PRECHECK RESULTS and a SOURCE FILE MANIFEST before this turn.",
+        "File bodies are NOT injected automatically.",
+        "Request specific allowlisted files with SNAPSHOT_REQUEST_BEGIN/END.",
+        "You are running with tools disabled — do not emit <tool_call> XML.",
         "",
-        "Configured snapshot source paths:",
+        "Allowed read paths (manifest includes size + sha256):",
     ])
     for path in read_paths:
         lines.append(f"  - {path}")
     lines.extend([
+        "",
+        "Suggested first snapshot request for PaymentModal analysis:",
+        "  - src/components/PaymentModal.tsx",
+        "  - src/components/PaymentModal.css",
         "",
         "PROMPT MEMO:",
         prompt_memo_body.strip(),
@@ -1554,12 +1560,13 @@ def build_initial_developer_report_prompt(
         "RULES:",
         "- You may write only the external markdown report under allowed Ai-Report roots.",
         "- You may not write inside the Twinpet workspace.",
-        "- Use injected snapshots only.",
+        "- Request source snapshots on demand; do not inspect the repo via tools.",
         "- Do not modify product source, tests, backend files, mobile files, tracker docs, or hidden agent folders.",
         "- Create the report folder if missing.",
         "- Do not emit <tool_call> XML or use Write/Read/Bash tools.",
+        "- To read source files, use SNAPSHOT_REQUEST_BEGIN/END.",
         "- To write your external report, output exactly one REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END block.",
-        "- The worker runtime validates the path and creates the .md file; then your output becomes REPORT_READY.",
+        "- The worker runtime validates paths and returns bounded snapshots; then your output becomes REPORT_READY.",
         "- Do not claim REPORT_READY unless the runtime confirms the report file exists.",
         "- Do not use MCP tools. Do not call chat_read or chat_send.",
         "- Channel carries short status only; the report file is the source of truth.",
@@ -1638,7 +1645,20 @@ def build_initial_developer_report_prompt(
         "  <markdown report body>",
         "  REPORT_FILE_WRITE_END",
     ])
-    return ReportPromptResult(ok=True, prompt="\n".join(lines))
+    prompt = "\n".join(lines)
+    from on_demand_snapshots import get_snapshot_budget
+
+    budget = get_snapshot_budget(None)
+    if len(prompt) > budget.max_initial_prompt_chars:
+        return ReportPromptResult(
+            ok=False,
+            blocker=(
+                "BLOCKER: initial developer prompt exceeds cap\n"
+                f"- initial_prompt_chars: {len(prompt)}\n"
+                f"- max_initial_report_flow_prompt_chars: {budget.max_initial_prompt_chars}"
+            ),
+        )
+    return ReportPromptResult(ok=True, prompt=prompt)
 
 
 def _handoff_max_chars(max_chars: int) -> int:

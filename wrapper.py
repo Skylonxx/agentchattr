@@ -1642,11 +1642,21 @@ def _run_claude_workspace_print_turn(
     from worker_workspace import (
         ReportSaveResult,
         build_docs_only_worker_augmentation,
+        build_on_demand_worker_augmentation,
         is_docs_only_snapshot_mode,
         is_workspace_bound_queue_item,
         load_canonical_policy_for_item,
         run_workspace_precheck,
         try_save_external_analysis_report,
+    )
+    from on_demand_snapshots import (
+        get_snapshot_budget,
+        is_on_demand_snapshot_mode,
+        load_snapshot_state_from_item,
+        parse_snapshot_request,
+        process_snapshot_request,
+        save_snapshot_state_to_item,
+        worker_output_is_terminal_report,
     )
 
     prompt = str(item.get("prompt") or "")
@@ -1672,8 +1682,38 @@ def _run_claude_workspace_print_turn(
 
     policy = load_canonical_policy_for_item(item, data_dir=data_dir)
     work_item = dict(item)
+    on_demand = is_on_demand_snapshot_mode(item, policy, config=config)
 
-    if is_docs_only_snapshot_mode(item, policy):
+    if on_demand:
+        augment, pre_blocker, snap_meta = build_on_demand_worker_augmentation(
+            effective_cwd or default_cwd,
+            item,
+            policy,
+            config=config,
+        )
+        if pre_blocker:
+            print(f"  > {agent} workspace precheck blocked: {pre_blocker[:120]}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port, get_token_fn(), pre_blocker, channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay precheck blocker: {exc}")
+            return
+        if augment:
+            prompt = f"{augment}\n\n{prompt}"
+            work_item["_snapshot_meta"] = {
+                "injected": snap_meta.injected,
+                "file_count": snap_meta.file_count,
+                "paths": snap_meta.paths,
+            }
+            print(
+                f"  > {agent} on-demand manifest injected "
+                f"(manifest_paths={len(snap_meta.paths)}, initial_snapshot_injected=false) "
+                f"-> #{reply_channel}"
+            )
+    elif is_docs_only_snapshot_mode(item, policy, config=config):
         augment, pre_blocker, snap_meta = build_docs_only_worker_augmentation(
             effective_cwd or default_cwd,
             item,
@@ -1710,6 +1750,39 @@ def _run_claude_workspace_print_turn(
         precheck = run_workspace_precheck(effective_cwd or default_cwd, expected_head=expected_head)
         prompt = f"{prompt}\n\n{precheck}"
 
+    budget = get_snapshot_budget(config)
+    if len(prompt) > budget.max_initial_prompt_chars:
+        blocker = (
+            "BLOCKER: initial developer prompt exceeds cap\n"
+            f"- initial_prompt_chars: {len(prompt)}\n"
+            f"- max_initial_report_flow_prompt_chars: {budget.max_initial_prompt_chars}"
+        )
+        print(f"  > {agent} initial prompt blocked: {len(prompt)} chars")
+        if get_token_fn is not None:
+            try:
+                _relay_to_chat(server_port, get_token_fn(), blocker, channel=reply_channel)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  > {agent} failed to relay prompt cap blocker: {exc}")
+        return
+
+    if on_demand:
+        _run_claude_on_demand_snapshot_turn(
+            command=command,
+            cwd=effective_cwd,
+            env=env,
+            agent=agent,
+            prompt=prompt,
+            reply_channel=reply_channel,
+            server_port=server_port,
+            get_token_fn=get_token_fn,
+            log_path=log_path,
+            queue_item=work_item,
+            config=config,
+            data_dir=data_dir,
+            policy=policy,
+        )
+        return
+
     _run_claude_direct_print_turn(
         command=command,
         cwd=effective_cwd,
@@ -1725,10 +1798,222 @@ def _run_claude_workspace_print_turn(
         data_dir=data_dir,
         on_success_save_report=lambda text: _format_report_save_notes(
             try_save_external_analysis_report(text, policy, effective_cwd or default_cwd)
-            if isinstance(policy, dict) and is_docs_only_snapshot_mode(item, policy)
+            if isinstance(policy, dict) and (
+                is_docs_only_snapshot_mode(item, policy, config=config)
+                or on_demand
+            )
             else ReportSaveResult(),
         ),
     )
+
+
+def _run_claude_on_demand_snapshot_turn(
+    *,
+    command,
+    cwd,
+    env,
+    agent,
+    prompt,
+    reply_channel,
+    server_port,
+    get_token_fn,
+    log_path=None,
+    queue_item=None,
+    config=None,
+    data_dir=None,
+    policy=None,
+):
+    """Run Claude with on-demand snapshot request/response loop."""
+    from on_demand_snapshots import (
+        get_snapshot_budget,
+        load_snapshot_state_from_item,
+        parse_snapshot_request,
+        process_snapshot_request,
+        save_snapshot_state_to_item,
+        worker_output_is_terminal_report,
+    )
+
+    budget = get_snapshot_budget(config)
+    work_item = dict(queue_item or {})
+    state = load_snapshot_state_from_item(work_item)
+    current_prompt = prompt
+    final_reply = ""
+
+    wpc = work_item.get("workspace_policy_context") if isinstance(work_item, dict) else {}
+    workspace_profile = ""
+    workspace_mode = ""
+    if isinstance(wpc, dict):
+        workspace_profile = str(wpc.get("policy_id") or "")
+        workspace_mode = str(wpc.get("policy_mode") or "")
+    if isinstance(policy, dict):
+        workspace_profile = workspace_profile or str(policy.get("policy_id") or "")
+        workspace_mode = workspace_mode or str(policy.get("mode") or "")
+
+    for _attempt in range(budget.max_rounds_per_worker + 1):
+        captured, timed_out, errored, returncode = _execute_claude_print_capture(
+            command=command,
+            cwd=cwd,
+            env=env,
+            agent=agent,
+            prompt=current_prompt,
+            reply_channel=reply_channel,
+            log_path=log_path,
+            queue_item=work_item,
+            config=config,
+            data_dir=data_dir,
+        )
+        if timed_out:
+            final_reply = f"[timed out after snapshot turn]"
+            break
+        if errored:
+            final_reply = "[claude --print failed to start]"
+            break
+        if returncode not in (None, 0) and not captured:
+            final_reply = f"[claude --print failed (exit {returncode})]"
+            break
+
+        processed = _process_claude_worker_output(
+            captured,
+            queue_item=work_item,
+            cwd=cwd,
+            data_dir=data_dir,
+        )
+        if worker_output_is_terminal_report(processed) or processed.startswith("BLOCKER:"):
+            final_reply = processed
+            break
+        if parse_snapshot_request(processed) is None:
+            final_reply = (
+                "BLOCKER: worker did not request snapshot or write report\n"
+                "- expected SNAPSHOT_REQUEST_BEGIN/END or REPORT_FILE_WRITE_BEGIN/END"
+            )
+            break
+
+        result = process_snapshot_request(
+            processed,
+            workspace_root=cwd or ".",
+            policy=policy or {},
+            state=state,
+            budget=budget,
+            workspace_profile=workspace_profile,
+            workspace_mode=workspace_mode,
+        )
+        if not result.ok:
+            final_reply = result.blocker
+            break
+
+        state = result.updated_state or state
+        work_item = save_snapshot_state_to_item(work_item, state)
+        current_prompt = (
+            f"{current_prompt}\n\n"
+            f"--- WORKER SNAPSHOT REQUEST ---\n{processed}\n\n"
+            f"{result.response_text}"
+        )
+        print(
+            f"  > {agent} on-demand snapshot round {state.round} "
+            f"(+{result.response_chars} chars, total={state.total_chars}) -> #{reply_channel}"
+        )
+
+    if not final_reply:
+        final_reply = "BLOCKER: snapshot budget exceeded"
+
+    if (
+        not final_reply.startswith("BLOCKER:")
+        and not final_reply.startswith("REPORT_READY")
+        and not final_reply.startswith("REPORT_WRITE_FAILED")
+        and isinstance(policy, dict)
+    ):
+        saved = _format_report_save_notes(
+            try_save_external_analysis_report(final_reply, policy, cwd or ".")
+        )
+        if saved:
+            final_reply = final_reply + "\n\n" + "\n".join(["Report save:", *saved])
+
+    if get_token_fn:
+        try:
+            _relay_to_chat(server_port, get_token_fn(), final_reply, channel=reply_channel)
+            print(f"  > {agent} reply relayed ({len(final_reply)} chars) -> #{reply_channel}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  > {agent} relay failed: {exc}")
+
+
+def _execute_claude_print_capture(
+    *,
+    command,
+    cwd,
+    env,
+    agent,
+    prompt,
+    reply_channel,
+    log_path=None,
+    queue_item=None,
+    config=None,
+    data_dir=None,
+):
+    """Execute one claude --print subprocess; return captured output metadata."""
+    import subprocess
+    from worker_timeout import resolve_claude_print_timeout, subprocess_timeout_for_print
+
+    timeout_secs = resolve_claude_print_timeout(
+        queue_item if isinstance(queue_item, dict) else None,
+        config=config,
+        data_dir=data_dir,
+    )
+    subprocess_timeout = subprocess_timeout_for_print(timeout_secs, config=config)
+    cmd, stdin_payload = _build_claude_print_command(command, prompt, use_stdin=True)
+    print(
+        f"  > {agent} direct print-exec triggered ({len(prompt)} chars, "
+        f"timeout={timeout_secs}s) -> #{reply_channel}"
+    )
+
+    timed_out = False
+    errored = False
+    proc = None
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            input=stdin_payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=subprocess_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        print(f"  > {agent} direct print-exec timed out ({timeout_secs}s)")
+    except Exception as exc:  # noqa: BLE001
+        errored = True
+        print(f"  > {agent} direct print-exec error: {exc}")
+
+    captured = ""
+    stderr_text = ""
+    returncode = None
+    if proc is not None:
+        returncode = proc.returncode
+        print(f"  > {agent} direct print-exec finished (exit {proc.returncode})")
+        captured = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+
+    if log_path:
+        try:
+            with open(log_path, "ab") as lf:
+                header = (
+                    f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} direct print-exec ===\n"
+                    f"channel={reply_channel} prompt_len={len(prompt)} timeout={timeout_secs}s\n"
+                )
+                lf.write(header.encode("utf-8", "replace"))
+                if captured:
+                    lf.write(b"stdout: ")
+                    lf.write(captured.encode("utf-8", "replace"))
+                    lf.write(b"\n")
+                if stderr_text:
+                    lf.write(b"stderr: ")
+                    lf.write(stderr_text.encode("utf-8", "replace"))
+                    lf.write(b"\n")
+        except Exception:
+            pass
+
+    return captured, timed_out, errored, returncode
 
 
 def _run_claude_direct_print_turn(

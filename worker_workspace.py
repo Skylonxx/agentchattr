@@ -143,8 +143,14 @@ def is_workspace_bound_queue_item(item: dict[str, Any] | None) -> bool:
 def is_docs_only_snapshot_mode(
     item: dict[str, Any] | None,
     policy: dict[str, Any] | None,
+    *,
+    config: dict | None = None,
 ) -> bool:
-    """True when worker should receive automated precheck + file snapshots."""
+    """True when worker should receive automated precheck + full file snapshots."""
+    from on_demand_snapshots import is_on_demand_snapshot_mode
+
+    if is_on_demand_snapshot_mode(item, policy, config=config):
+        return False
     if isinstance(item, dict):
         relay_meta = item.get("relay_meta")
         if isinstance(relay_meta, dict) and relay_meta.get("handoff_repair"):
@@ -449,6 +455,70 @@ def run_workspace_precheck(cwd: str | Path, *, expected_head: str = "") -> str:
     """Legacy text-only precheck (non-blocking). Prefer run_workspace_precheck_structured."""
     result = run_workspace_precheck_structured(cwd, expected_head=expected_head)
     return result.text
+
+
+def build_on_demand_worker_augmentation(
+    cwd: str | Path,
+    item: dict[str, Any],
+    policy: dict[str, Any] | None,
+    *,
+    config: dict | None = None,
+) -> tuple[str | None, str | None, SnapshotMeta]:
+    """Precheck + source manifest only (no automatic file body injection)."""
+    from on_demand_snapshots import (
+        build_on_demand_snapshot_contract,
+        build_source_file_manifest,
+        get_snapshot_budget,
+    )
+
+    wpc = item.get("workspace_policy_context") if isinstance(item, dict) else {}
+    if not isinstance(wpc, dict):
+        wpc = {}
+    if not isinstance(policy, dict):
+        return None, "BLOCKER: workspace policy snapshot missing", SnapshotMeta()
+
+    workspace = policy.get("workspace") or {}
+    expected_head = str(workspace.get("expected_head") or "")
+    profile = str(policy.get("policy_id") or wpc.get("policy_id") or "")
+    mode = str(policy.get("mode") or wpc.get("policy_mode") or "")
+
+    pre = run_workspace_precheck_structured(
+        cwd,
+        expected_head=expected_head,
+        policy=policy,
+        workspace_profile=profile,
+        workspace_mode=mode,
+    )
+    if not pre.ok:
+        return None, pre.blocker, SnapshotMeta()
+
+    read_paths = list(policy.get("read_paths") or [])
+    manifest_text, manifest_count = build_source_file_manifest(cwd, read_paths)
+    suggested = list(policy.get("suggested_initial_snapshot_paths") or [
+        "src/components/PaymentModal.tsx",
+        "src/components/PaymentModal.css",
+    ])
+    contract = build_on_demand_snapshot_contract(suggested_paths=suggested)
+    budget = get_snapshot_budget(config)
+    pre_text = pre.text.replace(
+        "Analyze ONLY from AUTOMATED PRECHECK RESULTS and READ-ONLY FILE SNAPSHOT below.",
+        "Analyze from AUTOMATED PRECHECK RESULTS and on-demand snapshots you request.",
+    ).replace(
+        "- If the snapshot is insufficient, return: BLOCKER: insufficient snapshot",
+        "- If you need source content, request snapshots via SNAPSHOT_REQUEST_BEGIN/END.",
+    )
+    sections = [
+        pre_text,
+        "",
+        manifest_text,
+        "",
+        contract,
+        "",
+        f"- max_snapshot_rounds_per_worker: {budget.max_rounds_per_worker}",
+        f"- max_total_snapshot_chars_per_worker: {budget.max_total_chars_per_worker}",
+        f"- manifest_paths: {manifest_count}",
+    ]
+    return "\n".join(sections), None, SnapshotMeta(injected=False, file_count=0, paths=read_paths)
 
 
 def build_docs_only_worker_augmentation(

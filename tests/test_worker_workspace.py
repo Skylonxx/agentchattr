@@ -95,7 +95,18 @@ class WorkspaceBoundItemTests(unittest.TestCase):
     def test_docs_only_snapshot_mode(self):
         session = _analysis_session_record()
         item = _analysis_queue_item()
-        self.assertTrue(is_docs_only_snapshot_mode(item, session["workspace_policy"]))
+        config = config_loader.load_config(ROOT)
+        self.assertFalse(
+            is_docs_only_snapshot_mode(item, session["workspace_policy"], config=config)
+        )
+
+    def test_legacy_read_only_without_on_demand_uses_full_snapshots(self):
+        session = _analysis_session_record()
+        item = _analysis_queue_item()
+        policy = dict(session["workspace_policy"])
+        policy["on_demand_snapshots"] = False
+        policy["analysis_report_only"] = False
+        self.assertTrue(is_docs_only_snapshot_mode(item, policy))
 
     def test_handoff_repair_skips_snapshot_injection(self):
         session = _analysis_session_record()

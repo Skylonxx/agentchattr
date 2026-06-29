@@ -288,6 +288,13 @@ scoped_write_external_cwd_enabled = true
 # Report-orchestrated coordinator flow (Prompt Memo / read-only analysis).
 [report_orchestration]
 max_report_prompt_chars = 120000
+on_demand_snapshots_enabled = true
+max_initial_report_flow_prompt_chars = 50000
+max_snapshot_request_paths = 3
+max_snapshot_response_chars = 60000
+max_snapshot_rounds_per_worker = 4
+max_total_snapshot_chars_per_worker = 120000
+max_single_file_snapshot_chars = 45000
 
 # Claude --print worker timeouts for session / Prompt Memo turns.
 [session_worker_timeouts]
@@ -322,19 +329,20 @@ allowed_modes = ["read-only"]
 default_mode = "read-only"
 max_mode = "read-only"
 analysis_report_only = true
+on_demand_snapshots = true
 require_git_repo = true
 expected_head = "752ed1317a5e0b83b872d563cda451c7621ed22e"
 default_read_paths = [
   "src/components/PaymentModal.tsx",
   "src/components/PaymentModal.css",
-  "src/hooks/useCheckout.ts",
+  "src/pages/POSPage.tsx",
   "src/hooks/pos/useCheckout.ts",
   "src/lib/pos/asyncCheckout.ts",
   "src/lib/pos/cartUtils.ts",
-  "tests/pos-human-checkout.spec.ts",
-  "Task.md",
-  "Context.md",
-  "docs/reports/latest-report.md",
+]
+suggested_initial_snapshot_paths = [
+  "src/components/PaymentModal.tsx",
+  "src/components/PaymentModal.css",
 ]
 default_report_paths = [
   "C:/Users/Narachat/OneDrive/Ai-Report/claude/twinpet-ui-09-c-payment-modal-analysis-report.md",

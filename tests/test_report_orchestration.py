@@ -507,8 +507,9 @@ class InitialDeveloperPromptTests(unittest.TestCase):
             external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
-        self.assertIn("READ-ONLY SNAPSHOTS:", result.prompt)
+        self.assertIn("ON-DEMAND SOURCE ACCESS", result.prompt)
         self.assertIn("PaymentModal.tsx", result.prompt)
+        self.assertIn("SNAPSHOT_REQUEST_BEGIN", result.prompt)
 
     def test_initial_developer_includes_expected_report_path(self):
         result = build_report_orchestrated_dispatch_prompt(
@@ -602,7 +603,7 @@ class InitialDeveloperPromptTests(unittest.TestCase):
             expected_output_path=self.report_path,
         )
         self.assertFalse(ok)
-        self.assertEqual(blocker, "BLOCKER: developer initial prompt missing source snapshots")
+        self.assertEqual(blocker, "BLOCKER: developer initial prompt missing read path allowlist")
 
     def test_missing_prompt_memo_blocks_with_clear_diagnostic(self):
         ok, blocker = validate_initial_developer_preflight(
