@@ -795,7 +795,8 @@ class ReportOrchestratedWorkerDispatchTests(CoordinatorLoopEngineTestBase):
         self.assertTrue(wpc.get("skip_snapshot_injection"))
         prompt = relay.get("prompt") or ""
         self.assertIn("MODE: Handoff block repair", prompt)
-        self.assertLess(len(prompt), 20_000)
+        self.assertIn("CURRENT REPORT CONTEXT", prompt)
+        self.assertLess(len(prompt), 75_000)
         from worker_workspace import is_docs_only_snapshot_mode
         self.assertFalse(is_docs_only_snapshot_mode(relay, _policy))
 

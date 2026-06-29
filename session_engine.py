@@ -1821,12 +1821,15 @@ class SessionEngine:
             cls.handoff_repair_rounds = rounds
             log.info(
                 "Session %d: handoff repair dispatch role=%s round=%d "
-                "handoff_repair_prompt_chars=%d snapshots_injected=false "
+                "handoff_repair_prompt_chars=%d report_context_chars=%d "
+                "report_context_injected=%s snapshots_injected=false "
                 "report_path=%s missing_blocks=%s repair_round=%d",
                 session["id"],
                 repair_owner,
                 rounds[repair_owner],
                 len(prompt),
+                int(getattr(result, "handoff_repair_report_context_chars", 0) or 0),
+                "true" if getattr(result, "handoff_repair_report_context_injected", False) else "false",
                 str((worker_ctx.get("report_paths_by_role") or {}).get(repair_owner) or ""),
                 getattr(result, "handoff_repair_missing_blocks", []),
                 rounds[repair_owner],

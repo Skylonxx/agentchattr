@@ -280,6 +280,7 @@ class ReportReadAndIngestTests(unittest.TestCase):
             phase="UX",
             subject="review",
             max_chars=1000,
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
@@ -405,6 +406,7 @@ class ReportPromptConstructionTests(unittest.TestCase):
             phase="UX",
             subject="review",
             max_chars=1000,
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
@@ -414,9 +416,13 @@ class ReportPromptConstructionTests(unittest.TestCase):
         self.assertIn(HANDOFF_FOR_AGY_BEGIN, result.prompt)
         self.assertIn("REPORT_FILE_WRITE_BEGIN", result.prompt)
         self.assertIn("Do not request source snapshots", result.prompt)
+        self.assertIn("CURRENT REPORT CONTEXT", result.prompt)
+        self.assertIn("# Dev", result.prompt)
+        self.assertIn("Do not emit <tool_call> XML", result.prompt)
         self.assertNotIn("REPORT CONTENT:", result.prompt)
         self.assertNotIn("READ-ONLY SNAPSHOTS:", result.prompt)
-        self.assertLess(len(result.prompt), 20_000)
+        self.assertTrue(result.handoff_repair_report_context_injected)
+        self.assertLess(len(result.prompt), 75_000)
 
     def test_oversized_handoff_routes_handoff_rewrite(self):
         big_handoff = "x" * 5000
@@ -434,6 +440,7 @@ class ReportPromptConstructionTests(unittest.TestCase):
             phase="UX",
             subject="review",
             max_chars=1000,
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
@@ -1192,6 +1199,78 @@ class HandoffRepairPromptTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.roots = [self.tmp]
 
+    def test_handoff_repair_includes_bounded_report_content(self):
+        bare = Path(self.tmp) / "bare.md"
+        body = "# Dev\nPaymentModal analysis\nFindings here."
+        bare.write_text(body, encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(bare)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertTrue(result.handoff_repair_report_context_injected)
+        self.assertIn("CURRENT REPORT CONTEXT", result.prompt)
+        self.assertIn("PaymentModal analysis", result.prompt)
+        self.assertGreater(result.handoff_repair_report_context_chars, 0)
+
+    def test_handoff_repair_forbids_tool_calls(self):
+        bare = Path(self.tmp) / "bare.md"
+        bare.write_text("# Dev\nNo handoff", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(bare)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertIn("Do not emit <tool_call> XML", result.prompt)
+        self.assertIn("Do not attempt to read files", result.prompt)
+        self.assertNotIn("READ-ONLY SNAPSHOTS:", result.prompt)
+
+    def test_missing_report_file_blocks_handoff_repair(self):
+        from report_orchestration import build_handoff_repair_result
+
+        missing = str(Path(self.tmp) / "gone.md")
+        result = build_handoff_repair_result(
+            owner_role="developer",
+            report_path=missing,
+            missing_blocks=[f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}"],
+            allowed_roots=self.roots,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("handoff repair report context unavailable", result.blocker.lower())
+
+    def test_oversized_report_uses_excerpt_context(self):
+        from report_orchestration import (
+            DEFAULT_MAX_HANDOFF_REPAIR_REPORT_CONTEXT_CHARS,
+            build_bounded_handoff_repair_report_context,
+        )
+
+        huge = "# Title\n" + ("analysis paragraph. " * 5000)
+        context, mode = build_bounded_handoff_repair_report_context(
+            huge,
+            max_chars=DEFAULT_MAX_HANDOFF_REPAIR_REPORT_CONTEXT_CHARS,
+        )
+        self.assertEqual(mode, "excerpt")
+        self.assertLessEqual(len(context), DEFAULT_MAX_HANDOFF_REPAIR_REPORT_CONTEXT_CHARS)
+        self.assertIn("REPORT EXCERPT", context)
+        self.assertIn("# Title", context)
+
     def test_handoff_repair_lists_exact_missing_block_names(self):
         bare = Path(self.tmp) / "bare.md"
         bare.write_text("# Dev\nNo handoff blocks", encoding="utf-8")
@@ -1206,13 +1285,14 @@ class HandoffRepairPromptTests(unittest.TestCase):
             project="twinpet",
             phase="UX",
             subject="review",
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.handoff_repair)
         self.assertIn(f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}", result.prompt)
         self.assertIn(HANDOFF_FOR_CODEX_REVIEWER_BEGIN, result.prompt)
         self.assertIn(HANDOFF_FOR_CODEX_REVIEWER_END, result.prompt)
 
-    def test_handoff_repair_prompt_bounded_size(self):
+    def test_handoff_repair_prompt_respects_hard_cap(self):
         bare = Path(self.tmp) / "bare.md"
         bare.write_text("# Dev\n" + ("x" * 50_000), encoding="utf-8")
         ingest = ingest_worker_report_output(
@@ -1226,10 +1306,12 @@ class HandoffRepairPromptTests(unittest.TestCase):
             project="twinpet",
             phase="UX",
             subject="review",
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
-        self.assertLess(len(result.prompt), 20_000)
-        self.assertNotIn("x" * 1000, result.prompt)
+        self.assertLess(len(result.prompt), 75_000)
+        self.assertIn("CURRENT REPORT CONTEXT", result.prompt)
+        self.assertIn("# Dev", result.prompt)
 
     def test_repair_limit_blocker_format(self):
         from report_orchestration import format_handoff_repair_limit_blocker
