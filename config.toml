@@ -339,6 +339,12 @@ default_read_paths = [
 default_report_paths = [
   "C:/Users/Narachat/OneDrive/Ai-Report/claude/twinpet-ui-09-c-payment-modal-analysis-report.md",
 ]
+default_external_report_write_roots = [
+  "C:/Users/Narachat/OneDrive/Ai-Report",
+  "C:/Users/Narachat/OneDrive/Ai-Report/claude",
+  "C:/Users/Narachat/OneDrive/Ai-Report/agy",
+  "C:/Users/Narachat/OneDrive/Ai-Report/codex",
+]
 default_forbidden_paths = [
   "src/**",
   "tests/**",

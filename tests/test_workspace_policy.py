@@ -80,6 +80,26 @@ class ValidPolicyTests(unittest.TestCase):
         self.assertEqual(result.policy["workspace"]["root"], EXAMPLE_ROOT)
         self.assertEqual(result.policy["write_files"], [])
 
+    def test_read_only_analysis_requires_external_report_write_roots(self):
+        policy = {
+            "schema_version": 1,
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "workspace": {"root": EXAMPLE_ROOT, "expected_head": None, "require_git_repo": False},
+            "read_paths": [EXAMPLE_ROOT],
+            "write_files": [],
+            "forbidden_paths": [],
+            "forbidden_commands": [],
+            "git_permissions": wp._default_git_permissions(),
+            "report_paths": ["C:/Users/Narachat/OneDrive/Ai-Report/claude/x.md"],
+            "external_report_write_roots": [],
+            "role_permissions": wp._default_role_permissions("read-only"),
+            "enforcement": {"fail_closed": True},
+        }
+        result = wp.validate_resolved_policy(policy)
+        self.assertFalse(result.ok)
+        self.assertTrue(any("external_report_write_roots" in e for e in result.errors))
+
     def test_valid_docs_only_policy_with_exact_docs_files(self):
         result = wp.resolve_workspace_policy(
             profiles=_example_profiles(),

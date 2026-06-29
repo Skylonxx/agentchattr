@@ -240,6 +240,35 @@ class SessionEngineEnrichTests(unittest.TestCase):
         self.assertIsNotNone(summary["hash"])
         self.assertEqual(summary["version"], 1)
 
+    def test_enrich_exposes_external_report_write_allowlist(self):
+        profiles = config_loader.get_workspace_profiles(config_loader.load_config(ROOT))
+        result = wp.resolve_session_workspace_policy(
+            profiles=profiles,
+            start_body={
+                "workspace_profile": "twinpet-ui-09-c-payment-modal-analysis",
+                "workspace_mode": "read-only-analysis",
+            },
+        )
+        self.assertTrue(result.ok, result.errors)
+        policy_fields = wp.build_session_workspace_policy_fields(result.policy)
+        session = {
+            "id": 2,
+            "template_id": "test-template",
+            "channel": "general",
+            "cast": {},
+            "current_phase": 0,
+            "current_turn": 0,
+            **policy_fields,
+        }
+        store = MagicMock()
+        store.get_template.return_value = _minimal_template()
+        engine = SessionEngine(store, MagicMock(), MagicMock())
+        enriched = engine._enrich(session)
+        summary = enriched["workspace_policy_summary"]
+        self.assertEqual(summary["write_files_count"], 0)
+        self.assertGreater(summary["external_report_write_roots_count"], 0)
+        self.assertTrue(summary["report_write_permission_ok"])
+
 
 class ConfigProfileTests(unittest.TestCase):
     def test_get_workspace_profiles_from_config(self):
@@ -307,6 +336,39 @@ class RuntimeSafetyTests(unittest.TestCase):
         git = result.policy["git_permissions"]
         for key in wp.GIT_WRITE_KEYS:
             self.assertFalse(git.get(key), f"git write {key} must stay disabled in Phase 2")
+
+
+class ReportFlowPreflightTests(unittest.TestCase):
+    def test_init_coordinator_loop_blocks_when_report_write_permission_missing(self):
+        profiles = config_loader.get_workspace_profiles(config_loader.load_config(ROOT))
+        result = wp.resolve_session_workspace_policy(
+            profiles=profiles,
+            start_body={
+                "workspace_profile": "twinpet-ui-09-c-payment-modal-analysis",
+                "workspace_mode": "read-only-analysis",
+            },
+        )
+        self.assertTrue(result.ok, result.errors)
+        broken_policy = dict(result.policy)
+        broken_policy["external_report_write_roots"] = []
+        session = {
+            "id": 9,
+            "template_id": "test-template",
+            "channel": "policy-test",
+            "goal": "report flow",
+            "prompt_id": "TEST-REPORT-FLOW",
+            "workspace_policy": broken_policy,
+        }
+        store = MagicMock()
+        store.get_template.return_value = _minimal_template()
+        trigger = MagicMock()
+        messages = MagicMock()
+        engine = SessionEngine(store, trigger, messages)
+        engine._init_coordinator_loop(session, "report flow")
+        store.interrupt.assert_called_once()
+        args = store.interrupt.call_args[0]
+        self.assertEqual(args[0], 9)
+        self.assertIn("external report write permission not enabled", args[1])
 
 
 if __name__ == "__main__":

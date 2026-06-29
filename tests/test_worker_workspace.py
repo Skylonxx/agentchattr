@@ -323,6 +323,7 @@ class ReadOnlyAnalysisPolicyTests(unittest.TestCase):
         self.assertEqual(policy["mode"], "read-only")
         self.assertEqual(policy.get("write_files") or [], [])
         self.assertTrue(policy.get("analysis_report_only"))
+        self.assertGreater(len(policy.get("external_report_write_roots") or []), 0)
 
     def test_read_only_analysis_mode_alias(self):
         self.assertEqual(wp.normalize_workspace_mode("read-only-analysis"), "read-only")
@@ -420,6 +421,8 @@ class PromptContractTests(unittest.TestCase):
         self.assertIn("no tools", prompt.lower())
         self.assertIn("tool_call", prompt)
         self.assertIn("No Twinpet repo writes", prompt)
+        self.assertIn("EXTERNAL REPORT WRITE ALLOWLIST", prompt)
+        self.assertIn("Write your report to the exact expected path", prompt)
 
 
 class TwinpetSmokeTests(unittest.TestCase):

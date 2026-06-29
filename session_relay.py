@@ -672,6 +672,7 @@ def build_scoped_write_worker_prompt(
     write_files = list(policy.get("write_files") or [])
     read_paths = list(policy.get("read_paths") or [])
     report_paths = list(policy.get("report_paths") or [])
+    report_roots = list(policy.get("external_report_write_roots") or [])
     forbidden = list(policy.get("forbidden_paths") or [])
     expected_head = workspace.get("expected_head") or ""
     mode = policy.get("mode") or ""
@@ -707,13 +708,20 @@ def build_scoped_write_worker_prompt(
         for rp in read_paths:
             lines.append(f"  - {rp}")
 
-    if report_paths and fs == "write_allowlist":
+    if report_paths and (fs == "write_allowlist" or mode == "read-only"):
         lines.extend([
             "",
             "REPORT OUTPUT PATHS (write final report here when instructed):",
         ])
         for rp in report_paths:
             lines.append(f"  - {rp}")
+    if report_roots and mode == "read-only":
+        lines.extend([
+            "",
+            "EXTERNAL REPORT WRITE ALLOWLIST:",
+        ])
+        for root_path in report_roots:
+            lines.append(f"  - {root_path}")
 
     if fs == "write_allowlist":
         if mode == "implementation":
@@ -768,8 +776,11 @@ def build_scoped_write_worker_prompt(
                 "SNAPSHOT MODE: agentchattr injects AUTOMATED PRECHECK RESULTS and",
                 "READ-ONLY FILE SNAPSHOT before this turn. You have no tools.",
                 "Analyze from injected snapshots only.",
-                "Save your final analysis as a markdown report under allowed Ai-Report paths.",
-                "Return REPORT_READY with the saved .md path (or REPORT_BEGIN/REPORT_END for inline save).",
+                "You are allowed to write markdown report files only under the configured external Ai-Report report paths.",
+                "You are not allowed to write inside the Twinpet workspace.",
+                "Create the report folder if missing.",
+                "Write your report to the exact expected path.",
+                "Then return REPORT_READY with the report path.",
                 "Channel carries short status only; the report file is the source of truth.",
             ])
     else:
@@ -1037,8 +1048,15 @@ def coordinator_loop_worker_output_contract(
             "  coordinator / developer / ui_lead / reviewer / safety_gate\n\n"
             "Notes:\n"
             "  <short notes>\n\n"
-            "If you cannot save a report file, you may use REPORT_BEGIN/REPORT_END inline; "
-            "agentchattr will save to the configured external path."
+            "If you cannot write the report file despite permission being configured, return:\n"
+            "  REPORT_WRITE_FAILED\n\n"
+            "Reason:\n"
+            "  <short reason>\n\n"
+            "Expected report:\n"
+            "  <path>\n\n"
+            "Status:\n"
+            "  FAIL\n\n"
+            "REPORT_BEGIN/REPORT_END remains emergency fallback only; do not use it as the normal path."
         )
     if role == "developer":
         lines = [

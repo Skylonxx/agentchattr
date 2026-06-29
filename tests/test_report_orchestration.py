@@ -18,10 +18,12 @@ from report_orchestration import (
     is_report_orchestrated_policy,
     is_twinpet_repo_path,
     parse_report_ready,
+    parse_report_write_failed,
     read_report_file,
     report_content_fits_prompt,
     save_inline_report_to_path,
     validate_report_path,
+    verify_report_write_permission,
 )
 from session_relay import coordinator_loop_worker_output_contract
 
@@ -56,6 +58,18 @@ class ReportReadyParsingTests(unittest.TestCase):
         self.assertEqual(parsed.status, "PASS")
         self.assertEqual(parsed.report_path, r"C:\x\report.md")
         self.assertEqual(parsed.summary, "short summary")
+
+    def test_parse_report_write_failed(self):
+        parsed = parse_report_write_failed(
+            "REPORT_WRITE_FAILED\n\n"
+            "Reason:\ndenied\n\n"
+            "Expected report:\nC:\\x\\report.md\n\n"
+            "Status:\nFAIL\n"
+        )
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed.reason, "denied")
+        self.assertEqual(parsed.expected_report_path, r"C:\x\report.md")
 
 
 class ReportPathValidationTests(unittest.TestCase):
@@ -133,6 +147,18 @@ class ReportReadAndIngestTests(unittest.TestCase):
         self.assertFalse(ingest.ok)
         self.assertIn("not found", ingest.blocker)
 
+    def test_report_write_failed_blocks(self):
+        ingest = ingest_worker_report_output(
+            "developer",
+            "REPORT_WRITE_FAILED\n\n"
+            "Reason:\npermission denied\n\n"
+            f"Expected report:\n{self.path}\n\n"
+            "Status:\nFAIL\n",
+            allowed_roots=self.roots,
+        )
+        self.assertFalse(ingest.ok)
+        self.assertIn("external report write failed", ingest.blocker)
+
     def test_report_too_large_blocks_not_chunks(self):
         huge = Path(self.tmp) / "huge.md"
         huge.write_text("x" * 5000, encoding="utf-8")
@@ -165,6 +191,17 @@ class ReportReadAndIngestTests(unittest.TestCase):
         self.assertTrue(ingest.ok)
         self.assertTrue(Path(target).is_file())
 
+    def test_no_host_save_as_default_path(self):
+        target = str(Path(self.tmp) / "missing-default.md")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(target),
+            allowed_roots=self.roots,
+            expected_report_paths=[target],
+        )
+        self.assertFalse(ingest.ok)
+        self.assertIn("not found", ingest.blocker)
+
 
 class ReportPromptConstructionTests(unittest.TestCase):
     def setUp(self):
@@ -193,11 +230,14 @@ class ReportPromptConstructionTests(unittest.TestCase):
             project="twinpet",
             phase="UX",
             subject="review",
+            expected_output_path=str(Path(self.tmp) / "agy-out.md"),
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
         self.assertIn("REPORT CONTENT:", result.prompt)
         self.assertIn("PaymentModal analysis", result.prompt)
         self.assertIn("TO: AGY UI Lead", result.prompt)
+        self.assertIn("EXPECTED REPORT OUTPUT PATH", result.prompt)
 
     def test_reviewer_prompt_contains_developer_and_agy(self):
         result = build_report_orchestrated_dispatch_prompt(
@@ -206,12 +246,15 @@ class ReportPromptConstructionTests(unittest.TestCase):
             project="twinpet",
             phase="Review",
             subject="codex review",
+            expected_output_path=str(Path(self.tmp) / "codex-out.md"),
+            external_report_write_roots=self.roots,
         )
         self.assertTrue(result.ok)
         self.assertIn("PaymentModal analysis", result.prompt)
         self.assertIn("UX notes", result.prompt)
         self.assertIn("TO: Codex Reviewer", result.prompt)
         self.assertIn("do not inspect repository files", result.prompt.lower())
+        self.assertIn("REPORT_WRITE_FAILED", result.prompt)
 
     def test_reviewer_blocks_without_developer_report(self):
         result = build_report_orchestrated_dispatch_prompt(
@@ -284,6 +327,21 @@ class ReportOrchestrationCoordinatorLoopTests(unittest.TestCase):
             report_orchestrated=True,
         )
         self.assertIn("REPORT_READY", contract)
+        self.assertIn("REPORT_WRITE_FAILED", contract)
+
+    def test_preflight_blocks_when_report_write_permission_missing(self):
+        policy = _analysis_policy()
+        policy = dict(policy)
+        policy["external_report_write_roots"] = []
+        ok, blocker = verify_report_write_permission(policy)
+        self.assertFalse(ok)
+        self.assertIn("not enabled", blocker)
+
+    def test_preflight_passes_when_report_write_permission_configured(self):
+        policy = _analysis_policy()
+        ok, blocker = verify_report_write_permission(policy)
+        self.assertTrue(ok)
+        self.assertEqual(blocker, "")
 
 
 class ReportOrchestrationRoutingTests(unittest.TestCase):

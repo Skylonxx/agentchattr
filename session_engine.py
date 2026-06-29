@@ -29,6 +29,7 @@ from report_orchestration import (
     DEFAULT_MAX_REPORT_PROMPT_CHARS,
     build_report_orchestrated_dispatch_prompt,
     is_report_orchestrated_policy,
+    verify_report_write_permission,
 )
 
 log = logging.getLogger(__name__)
@@ -370,7 +371,19 @@ class SessionEngine:
         policy = session.get("workspace_policy") if isinstance(session.get("workspace_policy"), dict) else {}
         channel = str(session.get("channel") or "general")
         report_paths = list(policy.get("report_paths") or [])
-        ai_base = r"C:\Users\Narachat\OneDrive\Ai-Report"
+        report_roots = list(policy.get("external_report_write_roots") or [])
+        ai_base = next(
+            (root for root in report_roots if str(root).replace("\\", "/").lower().endswith("/ai-report")),
+            r"C:\Users\Narachat\OneDrive\Ai-Report",
+        )
+        agy_root = next(
+            (root for root in report_roots if str(root).replace("\\", "/").lower().endswith("/ai-report/agy")),
+            f"{ai_base}\\agy",
+        )
+        codex_root = next(
+            (root for root in report_roots if str(root).replace("\\", "/").lower().endswith("/ai-report/codex")),
+            f"{ai_base}\\codex",
+        )
         return {
             "workspace_policy": policy,
             "policy_id": policy.get("policy_id"),
@@ -378,12 +391,12 @@ class SessionEngine:
             "prompt_id": session.get("prompt_id"),
             "has_prompt_body": bool(str(session.get("prompt_body") or "").strip()),
             "report_paths": report_paths,
-            "allowed_report_roots": list(DEFAULT_ALLOWED_REPORT_ROOTS),
+            "allowed_report_roots": report_roots,
             "max_report_prompt_chars": DEFAULT_MAX_REPORT_PROMPT_CHARS,
             "report_paths_by_role": {
                 "developer": report_paths[0] if report_paths else "",
-                "ui_lead": f"{ai_base}\\agy\\{channel}-ux-review.md",
-                "reviewer": f"{ai_base}\\codex\\{channel}-codex-review.md",
+                "ui_lead": f"{agy_root}\\{channel}-ux-review.md",
+                "reviewer": f"{codex_root}\\{channel}-codex-review.md",
             },
         }
 
@@ -1340,6 +1353,21 @@ class SessionEngine:
         policy = session.get("workspace_policy") or {}
         budget = resolve_loop_budget_from_session(session)
         report_orchestrated = is_report_orchestrated_policy(policy)
+        if report_orchestrated:
+            worker_ctx = self._worker_context_from_session(session)
+            by_role = worker_ctx.get("report_paths_by_role") or {}
+            expected_paths = list(policy.get("report_paths") or [])
+            for role in ("developer", "ui_lead", "reviewer"):
+                path = str(by_role.get(role) or "").strip() if isinstance(by_role, dict) else ""
+                if path:
+                    expected_paths.append(path)
+            ok, blocker = verify_report_write_permission(
+                policy,
+                expected_report_paths=expected_paths,
+            )
+            if not ok:
+                self._store.interrupt(session["id"], blocker)
+                return
         cls, action = on_session_start(
             goal or session.get("goal", ""),
             loop_budget=budget,
@@ -1678,6 +1706,7 @@ class SessionEngine:
         policy = session.get("workspace_policy") or {}
 
         def _dispatch_report_orchestrated_prompt() -> str | None:
+            worker_ctx = self._worker_context_from_session(session)
             result = build_report_orchestrated_dispatch_prompt(
                 role=role,
                 report_records=cls.report_records,
@@ -1687,6 +1716,9 @@ class SessionEngine:
                 instruction=instruction,
                 awaiting_developer_correction=cls.awaiting_developer_correction,
                 requires_agy=cls.requires_agy,
+                expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
+                external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
+                max_chars=int(worker_ctx.get("max_report_prompt_chars") or DEFAULT_MAX_REPORT_PROMPT_CHARS),
             )
             if result.ok:
                 return result.prompt

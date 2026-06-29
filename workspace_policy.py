@@ -20,6 +20,7 @@ MAX_WRITE_FILES = 32
 MAX_FORBIDDEN_PATHS = 64
 MAX_READ_PATHS = 16
 MAX_REPORT_PATHS = 8
+MAX_REPORT_ROOTS = 8
 MAX_POLICY_BYTES = 8192
 MIN_HEAD_LEN = 7
 MAX_HEAD_LEN = 40
@@ -110,6 +111,7 @@ def default_scratch_readonly_policy() -> dict[str, Any]:
         "forbidden_commands": list(_default_forbidden_commands()),
         "git_permissions": dict(_default_git_permissions()),
         "report_paths": [],
+        "external_report_write_roots": [],
         "role_permissions": dict(_default_role_permissions("scratch-readonly")),
         "enforcement": {
             "fail_closed": True,
@@ -291,6 +293,16 @@ def validate_resolved_policy(policy: dict[str, Any]) -> PolicyValidationResult:
         for idx, path in enumerate(report_paths):
             errors.extend(_validate_absolute_path(path, field=f"report_paths[{idx}]"))
 
+    report_roots = policy.get("external_report_write_roots", [])
+    if not isinstance(report_roots, list):
+        errors.append("external_report_write_roots must be a list")
+        report_roots = []
+    elif len(report_roots) > MAX_REPORT_ROOTS:
+        errors.append(f"external_report_write_roots exceeds max ({MAX_REPORT_ROOTS})")
+    else:
+        for idx, path in enumerate(report_roots):
+            errors.extend(_validate_absolute_path(path, field=f"external_report_write_roots[{idx}]"))
+
     write_files = policy.get("write_files", [])
     if not isinstance(write_files, list):
         errors.append("write_files must be a list")
@@ -415,6 +427,14 @@ def _profile_to_policy(profile_id: str, profile: dict[str, Any]) -> dict[str, An
     write_files: list[str] = []
     if default_mode in ("docs-only", "implementation", "git-stage", "git-commit", "git-push"):
         write_files = list(profile.get("default_write_files") or [])
+    report_paths = list(profile.get("default_report_paths") or [])
+    report_roots = list(profile.get("default_external_report_write_roots") or [])
+    if not report_roots:
+        for path in report_paths:
+            try:
+                report_roots.append(str(PureWindowsPath(path).parent))
+            except Exception:
+                continue
     return {
         "schema_version": SCHEMA_VERSION,
         "policy_id": profile_id,
@@ -429,7 +449,8 @@ def _profile_to_policy(profile_id: str, profile: dict[str, Any]) -> dict[str, An
         "forbidden_paths": list(profile.get("default_forbidden_paths") or []),
         "forbidden_commands": list(profile.get("forbidden_commands") or _default_forbidden_commands()),
         "git_permissions": dict(profile.get("git_permissions") or _default_git_permissions()),
-        "report_paths": list(profile.get("default_report_paths") or []),
+        "report_paths": report_paths,
+        "external_report_write_roots": report_roots,
         "analysis_report_only": bool(profile.get("analysis_report_only", False)),
         "role_permissions": dict(_default_role_permissions(default_mode)),
         "enforcement": {
@@ -604,6 +625,7 @@ def _apply_local_override(max_policy: dict[str, Any], local_override: dict[str, 
         "git_permissions",
         "read_paths",
         "report_paths",
+        "external_report_write_roots",
     )
     for key in broaden_keys:
         if key not in local_override:
@@ -632,6 +654,8 @@ def _validate_mode_constraints(policy: dict[str, Any], mode: str) -> list[str]:
     elif mode == "read-only":
         if write_files:
             errors.append("read-only mode must not allow write_files")
+        if policy.get("analysis_report_only") and not (policy.get("external_report_write_roots") or []):
+            errors.append("read-only analysis mode requires external_report_write_roots")
     elif mode == "docs-only":
         if not write_files:
             errors.append("docs-only mode requires explicit write_files")
@@ -1005,6 +1029,9 @@ def workspace_policy_read_summary(session: dict[str, Any]) -> dict[str, Any]:
             "workspace_root": None,
             "write_files": [],
             "write_files_count": 0,
+            "external_report_write_roots": [],
+            "external_report_write_roots_count": 0,
+            "report_write_permission_ok": True,
             "expected_head": None,
             "hash": session.get("workspace_policy_hash"),
             "version": session.get("workspace_policy_version"),
@@ -1012,12 +1039,23 @@ def workspace_policy_read_summary(session: dict[str, Any]) -> dict[str, Any]:
 
     workspace = policy.get("workspace") or {}
     write_files = list(policy.get("write_files") or [])
+    report_roots = list(policy.get("external_report_write_roots") or [])
+    report_orchestrated = bool(policy.get("analysis_report_only"))
+    report_write_permission_ok = (not report_orchestrated) or bool(report_roots)
     return {
         "mode": policy.get("mode"),
         "profile_id": policy.get("policy_id"),
         "workspace_root": workspace.get("root"),
         "write_files": write_files,
         "write_files_count": len(write_files),
+        "external_report_write_roots": report_roots,
+        "external_report_write_roots_count": len(report_roots),
+        "report_write_permission_ok": report_write_permission_ok,
+        "report_write_permission_warning": (
+            "BLOCKER: report write permission missing for report-orchestrated flow"
+            if report_orchestrated and not report_roots
+            else ""
+        ),
         "expected_head": workspace.get("expected_head"),
         "hash": session.get("workspace_policy_hash"),
         "version": session.get("workspace_policy_version"),

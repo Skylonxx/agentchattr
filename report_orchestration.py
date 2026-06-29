@@ -35,6 +35,7 @@ _TWINPET_REPO_MARKERS = (
 )
 
 _REPORT_READY_RE = re.compile(r"^\s*REPORT_READY\s*$", re.IGNORECASE)
+_REPORT_WRITE_FAILED_RE = re.compile(r"^\s*REPORT_WRITE_FAILED\s*$", re.IGNORECASE)
 
 _FIELD_PATTERNS = {
     "status": re.compile(r"^\s*Status\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
@@ -92,6 +93,13 @@ class ParsedReportReady:
 
 
 @dataclass
+class ParsedReportWriteFailed:
+    reason: str
+    expected_report_path: str
+    status: str
+
+
+@dataclass
 class ReportIngestResult:
     ok: bool
     blocker: str = ""
@@ -104,6 +112,13 @@ class ReportPromptResult:
     ok: bool
     prompt: str = ""
     blocker: str = ""
+
+
+def resolve_external_report_write_roots(policy: dict | None) -> list[str]:
+    """Return configured external report write allowlist roots."""
+    if not isinstance(policy, dict):
+        return list(DEFAULT_ALLOWED_REPORT_ROOTS)
+    return list(policy.get("external_report_write_roots") or [])
 
 
 def is_report_orchestrated_policy(policy: dict | None) -> bool:
@@ -160,6 +175,26 @@ def parse_report_ready(text: str | None) -> ParsedReportReady | None:
         summary=fields.get("summary", ""),
         next_role=fields.get("next_role", "").strip().lower().replace(" ", "_"),
         notes=fields.get("notes", ""),
+    )
+
+
+def parse_report_write_failed(text: str | None) -> ParsedReportWriteFailed | None:
+    """Parse REPORT_WRITE_FAILED worker output."""
+    if not text or not str(text).strip():
+        return None
+    if not _REPORT_WRITE_FAILED_RE.match(_first_non_empty_line(text)):
+        return None
+    reason_match = re.search(r"^\s*Reason\s*:\s*(.+?)\s*$", str(text), re.IGNORECASE | re.MULTILINE)
+    expected_match = re.search(
+        r"^\s*Expected report\s*:\s*(.+?)\s*$",
+        str(text),
+        re.IGNORECASE | re.MULTILINE,
+    )
+    status_match = re.search(r"^\s*Status\s*:\s*(.+?)\s*$", str(text), re.IGNORECASE | re.MULTILINE)
+    return ParsedReportWriteFailed(
+        reason=(reason_match.group(1).strip() if reason_match else ""),
+        expected_report_path=(expected_match.group(1).strip() if expected_match else ""),
+        status=normalize_report_status(status_match.group(1).strip() if status_match else "FAIL"),
     )
 
 
@@ -253,6 +288,36 @@ def save_inline_report_to_path(
     return True, str(resolved), ""
 
 
+def verify_report_write_permission(
+    policy: dict | None,
+    *,
+    expected_report_paths: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Verify report-orchestrated sessions have external report write permission."""
+    if not is_report_orchestrated_policy(policy):
+        return True, ""
+    if not isinstance(policy, dict):
+        return False, "BLOCKER: external report write permission not enabled"
+    roots = resolve_external_report_write_roots(policy)
+    if not roots:
+        return False, "BLOCKER: external report write permission not enabled"
+    if list(policy.get("write_files") or []):
+        return False, "BLOCKER: Twinpet workspace write allowlist must remain none"
+    for raw_root in roots:
+        ok, reason, _resolved = validate_report_path(
+            str(Path(raw_root) / "permission-check.md"),
+            allowed_roots=roots,
+        )
+        if not ok and "outside allowed roots" not in reason:
+            return False, f"BLOCKER: external report write permission not enabled ({reason})"
+    for report_path in expected_report_paths or list(policy.get("report_paths") or []):
+        ok, reason, _resolved = validate_report_path(report_path, allowed_roots=roots)
+        if not ok:
+            blocker = reason if reason.startswith("BLOCKER:") else f"BLOCKER: {reason}"
+            return False, blocker
+    return True, ""
+
+
 def report_content_fits_prompt(content: str, max_chars: int) -> tuple[bool, int]:
     total = len(content or "")
     return total <= max_chars, total
@@ -267,8 +332,21 @@ def ingest_worker_report_output(
     max_prompt_chars: int = DEFAULT_MAX_REPORT_PROMPT_CHARS,
 ) -> ReportIngestResult:
     """Parse REPORT_READY or inline REPORT_BEGIN/END, validate, read, record."""
+    failed = parse_report_write_failed(text)
+    if failed is not None:
+        reason = failed.reason or "worker could not write report"
+        exp = failed.expected_report_path or "(missing)"
+        return ReportIngestResult(
+            ok=False,
+            blocker=(
+                "BLOCKER: external report write failed\n"
+                f"reason={reason}\n"
+                f"expected_report={exp}\n"
+                f"status={failed.status or 'FAIL'}"
+            ),
+        )
+
     parsed = parse_report_ready(text)
-    report_path = ""
 
     if parsed is None and REPORT_BEGIN_MARKER in (text or ""):
         if not expected_report_paths:
@@ -286,7 +364,7 @@ def ingest_worker_report_output(
         parsed = ParsedReportReady(
             status="PASS_WITH_NOTES",
             report_path=saved_path,
-            summary="inline REPORT_BEGIN/END saved by coordinator",
+            summary="inline REPORT_BEGIN/END fallback saved by coordinator",
             next_role="coordinator",
             notes="",
         )
@@ -374,6 +452,8 @@ def build_report_review_prompt(
     source_reports: list[tuple[ReportRecord, str]],
     instruction: str = "",
     from_source: str = "agentchattr Coordinator",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
     """Build next-agent prompt from loaded report file content."""
     lines = [
@@ -393,9 +473,33 @@ def build_report_review_prompt(
         "- Do not inspect repository files.",
         "- Do not run shell.",
         "- Do not request direct file access.",
-        "- Produce your own markdown report at an allowed external Ai-Report path.",
+        "- You are allowed to write markdown report files only under the configured external Ai-Report report paths.",
+        "- You are not allowed to write inside the Twinpet workspace.",
+        "- Create the report folder if missing.",
+        "- Write your report to the exact expected path.",
         "- Return REPORT_READY with Status, Report path, and Summary when complete.",
     ]
+    roots = list(external_report_write_roots or [])
+    if roots:
+        lines.extend(["", "EXTERNAL REPORT WRITE ALLOWLIST:"])
+        for root in roots:
+            lines.append(f"- {root}")
+    if expected_output_path:
+        lines.extend(["", "EXPECTED REPORT OUTPUT PATH:", expected_output_path])
+    lines.extend([
+        "",
+        "If you cannot write the report file despite permission being configured, return exactly:",
+        "REPORT_WRITE_FAILED",
+        "",
+        "Reason:",
+        "<short reason>",
+        "",
+        "Expected report:",
+        expected_output_path or "<path>",
+        "",
+        "Status:",
+        "FAIL",
+    ])
     if instruction.strip():
         lines.extend(["", "COORDINATOR INSTRUCTION:", instruction.strip()[:2000]])
 
@@ -442,6 +546,8 @@ def build_reviewer_report_prompt(
     agy_record: ReportRecord | None = None,
     agy_content: str = "",
     instruction: str = "",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
     sources: list[tuple[ReportRecord, str]] = [(developer_record, developer_content)]
     if agy_record and agy_content:
@@ -460,6 +566,8 @@ def build_reviewer_report_prompt(
         ),
         source_reports=sources,
         instruction=instruction,
+        expected_output_path=expected_output_path,
+        external_report_write_roots=external_report_write_roots,
     )
 
 
@@ -471,6 +579,8 @@ def build_ui_lead_report_prompt(
     developer_record: ReportRecord,
     developer_content: str,
     instruction: str = "",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
     return build_report_review_prompt(
         target_role="ui_lead",
@@ -487,6 +597,8 @@ def build_ui_lead_report_prompt(
         ),
         source_reports=[(developer_record, developer_content)],
         instruction=instruction,
+        expected_output_path=expected_output_path,
+        external_report_write_roots=external_report_write_roots,
     )
 
 
@@ -501,6 +613,8 @@ def build_report_orchestrated_dispatch_prompt(
     awaiting_developer_correction: bool = False,
     requires_agy: bool = False,
     max_chars: int = DEFAULT_MAX_REPORT_PROMPT_CHARS,
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
     """Build next-worker prompt from stored report records (not channel history)."""
     dev = get_report_for_role(report_records, "developer")
@@ -532,6 +646,8 @@ def build_report_orchestrated_dispatch_prompt(
             developer_record=dev,
             developer_content=content,
             instruction=instruction,
+            expected_output_path=expected_output_path,
+            external_report_write_roots=external_report_write_roots,
         )
 
     if role == "reviewer":
@@ -566,6 +682,8 @@ def build_report_orchestrated_dispatch_prompt(
             agy_record=agy,
             agy_content=agy_content,
             instruction=instruction,
+            expected_output_path=expected_output_path,
+            external_report_write_roots=external_report_write_roots,
         )
 
     if role == "developer" and awaiting_developer_correction and reviewer:
@@ -588,6 +706,8 @@ def build_report_orchestrated_dispatch_prompt(
             reviewer_record=reviewer,
             reviewer_content=rev_content,
             instruction=instruction,
+            expected_output_path=expected_output_path,
+            external_report_write_roots=external_report_write_roots,
         )
 
     return ReportPromptResult(
@@ -604,6 +724,8 @@ def build_developer_correction_report_prompt(
     reviewer_record: ReportRecord,
     reviewer_content: str,
     instruction: str = "",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
     return build_report_review_prompt(
         target_role="developer",
@@ -618,4 +740,6 @@ def build_developer_correction_report_prompt(
         ),
         source_reports=[(reviewer_record, reviewer_content)],
         instruction=instruction,
+        expected_output_path=expected_output_path,
+        external_report_write_roots=external_report_write_roots,
     )
