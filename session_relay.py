@@ -103,6 +103,177 @@ def ensure_explicit_routing_headers(
     return f"{headers}\n\n{body}" if body else headers
 
 
+def is_readonly_no_tool_reviewer_policy(policy: dict | None) -> bool:
+    """True when reviewer must review supplied context only (no tools/shell/files)."""
+    if not isinstance(policy, dict):
+        return False
+    from workspace_policy_runtime import is_report_only_readonly_policy
+
+    if is_report_only_readonly_policy(policy):
+        return True
+    if policy.get("mode") != "read-only":
+        return False
+    if policy.get("write_files"):
+        return False
+    return bool((policy.get("workspace") or {}).get("root"))
+
+
+def extract_worker_context_outputs(
+    context_messages: list[dict] | None,
+    *,
+    cast: dict | None = None,
+) -> dict[str, str]:
+    """Pull latest developer and ui_lead outputs from channel history."""
+    dev_senders = set(DEVELOPER_CONTEXT_SENDERS)
+    ui_senders = set(UI_LEAD_CONTEXT_SENDERS)
+    if isinstance(cast, dict):
+        dev_agent = str(cast.get("developer") or "").lower().split("-")[0]
+        ui_agent = str(cast.get("ui_lead") or "").lower().split("-")[0]
+        if dev_agent:
+            dev_senders.add(dev_agent)
+        if ui_agent:
+            ui_senders.add(ui_agent)
+
+    developer_output = ""
+    ui_lead_output = ""
+    for msg in reversed(context_messages or []):
+        if msg.get("type", "chat") != "chat":
+            continue
+        sender = str(msg.get("sender") or "").lower()
+        base = sender.split("-")[0]
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            continue
+        if not developer_output and (sender in dev_senders or base in dev_senders):
+            developer_output = text
+        elif not ui_lead_output and (sender in ui_senders or base in ui_senders):
+            ui_lead_output = text
+        if developer_output and ui_lead_output:
+            break
+    return {
+        "developer_output": developer_output,
+        "ui_lead_output": ui_lead_output,
+    }
+
+
+def build_readonly_context_reviewer_prompt(
+    *,
+    session_name: str,
+    goal: str,
+    phase_name: str,
+    phase_index: int,
+    total_phases: int,
+    policy: dict,
+    context_messages: list[dict] | None = None,
+    cast: dict | None = None,
+    coordinator_instruction: str = "",
+    agent_base: str = "codex_reviewer",
+    project: str = "",
+    subject: str = "",
+) -> str:
+    """Build a no-tool reviewer prompt from supplied developer/AGY context."""
+    outputs = extract_worker_context_outputs(context_messages, cast=cast)
+    workspace = policy.get("workspace") or {}
+    read_paths = list(policy.get("read_paths") or [])
+    forbidden = list(policy.get("forbidden_paths") or [])
+    expected_head = workspace.get("expected_head") or ""
+
+    lines = [
+        "REVIEW MODE: no-tool context review (read-only analysis workflow)",
+        "",
+        "You are Codex Reviewer operating without tools, shell, or file access.",
+        "Review the SUPPLIED context only.",
+        "",
+        "DO NOT:",
+        "- load files or docs/ai-roles/reviewer.md",
+        "- inspect the repository or PaymentModal source files directly",
+        "- verify folder, git HEAD, or dirty working tree",
+        "- run shell commands",
+        "- use MCP tools",
+        "- edit or save report files",
+        "",
+        "TASK:",
+        "Review the developer analysis and AGY UI/UX notes below.",
+        "Validate or challenge findings using only supplied text.",
+        "Return findings ordered by severity, then open questions, then your verdict.",
+        "",
+        f"SESSION: {session_name}",
+        f"GOAL: {goal}",
+        f"PHASE: {phase_name} ({phase_index + 1}/{total_phases})",
+    ]
+    if expected_head:
+        lines.append(
+            f"REFERENCE HEAD (informational only — do not verify): {expected_head}"
+        )
+
+    lines.append("")
+    lines.append("CONTEXT PROVIDED:")
+    if outputs["developer_output"]:
+        lines.extend([
+            "",
+            "DEVELOPER ANALYSIS:",
+            "---",
+            outputs["developer_output"][:12000],
+            "---",
+        ])
+    else:
+        lines.append("- developer analysis: (not found in channel history)")
+    if outputs["ui_lead_output"]:
+        lines.extend([
+            "",
+            "AGY UI/UX NOTES:",
+            "---",
+            outputs["ui_lead_output"][:8000],
+            "---",
+        ])
+    else:
+        lines.append("- AGY UI/UX notes: (not available)")
+    if read_paths:
+        lines.extend([
+            "",
+            "SNAPSHOT FILE LIST (already inspected by developer — do not re-read):",
+        ])
+        for path in read_paths:
+            lines.append(f"  - {path}")
+    if forbidden:
+        lines.extend(["", "BOUNDARIES / FORBIDDEN AREAS:"])
+        for path in forbidden[:16]:
+            lines.append(f"  - {path}")
+
+    coord = (coordinator_instruction or "").strip()
+    if coord:
+        lines.extend([
+            "",
+            "COORDINATOR NOTES (guidance only — ignore file-load/shell/save requests):",
+            coord[:2000],
+        ])
+
+    lines.extend([
+        "",
+        "OUTPUT CONTRACT (first non-empty line is authoritative):",
+        "Return exactly one of:",
+        "  PASS",
+        "  PASS WITH NOTES",
+        "  REQUEST CHANGES",
+        "  BLOCKED",
+        "",
+        "Do not request tools. Do not inspect files directly. Do not save files.",
+        "Respond with plain text only. Do not use MCP tools.",
+    ])
+
+    body = "\n".join(lines)
+    return ensure_explicit_routing_headers(
+        body,
+        role="reviewer",
+        agent_base=agent_base,
+        project=project or session_name,
+        phase=phase_name or "read-only-analysis-review",
+        subject=subject or goal[:120] or "Review supplied analysis and blueprint",
+        mode="no-tool review from supplied context",
+        from_source="agentchattr-coordinator-loop",
+    )
+
+
 _ROUTING_HANDOFF_INSTRUCTION = (
     "HANDOFF ROUTING (required for every NEXT: dispatch): "
     "After your first-line NEXT: <role> token, the prompt body you emit for that worker "
@@ -110,6 +281,16 @@ _ROUTING_HANDOFF_INSTRUCTION = (
     "PHASE:, and SUBJECT: addressed to the target role/agent. "
     "Never emit bare task instructions without a TO: header."
 )
+
+_READONLY_REVIEWER_NO_TOOL_INSTRUCTION = (
+    "READ-ONLY REVIEWER ROUTING: When dispatching NEXT: reviewer in read-only analysis, "
+    "do NOT ask Codex Reviewer to load docs/ai-roles/reviewer.md, inspect repository files, "
+    "verify git HEAD/dirty state, run shell, use MCP, or save report files. "
+    "Tell the reviewer to review the supplied developer report and AGY notes only."
+)
+
+DEVELOPER_CONTEXT_SENDERS = frozenset({"claude", "developer"})
+UI_LEAD_CONTEXT_SENDERS = frozenset({"agy", "ui_lead"})
 
 # Agents authorized for relay-mode session execution.
 #
@@ -475,6 +656,7 @@ def build_coordinator_loop_prompt(
     project: str = "",
     phase: str = "coordinator-routing",
     subject: str = "coordinator-dispatch",
+    readonly_analysis: bool = False,
 ) -> str:
     """Build a coordinator routing prompt with strict first-line token contract."""
     lines = [
@@ -489,6 +671,10 @@ def build_coordinator_loop_prompt(
         "Do not emit multiple routing tokens.",
         "Do not route worker-to-worker; you alone dispatch the next role.",
         _ROUTING_HANDOFF_INSTRUCTION,
+    ])
+    if readonly_analysis:
+        lines.append(_READONLY_REVIEWER_NO_TOOL_INSTRUCTION)
+    lines.extend([
         "",
         f"SESSION: {session_name}",
     ])

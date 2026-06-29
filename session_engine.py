@@ -6,11 +6,13 @@ import time
 
 from session_relay import (
     build_relay_prompt,
+    build_readonly_context_reviewer_prompt,
     build_safety_gate_prompt,
     build_coordinator_loop_prompt,
     build_coordinator_loop_ui_lead_prompt,
     build_scoped_write_worker_prompt,
     coordinator_loop_worker_output_contract,
+    is_readonly_no_tool_reviewer_policy,
     is_relay_eligible,
     make_relay_queue_entry,
     parse_safety_verdict,
@@ -1575,6 +1577,7 @@ class SessionEngine:
         if role == "coordinator":
             from coordinator_loop import coordinator_allowed_tokens
 
+            policy = session.get("workspace_policy") or {}
             allowed = coordinator_allowed_tokens(cls)
             prompt = build_coordinator_loop_prompt(
                 session_name=tmpl.get("name", "?"),
@@ -1593,6 +1596,7 @@ class SessionEngine:
                 project=channel,
                 phase=phase.get("name", f"phase-{phase_idx}"),
                 subject=session.get("goal", "")[:120] or "coordinator-routing",
+                readonly_analysis=is_readonly_no_tool_reviewer_policy(policy),
             )
             if is_relay_eligible(agent_base):
                 relay_entry = self._make_relay_queue_entry(
@@ -1665,19 +1669,35 @@ class SessionEngine:
             return
 
         context_messages = self._get_recent_context(channel)
-        prompt = build_relay_prompt(
-            session_name=tmpl.get("name", "?"),
-            goal=session.get("goal", ""),
-            phase_name=phase["name"],
-            phase_index=phase_idx,
-            total_phases=len(phases),
-            role=role,
-            instruction=instruction,
-            context_messages=context_messages,
-            agent_base=agent_base,
-            prompt_body=self._session_prompt_body(session),
-        )
         policy = session.get("workspace_policy") or {}
+        if role == "reviewer" and is_readonly_no_tool_reviewer_policy(policy):
+            prompt = build_readonly_context_reviewer_prompt(
+                session_name=tmpl.get("name", "?"),
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                phase_index=phase_idx,
+                total_phases=len(phases),
+                policy=policy,
+                context_messages=context_messages,
+                cast=session.get("cast"),
+                coordinator_instruction=instruction,
+                agent_base=agent_base,
+                project=channel,
+                subject=session.get("goal", "")[:120] or "read-only-analysis-review",
+            )
+        else:
+            prompt = build_relay_prompt(
+                session_name=tmpl.get("name", "?"),
+                goal=session.get("goal", ""),
+                phase_name=phase["name"],
+                phase_index=phase_idx,
+                total_phases=len(phases),
+                role=role,
+                instruction=instruction,
+                context_messages=context_messages,
+                agent_base=agent_base,
+                prompt_body=self._session_prompt_body(session),
+            )
         workspace_bound = bool((policy.get("workspace") or {}).get("root"))
         contract = coordinator_loop_worker_output_contract(role, workspace_bound=workspace_bound)
         if contract:
