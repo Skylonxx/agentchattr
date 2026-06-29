@@ -653,6 +653,17 @@ def _queue_watcher(get_identity_fn, inject_fn, *, is_multi_instance: bool = Fals
                         time.sleep(1)
                         continue
 
+                    # Workspace/session prompts must preserve newlines (Prompt Memo bodies).
+                    if custom_prompt and isinstance(wpc, dict) and wpc.get("session_id") is not None:
+                        _inject_with_supported_kwargs(
+                            inject_fn, custom_prompt,
+                            channel=channel,
+                            workspace_policy_context=wpc,
+                            relay_meta=_extract_relay_meta_from_lines(lines),
+                        )
+                        time.sleep(1)
+                        continue
+
                     # Resolve role BEFORE prompt construction so the exec
                     # direct-mention path can prepend the IMMUTABLE role prompt
                     # (INV-018). Use current identity (may have changed via rename),
@@ -942,9 +953,26 @@ def _policy_blocker_for_exec_item(item, *, data_dir, config) -> str | None:
 def _resolve_exec_cwd(item, *, data_dir, config, default_cwd) -> str:
     """Resolve effective subprocess cwd from verified session workspace policy."""
     from config_loader import get_workspace_profiles
-    from workspace_policy_runtime import resolve_exec_cwd_for_item
+    from worker_workspace import resolve_workspace_exec_cwd_or_blocker
 
-    return resolve_exec_cwd_for_item(
+    cwd, blocker = resolve_workspace_exec_cwd_or_blocker(
+        item if isinstance(item, dict) else None,
+        data_dir=data_dir,
+        config=config,
+        default_cwd=default_cwd,
+        profiles=get_workspace_profiles(config or {}),
+    )
+    if blocker:
+        return default_cwd
+    return cwd or default_cwd
+
+
+def _resolve_exec_cwd_or_blocker(item, *, data_dir, config, default_cwd) -> tuple[str | None, str | None]:
+    """Resolve cwd or return BLOCKER for workspace-bound queue items."""
+    from config_loader import get_workspace_profiles
+    from worker_workspace import resolve_workspace_exec_cwd_or_blocker
+
+    return resolve_workspace_exec_cwd_or_blocker(
         item if isinstance(item, dict) else None,
         data_dir=data_dir,
         config=config,
@@ -1039,6 +1067,33 @@ def _workspace_dirty_blocker(
 EXEC_TIMEOUT_SECS = 120
 
 RELAY_NO_REPLY_MARKER = "[no reply]"
+
+
+def _process_claude_worker_output(
+    captured: str,
+    *,
+    queue_item: dict | None,
+    cwd: str | Path | None,
+) -> str:
+    """Format Claude output or convert tool-call leakage to structured BLOCKER."""
+    from worker_workspace import (
+        detect_tool_call_leakage,
+        format_tool_call_leakage_blocker,
+        worker_context_from_queue_item,
+    )
+
+    leakage = detect_tool_call_leakage(captured)
+    if leakage:
+        ctx = worker_context_from_queue_item(queue_item)
+        return format_tool_call_leakage_blocker(
+            role=str(ctx.get("role") or "unknown"),
+            cwd=cwd,
+            workspace_profile=str(ctx.get("policy_id") or ""),
+            workspace_mode=str(ctx.get("policy_mode") or ""),
+            prompt_id=str(ctx.get("prompt_id") or ""),
+            leakage=leakage,
+        )
+    return _format_relay_reply(captured)
 
 
 def _format_relay_reply(text: str) -> str:
@@ -1537,6 +1592,73 @@ def _build_claude_print_command(command: str, prompt: str, *, use_stdin: bool = 
     return [command, "--print", "--tools", "", prompt], None
 
 
+def _run_claude_workspace_print_turn(
+    *,
+    command,
+    default_cwd,
+    env,
+    agent,
+    item: dict,
+    server_port,
+    get_token_fn,
+    log_path=None,
+    config=None,
+    data_dir=None,
+):
+    """Workspace-bound Claude --print turn with cwd resolution, precheck, and context."""
+    from worker_workspace import is_workspace_bound_queue_item, run_workspace_precheck
+
+    prompt = str(item.get("prompt") or "")
+    reply_channel = item.get("channel") or "general"
+    relay_meta = item.get("relay_meta")
+    if isinstance(relay_meta, dict) and relay_meta.get("channel"):
+        reply_channel = relay_meta.get("channel") or reply_channel
+
+    effective_cwd, cwd_blocker = _resolve_exec_cwd_or_blocker(
+        item,
+        data_dir=data_dir,
+        config=config,
+        default_cwd=default_cwd,
+    )
+    if cwd_blocker:
+        print(f"  > {agent} workspace cwd blocked: {cwd_blocker}")
+        if get_token_fn is not None:
+            try:
+                _relay_to_chat(server_port, get_token_fn(), cwd_blocker, channel=reply_channel)
+            except Exception as exc:  # noqa: BLE001
+                print(f"  > {agent} failed to relay cwd blocker: {exc}")
+        return
+
+    if is_workspace_bound_queue_item(item):
+        wpc = item.get("workspace_policy_context") or {}
+        expected_head = ""
+        if isinstance(wpc, dict):
+            session = None
+            if data_dir is not None:
+                from worker_timeout import _session_from_item
+                session = _session_from_item(item, data_dir=data_dir)
+            if isinstance(session, dict):
+                ws = (session.get("workspace_policy") or {}).get("workspace") or {}
+                expected_head = str(ws.get("expected_head") or "")
+            precheck = run_workspace_precheck(effective_cwd or default_cwd, expected_head=expected_head)
+            prompt = f"{prompt}\n\n{precheck}"
+
+    _run_claude_direct_print_turn(
+        command=command,
+        cwd=effective_cwd,
+        env=env,
+        agent=agent,
+        prompt=prompt,
+        reply_channel=reply_channel,
+        server_port=server_port,
+        get_token_fn=get_token_fn,
+        log_path=log_path,
+        queue_item=item,
+        config=config,
+        data_dir=data_dir,
+    )
+
+
 def _run_claude_direct_print_turn(
     *,
     command,
@@ -1653,7 +1775,11 @@ def _run_claude_direct_print_turn(
     elif errored:
         reply = "[claude --print failed to start]"
     elif captured:
-        reply = _format_relay_reply(captured)
+        reply = _process_claude_worker_output(
+            captured,
+            queue_item=queue_item if isinstance(queue_item, dict) else None,
+            cwd=cwd,
+        )
     elif returncode not in (None, 0):
         reply = f"[claude --print failed (exit {returncode})]"
     else:
@@ -1728,12 +1854,25 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
                     print(f"  > {agent} failed to relay policy blocker: {exc}")
             continue
 
-        effective_cwd = _resolve_exec_cwd(
+        effective_cwd, cwd_blocker = _resolve_exec_cwd_or_blocker(
             item,
             data_dir=data_dir,
             config=config,
             default_cwd=cwd,
         )
+        if cwd_blocker:
+            print(f"  > {agent} workspace cwd blocked: {cwd_blocker}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        cwd_blocker,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay cwd blocker: {exc}")
+            continue
 
         pre_dirty = _workspace_dirty_blocker(
             item,
@@ -2117,7 +2256,7 @@ def _resolve_claude_relay_command(cmd: Sequence[str]) -> list[str]:
 def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
                            trigger_flag=None, running_flag=None, data_dir=None,
                            no_restart=False, server_port=8300, get_token_fn=None,
-                           scratch_root=CLAUDE_SCRATCH_ROOT):
+                           scratch_root=CLAUDE_SCRATCH_ROOT, config=None):
     """Headless Claude relay runner with direct #general fallback.
 
     Valid relay turns (relay_meta with disable_mcp and a non-#general channel)
@@ -2162,10 +2301,38 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
         except Exception as exc:  # noqa: BLE001
             print(f"  > {agent} claude relay failed: {exc}")
 
-    def _process_item(prompt, relay_meta, channel="general"):
+    def _process_item(item):
         """Handle one queue item. Uses ``return`` (never ``continue``) so the
         outer loop always reaches its no_restart check — a refusal must not
         leave the loop blocked on an empty queue."""
+        from worker_workspace import is_workspace_bound_queue_item
+
+        if isinstance(item, dict):
+            prompt = item.get("prompt", "")
+            relay_meta = item.get("relay_meta")
+            channel = item.get("channel", "general")
+        else:
+            prompt = item
+            relay_meta = None
+            channel = "general"
+            item = {"prompt": prompt, "channel": channel}
+
+        if is_workspace_bound_queue_item(item):
+            print(f"  > {agent} workspace print-exec for #{channel}")
+            _run_claude_workspace_print_turn(
+                command=command,
+                default_cwd=cwd,
+                env=env,
+                agent=agent,
+                item=item,
+                server_port=server_port,
+                get_token_fn=get_token_fn,
+                log_path=log_path,
+                config=config,
+                data_dir=data_dir,
+            )
+            return
+
         if relay_meta is None:
             print(f"  > {agent} using direct print-exec fallback for #{channel}")
             _run_claude_direct_print_turn(
@@ -2178,6 +2345,9 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
                 server_port=server_port,
                 get_token_fn=get_token_fn,
                 log_path=log_path,
+                queue_item=item if isinstance(item, dict) else None,
+                config=config,
+                data_dir=data_dir,
             )
             return
 
@@ -2296,9 +2466,10 @@ def run_agent_claude_relay(command, cwd, env, agent, start_watcher, *,
             prompt = item
             relay_meta = None
             channel = "general"
+            item = {"prompt": prompt, "channel": channel}
 
         try:
-            _process_item(prompt, relay_meta, channel=channel)
+            _process_item(item)
         finally:
             if running_flag is not None and work.empty():
                 running_flag[0] = False
@@ -2711,6 +2882,7 @@ def main():
                 no_restart=args.no_restart,
                 server_port=server_port,
                 get_token_fn=get_token,
+                config=config,
             )
         elif run_mode == "store_exec":
             run_agent_store_exec(

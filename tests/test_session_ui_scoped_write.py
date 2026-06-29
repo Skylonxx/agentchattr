@@ -276,8 +276,10 @@ class ScopedWriteEngineTests(unittest.TestCase):
         dev_triggers = [t for t in trigger.triggered if t.get("agent") == "claude"]
         self.assertTrue(dev_triggers)
         last = dev_triggers[-1]
-        self.assertNotIn("relay_entry", last)
-        prompt = last.get("prompt", "")
+        entry = last.get("relay_entry") or last
+        self.assertIn("relay_meta", entry)
+        self.assertIn("workspace_policy_context", entry)
+        prompt = entry.get("prompt", "")
         self.assertIn("WORKSPACE CONTRACT (implementation", prompt)
         self.assertIn(TWINPET, prompt)
         self.assertIn("src/components/PaymentModal.tsx", prompt)

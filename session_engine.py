@@ -817,14 +817,15 @@ class SessionEngine:
             session["id"], agent, role, phase.get("name", "?"),
         )
         try:
-            self._trigger.trigger_sync(
-                agent,
-                channel=channel,
+            relay_entry = self._make_relay_queue_entry(
                 prompt=prompt,
-                workspace_policy_context=self._session_workspace_policy_context(
-                    session, role, phase_idx, turn_idx,
-                ),
+                session=session,
+                phase_idx=phase_idx,
+                turn_idx=turn_idx,
+                role=role,
+                channel=channel,
             )
+            self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
         except Exception as exc:
             log.error(
                 "Session %d: failed scoped-workspace trigger %s: %s",

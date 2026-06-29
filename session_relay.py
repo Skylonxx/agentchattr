@@ -240,6 +240,19 @@ def build_scoped_write_worker_prompt(
     lines.append(
         "Respond with plain text only. Your response will be relayed by the server."
     )
+    lines.extend([
+        "",
+        "ROLE FLOW (Project Read-Only Coordinator Loop):",
+        "  developer / Claude: technical file inspection, data-flow mapping, precheck/report drafting",
+        "  ui_lead / AGY: UI/UX critique, cashier ergonomics, visual hierarchy, blueprint review",
+        "  reviewer / Codex: consistency/safety review",
+        "  safety_gate / CodexSafe: boundary enforcement",
+        "",
+        "TOOL USAGE:",
+        "  Claude --print runs with tools DISABLED. Do NOT emit <tool_call> XML markup.",
+        "  AUTOMATED PRECHECK RESULTS (when present) are authoritative for git HEAD/status.",
+        "  Inspect files using plain-text PROGRESS updates, not tool-call syntax.",
+    ])
     contract = coordinator_loop_worker_output_contract(role, workspace_bound=bool(root))
     if contract:
         lines.append("")

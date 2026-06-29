@@ -231,7 +231,9 @@ class PromptBodyRoutingTests(unittest.TestCase):
         engine._trigger_coordinator_loop(s)
         dev = [t for t in trigger.triggered if t.get("agent") == "claude"]
         self.assertTrue(dev)
-        self.assertIn("PAYMENT-MODAL-SCOPED-WRITE", dev[-1].get("prompt", ""))
+        entry = dev[-1].get("relay_entry") or dev[-1]
+        self.assertIn("PAYMENT-MODAL-SCOPED-WRITE", entry.get("prompt", ""))
+        self.assertIn("workspace_policy_context", entry)
 
 
 class ConfigProfilePresenceTests(unittest.TestCase):

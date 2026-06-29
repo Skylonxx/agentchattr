@@ -40,6 +40,11 @@ def _session_from_item(item: dict[str, Any], *, data_dir: str | Path | None) -> 
     return load_persisted_session_record(data_dir, int(session_id))
 
 
+def _wpc_from_item(item: dict[str, Any] | None) -> dict[str, Any]:
+    wpc = item.get("workspace_policy_context") if isinstance(item, dict) else None
+    return wpc if isinstance(wpc, dict) else {}
+
+
 def resolve_claude_print_timeout(
     item: dict[str, Any] | None,
     *,
@@ -53,17 +58,16 @@ def resolve_claude_print_timeout(
         return default
 
     prompt = str(item.get("prompt") or "")
-    wpc = item.get("workspace_policy_context")
+    wpc = _wpc_from_item(item)
     session = _session_from_item(item, data_dir=data_dir)
     policy = (session or {}).get("workspace_policy") if isinstance(session, dict) else {}
     if not isinstance(policy, dict):
         policy = {}
 
-    mode = wpc.get("policy_mode") if isinstance(wpc, dict) else None
-    if not mode:
-        mode = policy.get("mode")
-
+    mode = wpc.get("policy_mode") or policy.get("mode")
     has_prompt_body = bool(str((session or {}).get("prompt_body") or "").strip())
+    if not has_prompt_body:
+        has_prompt_body = bool(wpc.get("has_prompt_body"))
     long_prompt = len(prompt) >= PROMPT_BODY_LEN_HINT
 
     if mode == "implementation":
@@ -72,7 +76,7 @@ def resolve_claude_print_timeout(
         return timeouts["docs_only_secs"]
     if has_prompt_body or long_prompt:
         return timeouts["prompt_memo_secs"]
-    if mode == "read-only" and isinstance(wpc, dict) and wpc.get("workspace_root"):
+    if mode == "read-only" and wpc.get("workspace_root"):
         return timeouts["docs_only_secs"]
     return default
 
@@ -142,9 +146,7 @@ def build_timeout_diagnostics(
     session: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Collect timeout diagnostic fields for logging and chat relay."""
-    wpc = item.get("workspace_policy_context") if isinstance(item, dict) else None
-    if not isinstance(wpc, dict):
-        wpc = {}
+    wpc = _wpc_from_item(item)
     if session is None and isinstance(item, dict):
         session = {}
 
@@ -153,9 +155,10 @@ def build_timeout_diagnostics(
         policy = {}
 
     prompt_body = str((session or {}).get("prompt_body") or "")
-    has_prompt_body = bool(prompt_body.strip())
+    has_prompt_body = bool(prompt_body.strip()) or bool(wpc.get("has_prompt_body"))
     mode = wpc.get("policy_mode") or policy.get("mode")
-    profile = policy.get("policy_id") or wpc.get("policy_id")
+    profile = wpc.get("policy_id") or policy.get("policy_id")
+    prompt_id = str((session or {}).get("prompt_id") or wpc.get("prompt_id") or "")
 
     return {
         "status": "WORKER_TIMEOUT",
@@ -166,7 +169,7 @@ def build_timeout_diagnostics(
         "cwd": str(cwd) if cwd else "",
         "workspace_profile": profile or "",
         "workspace_mode": mode or "",
-        "prompt_id": str((session or {}).get("prompt_id") or ""),
+        "prompt_id": prompt_id,
         "prompt_body_mode": has_prompt_body,
         "retry_safe": _retry_safe(str(mode) if mode else None, has_prompt_body=has_prompt_body),
     }
