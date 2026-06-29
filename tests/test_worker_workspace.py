@@ -1,11 +1,13 @@
-"""Workspace worker context, cwd, and tool-call leakage tests."""
+"""Workspace worker context, snapshots, cwd, and tool-call leakage tests."""
 
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import config_loader
 import workspace_policy as wp
@@ -16,11 +18,18 @@ from worker_timeout import (
     resolve_claude_print_timeout,
 )
 from worker_workspace import (
+    SnapshotMeta,
+    build_docs_only_worker_augmentation,
+    build_read_only_file_snapshots,
     detect_tool_call_leakage,
+    extract_report_block,
     format_tool_call_leakage_blocker,
+    is_docs_only_snapshot_mode,
     is_workspace_bound_queue_item,
+    read_allowlisted_file_snapshot,
     resolve_workspace_exec_cwd_or_blocker,
-    run_workspace_precheck,
+    run_workspace_precheck_structured,
+    try_save_docs_only_report,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,6 +84,11 @@ class WorkspaceBoundItemTests(unittest.TestCase):
     def test_analysis_profile_item_is_workspace_bound(self):
         item = _analysis_queue_item()
         self.assertTrue(is_workspace_bound_queue_item(item))
+
+    def test_docs_only_snapshot_mode(self):
+        session = _analysis_session_record()
+        item = _analysis_queue_item()
+        self.assertTrue(is_docs_only_snapshot_mode(item, session["workspace_policy"]))
 
     def test_goal_only_item_not_workspace_bound(self):
         self.assertFalse(is_workspace_bound_queue_item({"prompt": "hi"}))
@@ -153,9 +167,114 @@ class WorkspaceCwdTests(unittest.TestCase):
         self.assertEqual(cwd, SCRATCH)
 
 
+class SnapshotTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "src" / "components").mkdir(parents=True)
+        (self.root / "src" / "components" / "PaymentModal.tsx").write_text(
+            "export function PaymentModal() { return null; }\n", encoding="utf-8",
+        )
+        (self.root / "src" / "components" / "PaymentModal.css").write_text(
+            ".modal { color: red; }\n", encoding="utf-8",
+        )
+        (self.root / "secret").write_text("nope", encoding="utf-8")
+        subprocess.run(["git", "init"], cwd=self.root, capture_output=True, check=False)
+        subprocess.run(["git", "add", "."], cwd=self.root, capture_output=True, check=False)
+        subprocess.run(
+            ["git", "commit", "-m", "init", "--allow-empty"],
+            cwd=self.root, capture_output=True, check=False,
+        )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reads_allowlisted_files_only(self):
+        snap = read_allowlisted_file_snapshot(
+            self.root, "src/components/PaymentModal.tsx", max_chars_per_file=10000,
+        )
+        self.assertTrue(snap["exists"])
+        self.assertIn("PaymentModal", snap["content"])
+
+    def test_rejects_path_outside_allowlist_resolution(self):
+        snap = read_allowlisted_file_snapshot(
+            self.root, "../secret", max_chars_per_file=10000,
+        )
+        self.assertFalse(snap["exists"])
+        self.assertIn("rejected", snap["content"])
+
+    def test_snapshot_section_includes_payment_modal_files(self):
+        text, meta = build_read_only_file_snapshots(
+            self.root,
+            ["src/components/PaymentModal.tsx", "src/components/PaymentModal.css", "missing.md"],
+            max_chars_per_file=10000,
+        )
+        self.assertIn("READ-ONLY FILE SNAPSHOT", text)
+        self.assertIn("PaymentModal.tsx", text)
+        self.assertIn("PaymentModal.css", text)
+        self.assertIn("(missing)", text)
+        self.assertEqual(meta.file_count, 2)
+
+    def test_truncation_marker_for_large_file(self):
+        big = "x" * 100_000
+        (self.root / "big.txt").write_text(big, encoding="utf-8")
+        snap = read_allowlisted_file_snapshot(self.root, "big.txt", max_chars_per_file=1000)
+        self.assertTrue(snap["truncated"])
+        self.assertIn("[TRUNCATED", snap["content"])
+
+
+class PrecheckBlockerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        subprocess.run(["git", "init"], cwd=self.root, capture_output=True, check=False)
+        subprocess.run(["git", "commit", "--allow-empty", "-m", "e"], cwd=self.root, capture_output=True, check=False)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_head_mismatch_blocks(self):
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.root, capture_output=True, text=True,
+        ).stdout.strip()
+        wrong = "0" * 40 if head != "0" * 40 else "f" * 40
+        result = run_workspace_precheck_structured(self.root, expected_head=wrong)
+        self.assertFalse(result.ok)
+        self.assertIn("expected head mismatch", result.blocker or "")
+
+    def test_dirty_tree_blocks_read_only(self):
+        (self.root / "dirty.txt").write_text("x", encoding="utf-8")
+        policy = wp.default_scratch_readonly_policy()
+        policy = dict(policy)
+        policy["mode"] = "read-only"
+        result = run_workspace_precheck_structured(self.root, policy=policy)
+        self.assertFalse(result.ok)
+        self.assertIn("dirty tree", (result.blocker or "").lower())
+
+    def test_docs_only_augmentation_includes_snapshots(self):
+        session = _analysis_session_record()
+        policy = session["workspace_policy"]
+        item = _analysis_queue_item()
+        with mock.patch("worker_workspace.run_workspace_precheck_structured") as m_pre:
+            m_pre.return_value = type("R", (), {
+                "ok": True, "blocker": None,
+                "text": "AUTOMATED PRECHECK RESULTS\n- ok",
+                "head": EXPECTED_HEAD, "porcelain": "",
+            })()
+            with mock.patch("worker_workspace.build_read_only_file_snapshots") as m_snap:
+                m_snap.return_value = ("READ-ONLY FILE SNAPSHOT\n### foo", SnapshotMeta(injected=True, file_count=1, paths=["foo"]))
+                text, blocker, meta = build_docs_only_worker_augmentation(
+                    TWINPET, item, policy, config=config_loader.load_config(ROOT),
+                )
+        self.assertIsNone(blocker)
+        self.assertIn("AUTOMATED PRECHECK", text or "")
+        self.assertIn("READ-ONLY FILE SNAPSHOT", text or "")
+        self.assertEqual(meta.file_count, 1)
+
+
 class ToolCallLeakageTests(unittest.TestCase):
     SAMPLE = (
-        '<tool_call>\n<tool_name>Bash</tool_name>\n<parameters>\n'
+        '<tool_call>\n<tool_name>Read</tool_name>\n<parameters>\n'
         '<command>cd "C:/Users/Narachat/twinpet-pos" && git rev-parse HEAD</command>\n'
         "</parameters>\n</tool_call>"
     )
@@ -164,10 +283,9 @@ class ToolCallLeakageTests(unittest.TestCase):
         info = detect_tool_call_leakage(self.SAMPLE)
         self.assertIsNotNone(info)
         assert info is not None
-        self.assertEqual(info["tool_name"], "Bash")
-        self.assertIn("git rev-parse", info["command"])
+        self.assertEqual(info["tool_name"], "Read")
 
-    def test_blocker_format_includes_diagnostics(self):
+    def test_snapshot_mode_blocker_message(self):
         info = detect_tool_call_leakage(self.SAMPLE)
         assert info is not None
         text = format_tool_call_leakage_blocker(
@@ -177,29 +295,90 @@ class ToolCallLeakageTests(unittest.TestCase):
             workspace_mode="docs-only",
             prompt_id="TEST-001",
             leakage=info,
+            snapshot_meta=SnapshotMeta(injected=True, file_count=3),
+            snapshot_mode=True,
         )
-        self.assertTrue(text.startswith("BLOCKER: tool-call markup leaked"))
-        self.assertIn("tool_name: Bash", text)
-        self.assertIn("twinpet-ui-09-c-payment-modal-analysis", text)
+        self.assertIn("despite snapshot mode", text)
+        self.assertIn("files injected: 3", text)
 
     def test_wrapper_processes_leakage_as_blocker(self):
         import wrapper
 
-        out = wrapper._process_claude_worker_output(
-            self.SAMPLE,
-            queue_item=_analysis_queue_item(),
-            cwd=TWINPET,
-        )
+        item = _analysis_queue_item()
+        item["_snapshot_meta"] = {"injected": True, "file_count": 2}
+        out = wrapper._process_claude_worker_output(self.SAMPLE, queue_item=item, cwd=TWINPET)
         self.assertTrue(out.startswith("BLOCKER: tool-call markup leaked"))
 
 
-class PrecheckTests(unittest.TestCase):
-    def test_precheck_runs_on_twinpet_if_present(self):
+class ReportSaveTests(unittest.TestCase):
+    def test_extract_report_block(self):
+        text = "intro\nREPORT_BEGIN\n# Title\nbody\nREPORT_END\n"
+        self.assertEqual(extract_report_block(text), "# Title\nbody")
+
+    def test_save_to_allowed_workspace_path(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        policy = {
+            "mode": "docs-only",
+            "write_files": ["docs/reports/latest-report.md"],
+            "report_paths": [],
+        }
+        body = "REPORT_BEGIN\n# Analysis\nDone.\nREPORT_END"
+        saved = try_save_docs_only_report(body, policy, root)
+        self.assertTrue(any("saved report" in s for s in saved))
+        self.assertTrue((root / "docs/reports/latest-report.md").exists())
+
+
+class PromptContractTests(unittest.TestCase):
+    def test_scoped_prompt_mentions_no_tools_for_docs_only(self):
+        from session_relay import build_scoped_write_worker_prompt
+
+        session = _analysis_session_record()
+        prompt = build_scoped_write_worker_prompt(
+            session_name="test",
+            goal="g",
+            role="developer",
+            policy=session["workspace_policy"],
+            prompt_body="PROMPT ID: X\nmemo body",
+        )
+        self.assertIn("FULL TASK MEMO", prompt)
+        self.assertIn("SNAPSHOT MODE", prompt)
+        self.assertIn("no tools", prompt.lower())
+        self.assertIn("tool_call", prompt)
+
+
+class TwinpetSmokeTests(unittest.TestCase):
+    def test_live_twinpet_snapshots_if_present(self):
         if not Path(TWINPET).is_dir():
-            self.skipTest("Twinpet workspace not present")
-        text = run_workspace_precheck(TWINPET, expected_head=EXPECTED_HEAD)
-        self.assertIn("AUTOMATED PRECHECK RESULTS", text)
-        self.assertIn("git rev-parse HEAD", text)
+            self.skipTest("Twinpet not present")
+        session = _analysis_session_record()
+        policy = session["workspace_policy"]
+        item = _analysis_queue_item()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        data_dir = Path(tmp.name)
+        (data_dir / "session_runs.json").write_text(json.dumps([session]), encoding="utf-8")
+        item = _analysis_queue_item(data_dir=data_dir)
+        cfg = config_loader.load_config(ROOT)
+        profiles = config_loader.get_workspace_profiles(cfg)
+        cwd, blocker = resolve_workspace_exec_cwd_or_blocker(
+            item, data_dir=data_dir, config=cfg, default_cwd=SCRATCH, profiles=profiles,
+        )
+        self.assertIsNone(blocker)
+        augment, pre_blocker, meta = build_docs_only_worker_augmentation(
+            cwd, item, policy, config=cfg,
+        )
+        self.assertIsNone(pre_blocker, msg=pre_blocker)
+        assert augment is not None
+        self.assertIn("AUTOMATED PRECHECK RESULTS", augment)
+        self.assertIn("PaymentModal.tsx", augment)
+        self.assertIn("PaymentModal.css", augment)
+        self.assertGreater(meta.file_count, 0)
+        st = subprocess.run(["git", "status", "--short"], cwd=TWINPET, capture_output=True, text=True)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=TWINPET, capture_output=True, text=True)
+        self.assertEqual(st.stdout.strip(), "")
+        self.assertEqual(head.stdout.strip(), EXPECTED_HEAD)
 
 
 if __name__ == "__main__":

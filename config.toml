@@ -291,7 +291,7 @@ default_secs = 120
 prompt_memo_secs = 600
 docs_only_secs = 600
 implementation_secs = 900
-subprocess_grace_secs = 30
+snapshot_max_chars_per_file = 48000
 
 # UI one-click session presets (server-approved; maps to workspace_profiles).
 [workspace_presets.twinpet-ui-09-c-payment-modal-write]

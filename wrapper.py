@@ -1079,12 +1079,15 @@ def _process_claude_worker_output(
     from worker_workspace import (
         detect_tool_call_leakage,
         format_tool_call_leakage_blocker,
+        snapshot_meta_from_item,
         worker_context_from_queue_item,
     )
 
     leakage = detect_tool_call_leakage(captured)
     if leakage:
         ctx = worker_context_from_queue_item(queue_item)
+        snap = snapshot_meta_from_item(queue_item)
+        snapshot_mode = bool(snap.injected or ctx.get("snapshot_injected"))
         return format_tool_call_leakage_blocker(
             role=str(ctx.get("role") or "unknown"),
             cwd=cwd,
@@ -1092,6 +1095,8 @@ def _process_claude_worker_output(
             workspace_mode=str(ctx.get("policy_mode") or ""),
             prompt_id=str(ctx.get("prompt_id") or ""),
             leakage=leakage,
+            snapshot_meta=snap,
+            snapshot_mode=snapshot_mode,
         )
     return _format_relay_reply(captured)
 
@@ -1605,8 +1610,15 @@ def _run_claude_workspace_print_turn(
     config=None,
     data_dir=None,
 ):
-    """Workspace-bound Claude --print turn with cwd resolution, precheck, and context."""
-    from worker_workspace import is_workspace_bound_queue_item, run_workspace_precheck
+    """Workspace-bound Claude --print turn with cwd resolution, snapshot injection."""
+    from worker_workspace import (
+        build_docs_only_worker_augmentation,
+        is_docs_only_snapshot_mode,
+        is_workspace_bound_queue_item,
+        load_canonical_policy_for_item,
+        run_workspace_precheck,
+        try_save_docs_only_report,
+    )
 
     prompt = str(item.get("prompt") or "")
     reply_channel = item.get("channel") or "general"
@@ -1629,19 +1641,45 @@ def _run_claude_workspace_print_turn(
                 print(f"  > {agent} failed to relay cwd blocker: {exc}")
         return
 
-    if is_workspace_bound_queue_item(item):
+    policy = load_canonical_policy_for_item(item, data_dir=data_dir)
+    work_item = dict(item)
+
+    if is_docs_only_snapshot_mode(item, policy):
+        augment, pre_blocker, snap_meta = build_docs_only_worker_augmentation(
+            effective_cwd or default_cwd,
+            item,
+            policy,
+            config=config,
+        )
+        if pre_blocker:
+            print(f"  > {agent} workspace precheck blocked: {pre_blocker[:120]}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port, get_token_fn(), pre_blocker, channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay precheck blocker: {exc}")
+            return
+        if augment:
+            prompt = f"{augment}\n\n{prompt}"
+            work_item["_snapshot_meta"] = {
+                "injected": snap_meta.injected,
+                "file_count": snap_meta.file_count,
+                "paths": snap_meta.paths,
+            }
+            print(
+                f"  > {agent} docs-only snapshot injected "
+                f"({snap_meta.file_count} files) -> #{reply_channel}"
+            )
+    elif is_workspace_bound_queue_item(item):
         wpc = item.get("workspace_policy_context") or {}
         expected_head = ""
-        if isinstance(wpc, dict):
-            session = None
-            if data_dir is not None:
-                from worker_timeout import _session_from_item
-                session = _session_from_item(item, data_dir=data_dir)
-            if isinstance(session, dict):
-                ws = (session.get("workspace_policy") or {}).get("workspace") or {}
-                expected_head = str(ws.get("expected_head") or "")
-            precheck = run_workspace_precheck(effective_cwd or default_cwd, expected_head=expected_head)
-            prompt = f"{prompt}\n\n{precheck}"
+        if isinstance(wpc, dict) and isinstance(policy, dict):
+            ws = policy.get("workspace") or {}
+            expected_head = str(ws.get("expected_head") or "")
+        precheck = run_workspace_precheck(effective_cwd or default_cwd, expected_head=expected_head)
+        prompt = f"{prompt}\n\n{precheck}"
 
     _run_claude_direct_print_turn(
         command=command,
@@ -1653,9 +1691,14 @@ def _run_claude_workspace_print_turn(
         server_port=server_port,
         get_token_fn=get_token_fn,
         log_path=log_path,
-        queue_item=item,
+        queue_item=work_item,
         config=config,
         data_dir=data_dir,
+        on_success_save_report=lambda text: (
+            try_save_docs_only_report(text, policy, effective_cwd or default_cwd)
+            if isinstance(policy, dict) and is_docs_only_snapshot_mode(item, policy)
+            else []
+        ),
     )
 
 
@@ -1674,6 +1717,7 @@ def _run_claude_direct_print_turn(
     queue_item=None,
     config=None,
     data_dir=None,
+    on_success_save_report=None,
 ):
     """Run one direct ``claude --print`` turn and relay to the source channel."""
     import subprocess
@@ -1780,6 +1824,13 @@ def _run_claude_direct_print_turn(
             queue_item=queue_item if isinstance(queue_item, dict) else None,
             cwd=cwd,
         )
+        if (
+            not reply.startswith("BLOCKER:")
+            and callable(on_success_save_report)
+        ):
+            saved = on_success_save_report(captured)
+            if saved:
+                reply = reply + "\n\n" + "\n".join(["Report save:", *saved])
     elif returncode not in (None, 0):
         reply = f"[claude --print failed (exit {returncode})]"
     else:

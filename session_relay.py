@@ -205,6 +205,9 @@ def build_scoped_write_worker_prompt(
             lines.extend([
                 "",
                 "DOCS-ONLY: No src/** or tests/** writes. Report/docs paths only.",
+                "SNAPSHOT MODE: agentchattr injects AUTOMATED PRECHECK RESULTS and",
+                "READ-ONLY FILE SNAPSHOT before this turn. You have no tools.",
+                "Do not emit <tool_call> markup. Analyze from injected snapshots only.",
             ])
         if forbidden:
             lines.append("Configured forbidden path patterns also apply.")
