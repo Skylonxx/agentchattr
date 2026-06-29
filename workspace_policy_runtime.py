@@ -153,7 +153,10 @@ def build_session_queue_workspace_context(
         "policy_hash": session.get("workspace_policy_hash"),
         "workspace_policy_version": session.get("workspace_policy_version"),
         "policy_mode": policy.get("mode"),
+        "policy_id": policy.get("policy_id"),
         "workspace_root": workspace.get("root"),
+        "prompt_id": session.get("prompt_id"),
+        "has_prompt_body": bool(str(session.get("prompt_body") or "").strip()),
         "relay_kind": relay_kind,
     }
 

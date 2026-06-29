@@ -412,6 +412,8 @@ def on_coordinator_output(state: CoordinatorLoopState, text: str) -> Coordinator
 
 def _parse_developer_verdict(text: str) -> tuple[str, str]:
     first = _first_non_empty_line(text)
+    if first == "WORKER_TIMEOUT":
+        return first, _body_after_first_line(text)
     if first == "READY_FOR_COORDINATOR":
         return first, _body_after_first_line(text)
     return "AMBIGUOUS", first or "empty developer output"
@@ -419,6 +421,8 @@ def _parse_developer_verdict(text: str) -> tuple[str, str]:
 
 def _parse_ui_lead_verdict(text: str) -> tuple[str, str]:
     first = _first_non_empty_line(text)
+    if first == "WORKER_TIMEOUT":
+        return first, _body_after_first_line(text)
     if first in ("UX_APPROVED", "REQUEST UX CHANGES", "BLOCKED"):
         return first, _body_after_first_line(text)
     if first == "PASS WITH NOTES":
@@ -507,6 +511,13 @@ def _on_developer_output(state: CoordinatorLoopState, text: str) -> CoordinatorA
     if token == "AMBIGUOUS":
         return _terminal_blocker(state, f"ambiguous developer output: {notes}")
 
+    if token == "WORKER_TIMEOUT":
+        return _coordinator_action(
+            state,
+            "Developer worker timed out (WORKER_TIMEOUT — infrastructure, not implementation failure). "
+            f"Coordinator may retry or issue BLOCKER. Details: {notes[:400]}",
+        )
+
     if token == "BLOCKED":
         return _terminal_blocker(state, f"developer blocked: {notes}")
 
@@ -528,6 +539,11 @@ def _on_ui_lead_output(state: CoordinatorLoopState, text: str) -> CoordinatorAct
         return _terminal_blocker(state, notes)
     if token == "AMBIGUOUS":
         return _terminal_blocker(state, f"ambiguous ui_lead output: {notes}")
+    if token == "WORKER_TIMEOUT":
+        return _coordinator_action(
+            state,
+            "UI lead worker timed out (WORKER_TIMEOUT). Coordinator may retry or BLOCKER.",
+        )
     if token == "BLOCKED":
         return _terminal_blocker(state, f"ui_lead blocked: {notes}")
 

@@ -338,3 +338,9 @@ def get_workspace_policy_config(cfg: dict) -> dict:
         "read_only_external_cwd_enabled": bool(section.get("read_only_external_cwd_enabled")),
         "scoped_write_external_cwd_enabled": bool(section.get("scoped_write_external_cwd_enabled")),
     }
+
+
+def get_session_worker_timeouts(cfg: dict) -> dict[str, int]:
+    """Return session worker timeout settings from config."""
+    from worker_timeout import get_session_worker_timeouts as _load
+    return _load(cfg)

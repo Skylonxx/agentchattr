@@ -1548,12 +1548,34 @@ def _run_claude_direct_print_turn(
     server_port,
     get_token_fn,
     log_path=None,
+    timeout_secs=None,
+    queue_item=None,
+    config=None,
+    data_dir=None,
 ):
     """Run one direct ``claude --print`` turn and relay to the source channel."""
     import subprocess
+    from worker_timeout import (
+        build_timeout_diagnostics,
+        format_worker_timeout_reply,
+        post_timeout_workspace_check,
+        resolve_claude_print_timeout,
+        subprocess_timeout_for_print,
+    )
+
+    if timeout_secs is None:
+        timeout_secs = resolve_claude_print_timeout(
+            queue_item if isinstance(queue_item, dict) else None,
+            config=config,
+            data_dir=data_dir,
+        )
+    subprocess_timeout = subprocess_timeout_for_print(timeout_secs, config=config)
 
     cmd, stdin_payload = _build_claude_print_command(command, prompt, use_stdin=True)
-    print(f"  > {agent} direct print-exec triggered ({len(prompt)} chars) -> #{reply_channel}")
+    print(
+        f"  > {agent} direct print-exec triggered ({len(prompt)} chars, "
+        f"timeout={timeout_secs}s) -> #{reply_channel}"
+    )
 
     timed_out = False
     errored = False
@@ -1566,11 +1588,11 @@ def _run_claude_direct_print_turn(
             input=stdin_payload,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=EXEC_TIMEOUT_SECS,
+            timeout=subprocess_timeout,
         )
     except subprocess.TimeoutExpired:
         timed_out = True
-        print(f"  > {agent} direct print-exec timed out ({EXEC_TIMEOUT_SECS}s)")
+        print(f"  > {agent} direct print-exec timed out ({timeout_secs}s)")
     except Exception as exc:  # noqa: BLE001
         errored = True
         print(f"  > {agent} direct print-exec error: {exc}")
@@ -1584,12 +1606,17 @@ def _run_claude_direct_print_turn(
         captured = (proc.stdout or b"").decode("utf-8", errors="replace").strip()
         stderr_text = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
 
+    session = None
+    if isinstance(queue_item, dict) and data_dir is not None:
+        from worker_timeout import _session_from_item
+        session = _session_from_item(queue_item, data_dir=data_dir)
+
     if log_path:
         try:
             with open(log_path, "ab") as lf:
                 header = (
                     f"\n=== {time.strftime('%Y-%m-%d %H:%M:%S')} direct print-exec ===\n"
-                    f"channel={reply_channel} prompt_len={len(prompt)}\n"
+                    f"channel={reply_channel} prompt_len={len(prompt)} timeout={timeout_secs}s\n"
                 )
                 lf.write(header.encode("utf-8", "replace"))
                 if captured:
@@ -1607,7 +1634,22 @@ def _run_claude_direct_print_turn(
         return
 
     if timed_out:
-        reply = f"[claude --print timed out after {EXEC_TIMEOUT_SECS}s]"
+        wpc = queue_item.get("workspace_policy_context") if isinstance(queue_item, dict) else {}
+        role = wpc.get("session_role") if isinstance(wpc, dict) else None
+        diagnostics = build_timeout_diagnostics(
+            agent=agent,
+            role=role,
+            timeout_secs=timeout_secs,
+            cwd=cwd,
+            item=queue_item if isinstance(queue_item, dict) else None,
+            session=session,
+        )
+        workspace_check = None
+        if cwd and (diagnostics.get("workspace_profile") or diagnostics.get("workspace_mode")):
+            workspace_check = post_timeout_workspace_check(cwd)
+        reply = format_worker_timeout_reply(diagnostics, workspace_check=workspace_check)
+        print(f"  > {agent} WORKER_TIMEOUT diagnostics: role={diagnostics.get('role')} "
+              f"profile={diagnostics.get('workspace_profile')} mode={diagnostics.get('workspace_mode')}")
     elif errored:
         reply = "[claude --print failed to start]"
     elif captured:
@@ -1724,6 +1766,9 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
             server_port=server_port,
             get_token_fn=get_token_fn,
             log_path=log_path,
+            queue_item=item if isinstance(item, dict) else None,
+            config=config,
+            data_dir=data_dir,
         )
 
         post_dirty = _workspace_dirty_blocker(
