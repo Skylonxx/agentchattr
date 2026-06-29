@@ -1314,9 +1314,19 @@ class SessionEngine:
 
     def _init_coordinator_loop(self, session: dict, goal: str):
         """Initialize coordinator loop state and trigger coordinator intake."""
-        from coordinator_loop import on_session_start
+        from coordinator_loop import on_session_start, resolve_loop_budget_from_session
 
-        cls, action = on_session_start(goal or session.get("goal", ""))
+        policy = session.get("workspace_policy") or {}
+        budget = resolve_loop_budget_from_session(session)
+        cls, action = on_session_start(
+            goal or session.get("goal", ""),
+            loop_budget=budget,
+            session_meta={
+                "prompt_id": session.get("prompt_id", ""),
+                "workspace_profile": policy.get("policy_id", ""),
+                "workspace_mode": policy.get("mode", ""),
+            },
+        )
         self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
         self._route_coordinator_loop_action(session, action)
 

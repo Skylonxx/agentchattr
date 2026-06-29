@@ -29,6 +29,52 @@ VALID_NEXT_ROLES = frozenset(WORKER_ROLES)
 DEFAULT_MAX_ROUNDS = 2
 DEFAULT_MAX_MALFORMED_COORDINATOR = 2
 DEFAULT_MAX_TOTAL_TRANSITIONS = 32
+MIN_SUBSTANTIAL_DEVELOPER_CHARS = 400
+
+
+@dataclass(frozen=True)
+class CoordinatorLoopBudget:
+    """Per-role round limits for coordinator-loop sessions."""
+    developer: int = DEFAULT_MAX_ROUNDS
+    ui_lead: int = DEFAULT_MAX_ROUNDS
+    reviewer: int = DEFAULT_MAX_ROUNDS
+    safety_gate: int = DEFAULT_MAX_ROUNDS
+    max_total_transitions: int = DEFAULT_MAX_TOTAL_TRANSITIONS
+
+
+PROMPT_MEMO_READONLY_BUDGET = CoordinatorLoopBudget(
+    developer=4,
+    ui_lead=2,
+    reviewer=2,
+    safety_gate=2,
+    max_total_transitions=48,
+)
+
+PROMPT_MEMO_BUDGET = CoordinatorLoopBudget(
+    developer=3,
+    ui_lead=2,
+    reviewer=2,
+    safety_gate=2,
+    max_total_transitions=40,
+)
+
+
+def resolve_loop_budget_from_session(session: dict[str, Any] | None) -> CoordinatorLoopBudget:
+    """Resolve expanded bounded budgets for Prompt Memo / read-only analysis sessions."""
+    if not isinstance(session, dict):
+        return CoordinatorLoopBudget()
+    policy = session.get("workspace_policy") or {}
+    has_prompt = bool(str(session.get("prompt_body") or "").strip())
+    try:
+        from workspace_policy_runtime import is_report_only_readonly_policy
+        readonly_analysis = is_report_only_readonly_policy(policy)
+    except ImportError:
+        readonly_analysis = bool(policy.get("analysis_report_only"))
+    if readonly_analysis or (has_prompt and policy.get("mode") == "read-only"):
+        return PROMPT_MEMO_READONLY_BUDGET
+    if has_prompt:
+        return PROMPT_MEMO_BUDGET
+    return CoordinatorLoopBudget()
 
 _ROUTING_TOKEN_RE = re.compile(
     r"^(CLASSIFY: (?:UI|NON_UI)|NEXT: \w+|FINAL:|BLOCKER:)",
@@ -113,7 +159,19 @@ class CoordinatorLoopState:
     malformed_coordinator_round: int = 0
     total_transition_count: int = 0
     max_rounds: int = DEFAULT_MAX_ROUNDS
+    max_developer_rounds: int = DEFAULT_MAX_ROUNDS
+    max_ui_rounds: int = DEFAULT_MAX_ROUNDS
+    max_review_rounds: int = DEFAULT_MAX_ROUNDS
+    max_safety_rounds: int = DEFAULT_MAX_ROUNDS
     max_total_transitions: int = DEFAULT_MAX_TOTAL_TRANSITIONS
+    awaiting_developer_correction: bool = False
+    developer_correction_complete: bool = False
+    developer_has_substantial_output: bool = False
+    last_developer_token: str = ""
+    last_reviewer_verdict: str = ""
+    session_prompt_id: str = ""
+    session_workspace_profile: str = ""
+    session_workspace_mode: str = ""
     task_description: str = ""
     last_role: str = ""
     last_output_summary: str = ""
@@ -130,6 +188,7 @@ class CoordinatorLoopState:
             phase = CoordinatorPhase(str(data["phase"]))
         except (KeyError, ValueError) as exc:
             raise ValueError(f"invalid coordinator_loop phase: {exc}") from exc
+        legacy_max = int(data.get("max_rounds", DEFAULT_MAX_ROUNDS))
         return cls(
             phase=phase,
             awaiting_role=str(data.get("awaiting_role", COORDINATOR_ROLE)),
@@ -145,9 +204,21 @@ class CoordinatorLoopState:
             safety_round=int(data.get("safety_round", 0)),
             malformed_coordinator_round=int(data.get("malformed_coordinator_round", 0)),
             total_transition_count=int(data.get("total_transition_count", 0)),
-            max_rounds=int(data.get("max_rounds", DEFAULT_MAX_ROUNDS)),
+            max_rounds=legacy_max,
+            max_developer_rounds=int(data.get("max_developer_rounds", legacy_max)),
+            max_ui_rounds=int(data.get("max_ui_rounds", legacy_max)),
+            max_review_rounds=int(data.get("max_review_rounds", legacy_max)),
+            max_safety_rounds=int(data.get("max_safety_rounds", legacy_max)),
             max_total_transitions=int(
                 data.get("max_total_transitions", DEFAULT_MAX_TOTAL_TRANSITIONS)),
+            awaiting_developer_correction=bool(data.get("awaiting_developer_correction", False)),
+            developer_correction_complete=bool(data.get("developer_correction_complete", False)),
+            developer_has_substantial_output=bool(data.get("developer_has_substantial_output", False)),
+            last_developer_token=str(data.get("last_developer_token", "")),
+            last_reviewer_verdict=str(data.get("last_reviewer_verdict", "")),
+            session_prompt_id=str(data.get("session_prompt_id", "")),
+            session_workspace_profile=str(data.get("session_workspace_profile", "")),
+            session_workspace_mode=str(data.get("session_workspace_mode", "")),
             task_description=str(data.get("task_description", "")),
             last_role=str(data.get("last_role", "")),
             last_output_summary=str(data.get("last_output_summary", "")),
@@ -173,7 +244,19 @@ class CoordinatorLoopState:
             "malformed_coordinator_round": self.malformed_coordinator_round,
             "total_transition_count": self.total_transition_count,
             "max_rounds": self.max_rounds,
+            "max_developer_rounds": self.max_developer_rounds,
+            "max_ui_rounds": self.max_ui_rounds,
+            "max_review_rounds": self.max_review_rounds,
+            "max_safety_rounds": self.max_safety_rounds,
             "max_total_transitions": self.max_total_transitions,
+            "awaiting_developer_correction": self.awaiting_developer_correction,
+            "developer_correction_complete": self.developer_correction_complete,
+            "developer_has_substantial_output": self.developer_has_substantial_output,
+            "last_developer_token": self.last_developer_token,
+            "last_reviewer_verdict": self.last_reviewer_verdict,
+            "session_prompt_id": self.session_prompt_id,
+            "session_workspace_profile": self.session_workspace_profile,
+            "session_workspace_mode": self.session_workspace_mode,
             "task_description": self.task_description,
             "last_role": self.last_role,
             "last_output_summary": self.last_output_summary,
@@ -390,6 +473,25 @@ def _validate_next_role(state: CoordinatorLoopState, role: str) -> str | None:
         return "NEXT: reviewer rejected before AGY approval in UI flow"
     if role == "safety_gate" and not state.reviewer_passed:
         return "NEXT: safety_gate rejected before reviewer pass"
+    if role == "developer":
+        if state.awaiting_developer_correction:
+            return None
+        if state.developer_correction_complete and state.review_round > 0 and not state.reviewer_passed:
+            return "NEXT: developer rejected — correction delivered; route reviewer for re-check"
+        if (
+            state.developer_has_substantial_output
+            and state.last_developer_token == "READY_FOR_COORDINATOR"
+            and state.developer_round >= state.max_developer_rounds
+        ):
+            return "NEXT: developer rejected — round budget reached with usable analysis"
+        if (
+            state.requires_agy
+            and not state.agy_approved
+            and state.last_developer_token == "READY_FOR_COORDINATOR"
+            and state.awaiting_developer_correction is False
+            and state.developer_correction_complete
+        ):
+            return "NEXT: developer rejected — route ui_lead for UX re-review"
     return None
 
 
@@ -408,14 +510,37 @@ def coordinator_allowed_tokens(state: CoordinatorLoopState) -> list[str]:
     return tokens
 
 
-def on_session_start(task_description: str,
-                     max_rounds: int = DEFAULT_MAX_ROUNDS) -> tuple[CoordinatorLoopState, CoordinatorAction]:
+def on_session_start(
+    task_description: str,
+    *,
+    loop_budget: CoordinatorLoopBudget | None = None,
+    max_rounds: int | None = None,
+    session_meta: dict[str, Any] | None = None,
+) -> tuple[CoordinatorLoopState, CoordinatorAction]:
     """Initialize loop state and trigger coordinator intake first."""
+    budget = loop_budget or CoordinatorLoopBudget()
+    if max_rounds is not None:
+        budget = CoordinatorLoopBudget(
+            developer=max_rounds,
+            ui_lead=max_rounds,
+            reviewer=max_rounds,
+            safety_gate=max_rounds,
+            max_total_transitions=budget.max_total_transitions,
+        )
+    meta = session_meta or {}
     state = CoordinatorLoopState(
         task_description=task_description,
-        max_rounds=max_rounds,
+        max_rounds=budget.developer,
+        max_developer_rounds=budget.developer,
+        max_ui_rounds=budget.ui_lead,
+        max_review_rounds=budget.reviewer,
+        max_safety_rounds=budget.safety_gate,
+        max_total_transitions=budget.max_total_transitions,
         phase=CoordinatorPhase.AWAIT_COORDINATOR,
         awaiting_role=COORDINATOR_ROLE,
+        session_prompt_id=str(meta.get("prompt_id") or ""),
+        session_workspace_profile=str(meta.get("workspace_profile") or ""),
+        session_workspace_mode=str(meta.get("workspace_mode") or ""),
     )
     state.total_transition_count = 1
     action = CoordinatorAction(
@@ -651,6 +776,92 @@ def on_worker_output(
     return _on_safety_output(state, text)
 
 
+def _has_substantial_developer_content(text: str, notes: str) -> bool:
+    """True when developer output contains enough analysis to continue routing."""
+    body = (notes or _body_after_first_line(text) or "").strip()
+    if len(body) >= MIN_SUBSTANTIAL_DEVELOPER_CHARS:
+        return True
+    markers = ("report_begin", "## ", "### ", "paymentmodal", "data flow", "findings")
+    low = body.lower()
+    return any(marker in low for marker in markers) and len(body) >= 120
+
+
+def _last_reviewer_verdict_from_log(state: CoordinatorLoopState) -> str:
+    for entry in reversed(state.verdict_log):
+        if entry.get("role") == "reviewer":
+            return str(entry.get("token") or "")
+    return state.last_reviewer_verdict
+
+
+def _next_role_hint_after_developer_ready(
+    state: CoordinatorLoopState,
+    *,
+    budget_exceeded: bool = False,
+) -> str:
+    if state.requires_agy and not state.agy_approved:
+        return (
+            "Developer analysis/correction is READY_FOR_COORDINATOR with substantial content. "
+            "Route ui_lead (AGY) for UX review with explicit TO: header. "
+            "Do NOT route developer again unless a new reviewer REQUEST CHANGES requires it."
+        )
+    if state.review_round > 0 and not state.reviewer_passed:
+        return (
+            "Developer correction pass is complete after reviewer REQUEST CHANGES. "
+            "Route reviewer for re-check with explicit TO: header. "
+            "Do NOT route developer again unless reviewer issues new REQUEST CHANGES."
+        )
+    if budget_exceeded:
+        return (
+            "Developer round budget reached but analysis is substantial. "
+            "Emit FINAL synthesis with PASS_WITH_NOTES or route reviewer/ui_lead if still required. "
+            "Do NOT issue a tooling BLOCKER for max developer rounds."
+        )
+    if state.requires_agy and state.agy_approved and not state.reviewer_passed:
+        return "Developer analysis ready. Route reviewer with explicit TO: header."
+    return "Developer reported READY_FOR_COORDINATOR. Decide next routing."
+
+
+def _coordinator_action_after_developer_ready(
+    state: CoordinatorLoopState,
+    *,
+    budget_exceeded: bool = False,
+) -> CoordinatorAction:
+    if state.awaiting_developer_correction:
+        state.awaiting_developer_correction = False
+        state.developer_correction_complete = True
+    return _coordinator_action(
+        state,
+        _next_role_hint_after_developer_ready(state, budget_exceeded=budget_exceeded),
+    )
+
+
+def _build_max_developer_rounds_diagnostics(
+    state: CoordinatorLoopState,
+    token: str,
+    text: str,
+    notes: str,
+) -> str:
+    substantial = _has_substantial_developer_content(text, notes)
+    next_role = "reviewer"
+    if state.requires_agy and not state.agy_approved:
+        next_role = "ui_lead"
+    lines = [
+        "max developer rounds exceeded",
+        f"role=developer",
+        f"max_rounds={state.max_developer_rounds}",
+        f"actual_rounds={state.developer_round}",
+        f"last_first_line_token={token}",
+        f"ready_for_coordinator={'yes' if token == 'READY_FOR_COORDINATOR' else 'no'}",
+        f"substantial_content={'yes' if substantial else 'no'}",
+        f"last_reviewer_verdict={_last_reviewer_verdict_from_log(state) or '(none)'}",
+        f"next_intended_role={next_role}",
+        f"prompt_id={state.session_prompt_id or '(none)'}",
+        f"workspace_profile={state.session_workspace_profile or '(none)'}",
+        f"workspace_mode={state.session_workspace_mode or '(none)'}",
+    ]
+    return "\n".join(lines)
+
+
 def _on_developer_output(
     state: CoordinatorLoopState,
     text: str,
@@ -659,6 +870,7 @@ def _on_developer_output(
 ) -> CoordinatorAction:
     token, notes = _parse_developer_verdict(text)
     _append_verdict(state, "developer", token, notes)
+    state.last_developer_token = token
 
     if token == "AMBIGUOUS":
         first = _first_non_empty_line(text)
@@ -685,8 +897,21 @@ def _on_developer_output(
         )
 
     state.developer_round += 1
-    if state.developer_round > state.max_rounds:
-        return _terminal_blocker(state, "max developer rounds exceeded")
+    substantial = token == "READY_FOR_COORDINATOR" and _has_substantial_developer_content(text, notes)
+    if substantial:
+        state.developer_has_substantial_output = True
+
+    over_budget = state.developer_round > state.max_developer_rounds
+    if over_budget:
+        if substantial:
+            return _coordinator_action_after_developer_ready(state, budget_exceeded=True)
+        return _terminal_blocker(
+            state,
+            _build_max_developer_rounds_diagnostics(state, token, text, notes),
+        )
+
+    if token == "READY_FOR_COORDINATOR" and substantial:
+        return _coordinator_action_after_developer_ready(state)
 
     return _coordinator_action(
         state,
@@ -732,7 +957,9 @@ def _on_ui_lead_output(
     # REQUEST UX CHANGES
     state.ui_round += 1
     state.agy_approved = False
-    if state.ui_round > state.max_rounds:
+    state.awaiting_developer_correction = True
+    state.developer_correction_complete = False
+    if state.ui_round > state.max_ui_rounds:
         return _terminal_blocker(state, "max ui_round exceeded")
     return _coordinator_action(
         state,
@@ -751,12 +978,16 @@ def _on_reviewer_output(state: CoordinatorLoopState, text: str) -> CoordinatorAc
 
     if token in ("PASS", "PASS WITH NOTES"):
         state.reviewer_passed = True
+        state.last_reviewer_verdict = token
         return _coordinator_action(state, "Reviewer passed. Route to safety_gate.")
 
     # REQUEST CHANGES
     state.review_round += 1
     state.reviewer_passed = False
-    if state.review_round > state.max_rounds:
+    state.last_reviewer_verdict = token
+    state.awaiting_developer_correction = True
+    state.developer_correction_complete = False
+    if state.review_round > state.max_review_rounds:
         return _terminal_blocker(state, "max review_round exceeded")
 
     ui_changed = _detect_ui_changed(notes)
@@ -794,7 +1025,7 @@ def _on_safety_output(state: CoordinatorLoopState, text: str) -> CoordinatorActi
     # BLOCK
     state.safety_round += 1
     state.safety_passed = False
-    if state.safety_round > state.max_rounds:
+    if state.safety_round > state.max_safety_rounds:
         return _terminal_blocker(state, f"safety gate blocked: {notes}")
     return _coordinator_action(
         state,
