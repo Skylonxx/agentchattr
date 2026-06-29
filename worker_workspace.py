@@ -27,6 +27,59 @@ TOOL_COMMAND_RE = re.compile(
 )
 REPORT_BEGIN_MARKER = "REPORT_BEGIN"
 REPORT_END_MARKER = "REPORT_END"
+REPORT_FILE_WRITE_BEGIN_MARKER = "REPORT_FILE_WRITE_BEGIN"
+REPORT_FILE_WRITE_END_MARKER = "REPORT_FILE_WRITE_END"
+
+_WRITE_PATH_PATTERNS = (
+    re.compile(
+        r"<\s*parameter\s+name=[\"']file_path[\"']\s*>([^<]+)</\s*parameter\s*>",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"<\s*parameter\s+name=[\"']path[\"']\s*>([^<]+)</\s*parameter\s*>",
+        re.IGNORECASE,
+    ),
+    re.compile(r"<\s*file_path\s*>([^<]+)</\s*file_path\s*>", re.IGNORECASE),
+)
+_WRITE_CONTENT_PATTERNS = (
+    re.compile(
+        r"<\s*parameter\s+name=[\"']content[\"']\s*>(.*?)</\s*parameter\s*>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"<\s*parameter\s+name=[\"']file_content[\"']\s*>(.*?)</\s*parameter\s*>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"<\s*content\s*>(.*?)</\s*content\s*>", re.IGNORECASE | re.DOTALL),
+)
+_REPORT_FILE_WRITE_FIELD_PATTERNS = {
+    "path": re.compile(r"^\s*Path\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    "status": re.compile(r"^\s*Status\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    "summary": re.compile(r"^\s*Summary\s*:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE),
+    "next_role": re.compile(
+        r"^\s*Next recommended role\s*:\s*(.+?)\s*$",
+        re.IGNORECASE | re.MULTILINE,
+    ),
+}
+
+REPORT_WRITE_BRIDGE_INSTRUCTION = (
+    "SCOPED REPORT WRITE (read-only report-flow sessions):\n"
+    "- You do not have generic file tools or shell.\n"
+    "- Do not emit <tool_call> XML or request Write/Read/Bash tools.\n"
+    "- To create your external .md report, output exactly one block:\n"
+    "  REPORT_FILE_WRITE_BEGIN\n"
+    "  Path: <absolute .md path under allowed Ai-Report roots>\n"
+    "  Status: PASS\n"
+    "  Summary: <short summary>\n"
+    "  Next recommended role: coordinator\n"
+    "  ---\n"
+    "  <markdown report body>\n"
+    "  REPORT_FILE_WRITE_END\n"
+    "- The worker runtime validates the path and writes the file.\n"
+    "- After the runtime confirms the file exists, your output becomes REPORT_READY.\n"
+    "- Do not claim REPORT_READY unless the runtime confirms the report file exists.\n"
+    "- Twinpet workspace writes are forbidden."
+)
 
 DEFAULT_SNAPSHOT_MAX_CHARS_PER_FILE = 48_000
 SNAPSHOT_HEAD_CHARS = 24_000
@@ -362,14 +415,22 @@ def run_workspace_precheck_structured(
     lines.extend([
         "",
         "SNAPSHOT WORKER CONTRACT:",
-        "- You have NO tools in this worker path (claude --print --tools \"\").",
-        "- Do NOT output <tool_call> XML markup or request Bash/Read tools.",
+        "- You have NO generic tools in this worker path (claude --print --tools \"\").",
+        "- Do NOT output <tool_call> XML markup or request Bash/Read/Write tools.",
         "- Analyze ONLY from AUTOMATED PRECHECK RESULTS and READ-ONLY FILE SNAPSHOT below.",
         "- If the snapshot is insufficient, return: BLOCKER: insufficient snapshot",
-        "- For final report markdown, wrap content between REPORT_BEGIN and REPORT_END lines.",
         "- Do NOT write Task.md, Context.md, or any file inside the Twinpet repo.",
-        "- Report will be saved outside the repo by agentchattr when possible.",
     ])
+    if is_report_only_readonly_policy(policy):
+        lines.extend([
+            "",
+            REPORT_WRITE_BRIDGE_INSTRUCTION,
+        ])
+    else:
+        lines.extend([
+            "- For final report markdown, wrap content between REPORT_BEGIN and REPORT_END lines.",
+            "- Report may be saved outside the repo by agentchattr when possible.",
+        ])
     return PrecheckResult(
         ok=True, text="\n".join(lines), head=head_val, porcelain=porcelain,
     )
@@ -477,6 +538,8 @@ def format_tool_call_leakage_blocker(
     lines.extend([
         "",
         "Claude --print runs with tools disabled. Use injected snapshots only.",
+        "For external report output in read-only report-flow sessions, use",
+        "REPORT_FILE_WRITE_BEGIN/END (see worker contract).",
         "Do not emit <tool_call> XML. Return plain-text analysis or BLOCKER: insufficient snapshot.",
     ])
     return "\n".join(lines)
@@ -490,6 +553,230 @@ def extract_report_block(text: str) -> str | None:
     end = text.index(REPORT_END_MARKER, start)
     block = text[start:end].strip()
     return block or None
+
+
+def extract_report_file_write_block(text: str) -> dict[str, str] | None:
+    """Parse REPORT_FILE_WRITE_BEGIN/END scoped worker report-write block."""
+    if REPORT_FILE_WRITE_BEGIN_MARKER not in text or REPORT_FILE_WRITE_END_MARKER not in text:
+        return None
+    start = text.index(REPORT_FILE_WRITE_BEGIN_MARKER) + len(REPORT_FILE_WRITE_BEGIN_MARKER)
+    end = text.index(REPORT_FILE_WRITE_END_MARKER, start)
+    body = text[start:end].strip()
+    if not body:
+        return None
+    header, _, markdown = body.partition("\n---\n")
+    if not markdown.strip():
+        if body.startswith("#"):
+            markdown = body
+            header = ""
+        else:
+            return None
+    fields: dict[str, str] = {}
+    for key, pattern in _REPORT_FILE_WRITE_FIELD_PATTERNS.items():
+        match = pattern.search(header)
+        fields[key] = match.group(1).strip() if match else ""
+    path = fields.get("path", "").strip().strip('"').strip("'")
+    if not path:
+        return None
+    return {
+        "path": path,
+        "status": fields.get("status") or "PASS",
+        "summary": fields.get("summary") or "report written via worker report-write bridge",
+        "next_role": fields.get("next_role") or "coordinator",
+        "content": markdown.strip(),
+    }
+
+
+def format_report_ready_after_worker_write(
+    *,
+    path: str,
+    status: str = "PASS",
+    summary: str = "",
+    notes: str = "",
+) -> str:
+    return (
+        "REPORT_READY\n\n"
+        f"Status:\n{status}\n\n"
+        f"Report:\n{path}\n\n"
+        f"Summary:\n{summary or 'report written'}\n\n"
+        "Next recommended role:\ncoordinator\n\n"
+        f"Notes:\n{notes or 'Report written through scoped worker report-write bridge.'}\n"
+    )
+
+
+def format_report_write_failed_reply(*, path: str, reason: str) -> str:
+    return (
+        "REPORT_WRITE_FAILED\n\n"
+        f"Reason:\n{reason}\n\n"
+        f"Expected report:\n{path}\n\n"
+        "Status:\nFAIL\n"
+    )
+
+
+def format_report_write_retry_instruction(*, path: str = "") -> str:
+    lines = [
+        "REPORT_WRITE_RETRY",
+        "",
+        "Reason:",
+        "Write tool-call markup cannot be executed in read-only report-flow mode.",
+        "",
+        "Action:",
+        "Re-emit your report using exactly one REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END block.",
+        "Do not emit <tool_call> XML.",
+    ]
+    if path:
+        lines.extend(["", f"Expected report:\n{path}"])
+    return "\n".join(lines)
+
+
+def _external_report_roots(policy: dict[str, Any]) -> list[str]:
+    from report_orchestration import resolve_external_report_write_roots
+    return list(resolve_external_report_write_roots(policy))
+
+
+def write_validated_external_report(
+    raw_path: str,
+    content: str,
+    policy: dict[str, Any],
+) -> tuple[bool, str, str]:
+    """Validate path under Ai-Report roots and write .md content. Returns ok, path, error."""
+    from report_orchestration import validate_report_path
+
+    if not (content or "").strip():
+        return False, raw_path, "empty report content"
+    roots = _external_report_roots(policy)
+    ok, reason, resolved = validate_report_path(raw_path, allowed_roots=roots)
+    if not ok:
+        blocker = reason if str(reason).startswith("BLOCKER:") else f"BLOCKER: {reason}"
+        return False, raw_path, blocker
+    assert resolved is not None
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(content.strip() + "\n", encoding="utf-8")
+    except OSError as exc:
+        return False, str(resolved), f"report write failed: {exc}"
+    return True, str(resolved), ""
+
+
+def extract_write_tool_call_intent(text: str) -> dict[str, str] | None:
+    """Extract path/content from a leaked Write tool-call block when possible."""
+    if not TOOL_CALL_TAG_RE.search(text or ""):
+        return None
+    if not re.search(r"<\s*tool_name\s*>\s*Write\s*</\s*tool_name\s*>", text, re.IGNORECASE):
+        return None
+    path = ""
+    for pattern in _WRITE_PATH_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            path = match.group(1).strip().strip('"').strip("'")
+            break
+    if not path:
+        return None
+    content = ""
+    for pattern in _WRITE_CONTENT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            content = match.group(1).strip()
+            break
+    return {"path": path, "content": content}
+
+
+def try_process_scoped_worker_report_output(
+    text: str,
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Handle REPORT_FILE_WRITE bridge / legacy REPORT_BEGIN for report-only sessions."""
+    if not isinstance(policy, dict) or not is_report_only_readonly_policy(policy):
+        return None
+    from report_orchestration import parse_report_ready, read_report_file, validate_report_path
+
+    parsed = parse_report_ready(text)
+    if parsed:
+        roots = _external_report_roots(policy)
+        ok, _reason, resolved = validate_report_path(parsed.report_path, allowed_roots=roots)
+        if ok and resolved:
+            read_ok, _, _, _ = read_report_file(resolved)
+            if read_ok:
+                return text.strip()
+
+    bridge = extract_report_file_write_block(text)
+    if bridge:
+        ok, saved_path, err = write_validated_external_report(
+            bridge["path"], bridge["content"], policy,
+        )
+        if ok:
+            return format_report_ready_after_worker_write(
+                path=saved_path,
+                status=bridge.get("status") or "PASS",
+                summary=bridge.get("summary") or "",
+            )
+        return format_report_write_failed_reply(path=bridge["path"], reason=err)
+
+    legacy = extract_report_block(text)
+    if legacy:
+        targets = [
+            p for p in (policy.get("report_paths") or [])
+            if isinstance(p, str) and p.strip()
+        ]
+        if targets:
+            ok, saved_path, err = write_validated_external_report(
+                targets[0], legacy, policy,
+            )
+            if ok:
+                return format_report_ready_after_worker_write(path=saved_path)
+            return format_report_write_failed_reply(path=targets[0], reason=err)
+    return None
+
+
+def try_recover_write_tool_call_leakage(
+    text: str,
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Translate allowed Write tool-call leaks into scoped report writes when safe."""
+    if not isinstance(policy, dict) or not is_report_only_readonly_policy(policy):
+        return None
+    from report_orchestration import is_twinpet_repo_path, validate_report_path
+
+    intent = extract_write_tool_call_intent(text)
+    if not intent:
+        return None
+    raw_path = intent["path"]
+    if is_twinpet_repo_path(raw_path):
+        return (
+            "BLOCKER: report write targets Twinpet workspace (forbidden)\n\n"
+            f"path={raw_path}\n"
+            "Use REPORT_FILE_WRITE_BEGIN/END with an external Ai-Report .md path only."
+        )
+    roots = _external_report_roots(policy)
+    ok, reason, _resolved = validate_report_path(raw_path, allowed_roots=roots)
+    if not ok:
+        blocker = reason if str(reason).startswith("BLOCKER:") else f"BLOCKER: {reason}"
+        return blocker
+    content = intent.get("content") or ""
+    if not content.strip():
+        return format_report_write_retry_instruction(path=raw_path)
+    ok, saved_path, err = write_validated_external_report(raw_path, content, policy)
+    if ok:
+        return format_report_ready_after_worker_write(
+            path=saved_path,
+            notes="Recovered from Write tool-call intent via scoped worker report-write bridge.",
+        )
+    return format_report_write_failed_reply(path=raw_path, reason=err)
+
+
+def process_claude_worker_report_output(
+    captured: str,
+    *,
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Return transformed worker output when report-write bridge handles it."""
+    handled = try_process_scoped_worker_report_output(captured, policy)
+    if handled is not None:
+        return handled
+    leakage = detect_tool_call_leakage(captured)
+    if leakage and str(leakage.get("tool_name", "")).lower() == "write":
+        return try_recover_write_tool_call_leakage(captured, policy)
+    return None
 
 
 def _path_outside_workspace(path: Path, workspace_root: Path) -> bool:

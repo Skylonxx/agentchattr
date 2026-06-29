@@ -1084,14 +1084,25 @@ def _process_claude_worker_output(
     *,
     queue_item: dict | None,
     cwd: str | Path | None,
+    data_dir=None,
 ) -> str:
     """Format Claude output or convert tool-call leakage to structured BLOCKER."""
     from worker_workspace import (
         detect_tool_call_leakage,
         format_tool_call_leakage_blocker,
+        load_canonical_policy_for_item,
+        process_claude_worker_report_output,
         snapshot_meta_from_item,
         worker_context_from_queue_item,
     )
+
+    policy = None
+    if isinstance(queue_item, dict):
+        policy = load_canonical_policy_for_item(queue_item, data_dir=data_dir)
+
+    bridge_reply = process_claude_worker_report_output(captured, policy=policy)
+    if bridge_reply is not None:
+        return bridge_reply
 
     leakage = detect_tool_call_leakage(captured)
     if leakage:
@@ -1841,9 +1852,12 @@ def _run_claude_direct_print_turn(
             captured,
             queue_item=queue_item if isinstance(queue_item, dict) else None,
             cwd=cwd,
+            data_dir=data_dir,
         )
         if (
             not reply.startswith("BLOCKER:")
+            and not reply.startswith("REPORT_READY")
+            and not reply.startswith("REPORT_WRITE_FAILED")
             and callable(on_success_save_report)
         ):
             saved = on_success_save_report(captured)

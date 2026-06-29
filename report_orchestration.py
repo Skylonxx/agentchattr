@@ -764,7 +764,10 @@ def build_initial_developer_report_prompt(
         "- Use injected snapshots only.",
         "- Do not modify product source, tests, backend files, mobile files, tracker docs, or hidden agent folders.",
         "- Create the report folder if missing.",
-        "- Return REPORT_READY with path/status/summary.",
+        "- Do not emit <tool_call> XML or use Write/Read/Bash tools.",
+        "- To write your external report, output exactly one REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END block.",
+        "- The worker runtime validates the path and creates the .md file; then your output becomes REPORT_READY.",
+        "- Do not claim REPORT_READY unless the runtime confirms the report file exists.",
         "- Do not use MCP tools. Do not call chat_read or chat_send.",
         "- Channel carries short status only; the report file is the source of truth.",
     ])
@@ -811,6 +814,16 @@ def build_initial_developer_report_prompt(
         "  <short summary>",
         "",
         "Return REPORT_READY only after the report exists on disk.",
+        "",
+        "REPORT_FILE_WRITE_BEGIN/END FORMAT:",
+        "  REPORT_FILE_WRITE_BEGIN",
+        "  Path: <absolute .md under allowed Ai-Report roots>",
+        "  Status: PASS",
+        "  Summary: <short summary>",
+        "  Next recommended role: coordinator",
+        "  ---",
+        "  <markdown report body>",
+        "  REPORT_FILE_WRITE_END",
     ])
     return ReportPromptResult(ok=True, prompt="\n".join(lines))
 

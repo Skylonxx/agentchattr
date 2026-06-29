@@ -23,13 +23,20 @@ from worker_workspace import (
     build_read_only_file_snapshots,
     detect_tool_call_leakage,
     extract_report_block,
+    extract_report_file_write_block,
     format_tool_call_leakage_blocker,
     is_docs_only_snapshot_mode,
     is_workspace_bound_queue_item,
+    process_claude_worker_report_output,
     read_allowlisted_file_snapshot,
     resolve_workspace_exec_cwd_or_blocker,
     run_workspace_precheck_structured,
+    try_process_scoped_worker_report_output,
+    try_recover_write_tool_call_leakage,
     try_save_external_analysis_report,
+    write_validated_external_report,
+    REPORT_FILE_WRITE_BEGIN_MARKER,
+    REPORT_FILE_WRITE_END_MARKER,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -418,11 +425,11 @@ class PromptContractTests(unittest.TestCase):
         )
         self.assertIn("FULL TASK MEMO", prompt)
         self.assertIn("REPORT-ONLY ANALYSIS", prompt)
-        self.assertIn("no tools", prompt.lower())
-        self.assertIn("tool_call", prompt)
+        self.assertIn("no generic tools", prompt.lower())
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", prompt)
         self.assertIn("No Twinpet repo writes", prompt)
         self.assertIn("EXTERNAL REPORT WRITE ALLOWLIST", prompt)
-        self.assertIn("Write your report to the exact expected path", prompt)
+        self.assertNotIn("Write your report to the exact expected path", prompt)
 
 
 class TwinpetSmokeTests(unittest.TestCase):
@@ -459,6 +466,129 @@ class TwinpetSmokeTests(unittest.TestCase):
         self.assertNotIn("src/", porcelain)
         self.assertNotIn("tests/", porcelain)
         self.assertEqual(head.stdout.strip(), EXPECTED_HEAD)
+
+
+class WorkerReportWriteBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "write_files": [],
+            "external_report_write_roots": self.roots,
+            "report_paths": [str(Path(self.tmp) / "analysis-report.md")],
+        }
+        self.report_path = str(Path(self.tmp) / "analysis-report.md")
+
+    def _bridge_body(self, path: str | None = None, content: str = "# Report\nDone.") -> str:
+        target = path or self.report_path
+        return (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {target}\n"
+            "Status: PASS\n"
+            "Summary: short summary\n"
+            "Next recommended role: coordinator\n"
+            "---\n"
+            f"{content}\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+
+    def test_extract_report_file_write_block(self):
+        parsed = extract_report_file_write_block(self._bridge_body())
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed["path"], self.report_path)
+        self.assertIn("# Report", parsed["content"])
+
+    def test_bridge_writes_md_under_ai_report_root(self):
+        out = try_process_scoped_worker_report_output(self._bridge_body(), self.policy)
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertTrue(Path(self.report_path).is_file())
+        self.assertIn(self.report_path, out)
+
+    def test_bridge_rejects_twinpet_repo_path(self):
+        twinpet_path = "C:/Users/Narachat/twinpet-pos/docs/report.md"
+        out = try_process_scoped_worker_report_output(
+            self._bridge_body(path=twinpet_path),
+            self.policy,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_WRITE_FAILED"))
+
+    def test_bridge_rejects_outside_root(self):
+        outside = "C:/outside/report.md"
+        ok, _path, err = write_validated_external_report(
+            outside, "# x", self.policy,
+        )
+        self.assertFalse(ok)
+        self.assertIn("outside allowed roots", err)
+
+    def test_bridge_rejects_non_md(self):
+        bad = str(Path(self.tmp) / "report.txt")
+        ok, _path, err = write_validated_external_report(bad, "# x", self.policy)
+        self.assertFalse(ok)
+        self.assertIn("only .md", err)
+
+    def test_write_tool_call_to_allowed_path_recovered(self):
+        xml = (
+            "<tool_call>\n<tool_name>Write</tool_name>\n<parameters>\n"
+            f'<parameter name="file_path">{self.report_path}</parameter>\n'
+            '<parameter name="content"># Recovered\nbody</parameter>\n'
+            "</parameters>\n</tool_call>"
+        )
+        out = process_claude_worker_report_output(xml, policy=self.policy)
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertTrue(Path(self.report_path).is_file())
+
+    def test_write_tool_call_to_twinpet_hard_blocks(self):
+        xml = (
+            "<tool_call>\n<tool_name>Write</tool_name>\n<parameters>\n"
+            '<parameter name="file_path">C:/Users/Narachat/twinpet-pos/src/x.md</parameter>\n'
+            '<parameter name="content"># bad</parameter>\n'
+            "</parameters>\n</tool_call>"
+        )
+        out = process_claude_worker_report_output(xml, policy=self.policy)
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("BLOCKER:"))
+        self.assertIn("Twinpet workspace", out)
+
+    def test_generic_tool_call_still_blocks(self):
+        xml = (
+            "<tool_call>\n<tool_name>Read</tool_name>\n<parameters>\n"
+            '<parameter name="path">src/foo.ts</parameter>\n'
+            "</parameters>\n</tool_call>"
+        )
+        self.assertIsNone(try_recover_write_tool_call_leakage(xml, self.policy))
+        info = detect_tool_call_leakage(xml)
+        self.assertIsNotNone(info)
+        blocker = format_tool_call_leakage_blocker(
+            role="developer",
+            cwd=TWINPET,
+            workspace_profile="twinpet-ui-09-c-payment-modal-analysis",
+            workspace_mode="read-only",
+            prompt_id="test",
+            leakage=info or {},
+            snapshot_mode=True,
+        )
+        self.assertIn("tool-call markup leaked", blocker)
+
+    def test_augmentation_mentions_report_write_bridge(self):
+        session = _analysis_session_record()
+        item = _analysis_queue_item()
+        augment, blocker, _meta = build_docs_only_worker_augmentation(
+            TWINPET, item, session["workspace_policy"],
+        )
+        self.assertIsNone(blocker)
+        assert augment is not None
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", augment)
+        self.assertIn("Do not emit <tool_call>", augment)
 
 
 if __name__ == "__main__":

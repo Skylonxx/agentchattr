@@ -768,6 +768,35 @@ class FinalReportAttachmentTests(unittest.TestCase):
         self.assertIn("from registered report files", attachment)
 
 
+class ReportWriteBridgeCoordinatorTests(unittest.TestCase):
+    def test_coordinator_ingests_bridge_report_ready(self):
+        tmp = tempfile.mkdtemp()
+        report = Path(tmp) / "dev.md"
+        report.write_text("# Dev\nbody", encoding="utf-8")
+        from coordinator_loop import on_coordinator_output, on_session_start, on_worker_output
+
+        state, _ = on_session_start("g", session_meta={"report_orchestrated": True})
+        on_coordinator_output(state, "CLASSIFY: UI\nui")
+        on_coordinator_output(state, "NEXT: developer\nBegin analysis.")
+        ctx = {
+            "allowed_report_roots": [tmp],
+            "report_paths_by_role": {"developer": str(report)},
+            "max_report_prompt_chars": 120000,
+        }
+        action = on_worker_output(
+            state,
+            "developer",
+            (
+                "REPORT_READY\n\nStatus:\nPASS\n\n"
+                f"Report:\n{report}\n\n"
+                "Summary:\nbridge summary\n"
+            ),
+            worker_context=ctx,
+        )
+        self.assertEqual(action.target_role, "coordinator")
+        self.assertEqual(len(state.report_records), 1)
+
+
 class ReportOrchestrationE2EFlowTests(unittest.TestCase):
     """End-to-end report-flow: dev → AGY → reviewer → correction → re-check → safety → FINAL."""
 

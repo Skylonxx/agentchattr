@@ -774,13 +774,13 @@ def build_scoped_write_worker_prompt(
                 "",
                 "REPORT-ONLY ANALYSIS: No Twinpet repo writes (no Task.md/Context.md/docs edits).",
                 "SNAPSHOT MODE: agentchattr injects AUTOMATED PRECHECK RESULTS and",
-                "READ-ONLY FILE SNAPSHOT before this turn. You have no tools.",
+                "READ-ONLY FILE SNAPSHOT before this turn. You have no generic tools.",
                 "Analyze from injected snapshots only.",
                 "You are allowed to write markdown report files only under the configured external Ai-Report report paths.",
                 "You are not allowed to write inside the Twinpet workspace.",
-                "Create the report folder if missing.",
-                "Write your report to the exact expected path.",
-                "Then return REPORT_READY with the report path.",
+                "Use REPORT_FILE_WRITE_BEGIN/END to create the external report; the worker runtime writes the file.",
+                "Do not emit <tool_call> XML. Do not use Write/Read/Bash tools.",
+                "After the runtime confirms the file exists, output becomes REPORT_READY.",
                 "Channel carries short status only; the report file is the source of truth.",
             ])
     else:
@@ -1048,6 +1048,17 @@ def coordinator_loop_worker_output_contract(
             "  coordinator / developer / ui_lead / reviewer / safety_gate\n\n"
             "Notes:\n"
             "  <short notes>\n\n"
+            "To create the report file, output exactly one:\n"
+            "  REPORT_FILE_WRITE_BEGIN\n"
+            "  Path: <absolute .md path>\n"
+            "  Status: PASS\n"
+            "  Summary: <short summary>\n"
+            "  Next recommended role: coordinator\n"
+            "  ---\n"
+            "  <markdown body>\n"
+            "  REPORT_FILE_WRITE_END\n\n"
+            "The worker runtime validates the path and writes the file, then transforms output to REPORT_READY.\n"
+            "Do not emit <tool_call> XML.\n\n"
             "If you cannot write the report file despite permission being configured, return:\n"
             "  REPORT_WRITE_FAILED\n\n"
             "Reason:\n"
