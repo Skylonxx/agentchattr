@@ -140,6 +140,8 @@ class SessionStore:
 
     def create(self, template_id: str, channel: str, cast: dict,
                started_by: str, goal: str = "",
+               prompt_body: str = "",
+               prompt_id: str = "",
                workspace_policy: dict | None = None,
                workspace_policy_hash: str | None = None,
                workspace_policy_version: int | None = None) -> dict | None:
@@ -169,6 +171,8 @@ class SessionStore:
                 "last_message_id": None,
                 "output_message_id": None,
                 "goal": goal.strip()[:500],
+                "prompt_body": (prompt_body or "").strip()[:50000],
+                "prompt_id": (prompt_id or "").strip()[:200],
             }
             if workspace_policy is not None:
                 session["workspace_policy"] = dict(workspace_policy)

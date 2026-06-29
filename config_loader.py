@@ -301,6 +301,29 @@ def get_workspace_presets_enriched(cfg: dict) -> list[dict]:
     return enriched
 
 
+def get_workspace_profiles_enriched(cfg: dict) -> list[dict]:
+    """Return workspace profiles for UI dropdown (read-only metadata)."""
+    profiles = get_workspace_profiles(cfg)
+    enriched: list[dict] = []
+    for profile_id, profile in profiles.items():
+        write_files = profile.get("default_write_files") or profile.get(
+            "allowed_write_files"
+        ) or []
+        read_paths = profile.get("default_read_paths") or []
+        enriched.append({
+            "id": profile_id,
+            "workspace_root": profile.get("workspace_root", ""),
+            "allowed_modes": list(profile.get("allowed_modes") or []),
+            "default_mode": profile.get("default_mode", ""),
+            "max_mode": profile.get("max_mode", ""),
+            "expected_head": profile.get("expected_head", ""),
+            "write_files": [str(f) for f in write_files] if isinstance(write_files, (list, tuple)) else [],
+            "read_paths": [str(f) for f in read_paths] if isinstance(read_paths, (list, tuple)) else [],
+            "report_paths": list(profile.get("default_report_paths") or []),
+        })
+    return enriched
+
+
 def get_workspace_policy_config(cfg: dict) -> dict:
     """Return workspace policy runtime config (safe defaults when missing)."""
     section = cfg.get("workspace_policy")

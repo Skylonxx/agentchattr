@@ -230,10 +230,17 @@ class SessionEngine:
 
     def start_session(self, template_id: str, channel: str, cast: dict,
                       started_by: str, goal: str = "",
+                      prompt_body: str = "",
+                      prompt_id: str = "",
                       workspace_policy: dict | None = None,
                       workspace_policy_hash: str | None = None,
                       workspace_policy_version: int | None = None) -> dict | None:
         """Start a new session. Returns the session dict or None on failure."""
+        from session_memo import normalize_goal, normalize_prompt_body
+
+        prompt_body = normalize_prompt_body(prompt_body)
+        goal = normalize_goal(goal, prompt_body=prompt_body)
+        prompt_id = (prompt_id or "").strip()[:200]
         # Central safety-role guard (fail-closed). A restricted dry-run agent
         # (claude_dryrun) must never be cast into a safety/verdict-parsed role;
         # refuse to even create the session. Bases are resolved so a renamed
@@ -275,6 +282,8 @@ class SessionEngine:
             "cast": cast,
             "started_by": started_by,
             "goal": goal,
+            "prompt_body": prompt_body,
+            "prompt_id": prompt_id,
         }
         if workspace_policy is not None:
             create_kwargs["workspace_policy"] = workspace_policy
@@ -762,6 +771,9 @@ class SessionEngine:
                 log.error("Session %d: failed to trigger %s: %s",
                           session["id"], agent, exc)
 
+    def _session_prompt_body(self, session: dict) -> str:
+        return str(session.get("prompt_body") or "")
+
     def _trigger_scoped_workspace_worker(
         self,
         session: dict,
@@ -788,6 +800,7 @@ class SessionEngine:
             phase_index=phase_idx,
             total_phases=len(tmpl.get("phases", [])),
             context_messages=context_messages,
+            prompt_body=self._session_prompt_body(session),
         )
         contract = coordinator_loop_worker_output_contract(role)
         if contract:
@@ -831,6 +844,7 @@ class SessionEngine:
                 phase_name=phase["name"],
                 content_to_review=content,
                 agent_base=agent_base,
+                prompt_body=self._session_prompt_body(session),
             )
         else:
             context_messages = self._get_recent_context(channel)
@@ -844,6 +858,7 @@ class SessionEngine:
                 instruction=phase.get("prompt", ""),
                 context_messages=context_messages,
                 agent_base=agent_base,
+                prompt_body=self._session_prompt_body(session),
             )
 
         relay_entry = self._make_relay_queue_entry(
@@ -1594,6 +1609,7 @@ class SessionEngine:
                 phase_name=phase["name"],
                 content_to_review=content,
                 agent_base=agent_base,
+                prompt_body=self._session_prompt_body(session),
             )
             relay_entry = self._make_relay_queue_entry(
                 prompt=prompt,
@@ -1644,6 +1660,7 @@ class SessionEngine:
             instruction=instruction,
             context_messages=context_messages,
             agent_base=agent_base,
+            prompt_body=self._session_prompt_body(session),
         )
         contract = coordinator_loop_worker_output_contract(role)
         if contract:

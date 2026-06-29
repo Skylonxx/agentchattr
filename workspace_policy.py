@@ -38,6 +38,7 @@ MODE_RANK = {mode: idx for idx, mode in enumerate(VALID_MODES)}
 
 # Session API alias: scoped-write maps to implementation (narrow write_files allowlist).
 SCOPED_WRITE_MODE_ALIASES = frozenset({"scoped-write"})
+READ_ONLY_ANALYSIS_MODE_ALIASES = frozenset({"read-only-analysis"})
 
 
 def normalize_workspace_mode(mode: str | None) -> str | None:
@@ -46,6 +47,8 @@ def normalize_workspace_mode(mode: str | None) -> str | None:
         return None
     if mode in SCOPED_WRITE_MODE_ALIASES:
         return "implementation"
+    if mode in READ_ONLY_ANALYSIS_MODE_ALIASES:
+        return "docs-only"
     return mode
 
 CANONICAL_ROLES = frozenset({
@@ -1017,4 +1020,6 @@ def workspace_policy_read_summary(session: dict[str, Any]) -> dict[str, Any]:
         "expected_head": workspace.get("expected_head"),
         "hash": session.get("workspace_policy_hash"),
         "version": session.get("workspace_policy_version"),
+        "prompt_id": session.get("prompt_id"),
+        "has_prompt_body": bool((session.get("prompt_body") or "").strip()),
     }

@@ -47,6 +47,7 @@ def build_relay_prompt(
     instruction: str,
     context_messages: list[dict] | None = None,
     agent_base: str = "",
+    prompt_body: str = "",
 ) -> str:
     """Build a sealed session-turn prompt for a relay-mode agent.
 
@@ -57,7 +58,9 @@ def build_relay_prompt(
     lines = [
         f"SESSION: {session_name}",
     ]
-    if goal:
+    if prompt_body:
+        lines.extend(["", "FULL TASK MEMO (authoritative):", prompt_body])
+    elif goal:
         lines.append(f"GOAL: {goal}")
     lines.append(f"PHASE: {phase_name} ({phase_index + 1}/{total_phases})")
     lines.append(f"YOUR ROLE: {role}")
@@ -91,13 +94,16 @@ def session_workspace_policy(session: dict | None) -> dict | None:
 
 
 def role_uses_scoped_workspace(session: dict | None, role: str) -> bool:
-    """True when role participates in an implementation/scoped-write workspace session."""
+    """True when role participates in an external workspace session (impl/docs-only)."""
     policy = session_workspace_policy(session)
-    if not policy or policy.get("mode") != "implementation":
+    if not policy or policy.get("mode") not in ("implementation", "docs-only"):
         return False
     import workspace_policy as wp
     perms = wp.role_permission_for(policy, role)
     if not perms:
+        return False
+    root = (policy.get("workspace") or {}).get("root")
+    if not root:
         return False
     return perms.get("filesystem") in ("write_allowlist", "read")
 
@@ -120,23 +126,29 @@ def build_scoped_write_worker_prompt(
     phase_index: int = 0,
     total_phases: int = 1,
     context_messages: list[dict] | None = None,
+    prompt_body: str = "",
 ) -> str:
-    """Build a coordinator-loop worker prompt for scoped-write implementation."""
+    """Build a coordinator-loop worker prompt for workspace-bound sessions."""
     import workspace_policy as wp
 
     workspace = policy.get("workspace") or {}
     root = workspace.get("root") or ""
     write_files = list(policy.get("write_files") or [])
+    read_paths = list(policy.get("read_paths") or [])
+    report_paths = list(policy.get("report_paths") or [])
     forbidden = list(policy.get("forbidden_paths") or [])
     expected_head = workspace.get("expected_head") or ""
+    mode = policy.get("mode") or ""
     perms = wp.role_permission_for(policy, role) or {}
     fs = perms.get("filesystem", "none")
 
     lines = [
         f"SESSION: {session_name}",
     ]
-    if goal:
-        lines.append(f"GOAL: {goal}")
+    if prompt_body:
+        lines.extend(["", "FULL TASK MEMO (authoritative):", prompt_body])
+    elif goal:
+        lines.append(f"GOAL SUMMARY: {goal}")
     if phase_name:
         lines.append(f"PHASE: {phase_name} ({phase_index + 1}/{total_phases})")
     lines.append(f"YOUR ROLE: {role}")
@@ -145,7 +157,7 @@ def build_scoped_write_worker_prompt(
 
     lines.extend([
         "",
-        "WORKSPACE CONTRACT (scoped-write — authoritative over template read-only text):",
+        f"WORKSPACE CONTRACT ({mode or 'scoped'} — authoritative over template read-only text):",
         f"WORKING DIRECTORY: {root}",
         "You MUST treat this path as your workspace root for this turn.",
         "Do not claim you are in agentchattr-scratch or another repo.",
@@ -154,24 +166,46 @@ def build_scoped_write_worker_prompt(
     if expected_head:
         lines.append(f"EXPECTED GIT HEAD: {expected_head}")
 
-    if fs == "write_allowlist":
+    if read_paths and fs in ("read", "write_allowlist"):
+        lines.extend(["", "ALLOWED READ PATHS:"])
+        for rp in read_paths:
+            lines.append(f"  - {rp}")
+
+    if report_paths and fs == "write_allowlist":
         lines.extend([
             "",
-            "PREFLIGHT (run before editing):",
-            "  pwd",
-            "  git status --short",
-            "  git rev-parse HEAD",
-            "",
-            "ALLOWED FILE WRITES (exact allowlist only):",
+            "REPORT OUTPUT PATHS (write final report here when instructed):",
         ])
+        for rp in report_paths:
+            lines.append(f"  - {rp}")
+
+    if fs == "write_allowlist":
+        if mode == "implementation":
+            lines.extend([
+                "",
+                "PREFLIGHT (run before editing):",
+                "  pwd",
+                "  git status --short",
+                "  git rev-parse HEAD",
+                "",
+            ])
+        else:
+            lines.append("")
+        lines.append("ALLOWED FILE WRITES (exact allowlist only):")
         for wf in write_files:
             lines.append(f"  - {wf}")
-        lines.extend([
-            "",
-            "FORBIDDEN WRITES (non-exhaustive red zones):",
-            "  POSPage.tsx, useCheckout.ts, asyncCheckout.ts, cartUtils.ts,",
-            "  payment finalization, cart math, keyboard contracts, Firebase/rules, git writes.",
-        ])
+        if mode == "implementation":
+            lines.extend([
+                "",
+                "FORBIDDEN WRITES (non-exhaustive red zones):",
+                "  POSPage.tsx, useCheckout.ts, asyncCheckout.ts, cartUtils.ts,",
+                "  payment finalization, cart math, keyboard contracts, Firebase/rules, git writes.",
+            ])
+        elif mode == "docs-only":
+            lines.extend([
+                "",
+                "DOCS-ONLY: No src/** or tests/** writes. Report/docs paths only.",
+            ])
         if forbidden:
             lines.append("Configured forbidden path patterns also apply.")
         lines.extend([
@@ -216,6 +250,7 @@ def build_safety_gate_prompt(
     phase_name: str,
     content_to_review: str,
     agent_base: str = "",
+    prompt_body: str = "",
 ) -> str:
     """Build a safety gate prompt for CodexSafe relay turns.
 
@@ -251,7 +286,12 @@ def build_safety_gate_prompt(
         "  Ordinary harmless summarisation or analysis request → PASS",
         "",
         f"SESSION: {session_name}",
-        f"GOAL: {goal}",
+    ]
+    if prompt_body:
+        lines.extend([f"GOAL SUMMARY: {goal}" if goal else "", "", "FULL TASK MEMO (authoritative):", prompt_body])
+    else:
+        lines.append(f"GOAL: {goal}")
+    lines.extend([
         f"PHASE: {phase_name}",
         "YOUR ROLE: safety_gate",
         "",
@@ -261,7 +301,7 @@ def build_safety_gate_prompt(
         "---",
         "",
         "Now return your verdict. First non-empty line must be PASS or BLOCK: <reason>.",
-    ]
+    ])
 
     return "\n\n".join(lines)
 

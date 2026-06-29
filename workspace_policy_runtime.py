@@ -90,6 +90,11 @@ def external_cwd_enabled_for_mode(cfg: dict | None, mode: str | None) -> bool:
         return is_read_only_external_cwd_enabled(cfg)
     if mode == "implementation":
         return is_scoped_write_external_cwd_enabled(cfg)
+    if mode == "docs-only":
+        return (
+            is_scoped_write_external_cwd_enabled(cfg)
+            or is_read_only_external_cwd_enabled(cfg)
+        )
     return False
 
 
@@ -335,7 +340,7 @@ def resolve_role_cwd(
     if mode == "scratch-readonly":
         return default_scratch
 
-    if mode not in ("read-only", "implementation"):
+    if mode not in ("read-only", "implementation", "docs-only"):
         return default_scratch
 
     workspace = canonical.get("workspace") or {}
@@ -351,6 +356,11 @@ def resolve_role_cwd(
     fs = perms.get("filesystem", "none")
     if mode == "read-only":
         if fs not in ("read", "none"):
+            return default_scratch
+    elif mode == "docs-only":
+        if fs == "none":
+            return default_scratch
+        if fs not in ("read", "write_allowlist"):
             return default_scratch
     elif mode == "implementation":
         if fs == "none":

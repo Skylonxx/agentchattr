@@ -24,7 +24,11 @@ from agents import AgentTrigger
 from registry import RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
-from config_loader import get_workspace_presets_enriched, get_workspace_profiles
+from config_loader import (
+    get_workspace_presets_enriched,
+    get_workspace_profiles,
+    get_workspace_profiles_enriched,
+)
 import workspace_policy as workspace_policy_mod
 from safety_invariants import (
     build_sandbox_flow_channel_name,
@@ -2560,6 +2564,36 @@ async def get_workspace_presets():
     return JSONResponse({"presets": get_workspace_presets_enriched(config or {})})
 
 
+@app.get("/api/sessions/workspace-profiles")
+async def get_workspace_profiles_api():
+    """Return server-approved workspace profiles for memo launcher dropdown."""
+    return JSONResponse({"profiles": get_workspace_profiles_enriched(config or {})})
+
+
+@app.post("/api/sessions/analyze-memo")
+async def analyze_session_memo(request: Request):
+    """Parse a prompt memo and suggest launcher field values (non-authoritative)."""
+    import session_memo
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+
+    memo = body.get("prompt_body") or body.get("memo") or body.get("instructions") or ""
+    profiles = get_workspace_profiles(config or {})
+    presets = get_workspace_presets_enriched(config or {})
+    result = session_memo.analyze_memo(
+        memo,
+        profiles=profiles,
+        presets=presets,
+        hints=body,
+    )
+    return JSONResponse(result)
+
+
 @app.get("/api/sessions/active")
 async def get_active_session(channel: str = "general"):
     if not session_engine:
@@ -2823,7 +2857,17 @@ async def start_session(request: Request):
     channel = body.get("channel", "general")
     cast = body.get("cast", {})
     goal = body.get("goal", "")
+    prompt_body = body.get("prompt_body") or body.get("instructions") or body.get("memo") or ""
+    prompt_id = body.get("prompt_id", "")
     started_by = body.get("started_by", "user")
+
+    import session_memo as session_memo_mod
+    from session_memo import parse_memo_headers
+
+    prompt_body = session_memo_mod.normalize_prompt_body(prompt_body)
+    if not prompt_id and prompt_body:
+        prompt_id = parse_memo_headers(prompt_body).prompt_id
+    goal = session_memo_mod.normalize_goal(goal, prompt_body=prompt_body)
 
     # If running from a draft, load the inline template from message metadata
     tmpl = None
@@ -2878,12 +2922,31 @@ async def start_session(request: Request):
         )
     policy_fields = workspace_policy_mod.build_session_workspace_policy_fields(policy_result.policy)
 
+    memo_safety = session_memo_mod.validate_memo_start(
+        prompt_body,
+        start_body=body,
+        profiles=profiles,
+        policy=policy_result.policy,
+    )
+    if not memo_safety.ok:
+        return JSONResponse(
+            {
+                "error": "memo safety block",
+                "code": memo_safety.code or "MEMO_SAFETY_BLOCK",
+                "details": list(memo_safety.errors),
+                "warnings": list(memo_safety.warnings),
+            },
+            status_code=400,
+        )
+
     session = session_engine.start_session(
         template_id,
         channel,
         cast,
         started_by,
         goal,
+        prompt_body=prompt_body,
+        prompt_id=prompt_id,
         workspace_policy=policy_fields["workspace_policy"],
         workspace_policy_hash=policy_fields["workspace_policy_hash"],
         workspace_policy_version=policy_fields["workspace_policy_version"],

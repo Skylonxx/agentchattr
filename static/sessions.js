@@ -18,6 +18,8 @@
 let activeSession = null;
 let sessionTemplates = [];
 let workspacePresets = [];
+let workspaceProfiles = [];
+let memoAnalysisResult = null;
 let activeSessionsByChannel = {};
 let sessionIndicatorTargetChannel = null;
 
@@ -166,6 +168,19 @@ async function fetchWorkspacePresets() {
     } catch (e) {
         console.warn('Failed to fetch workspace presets', e);
         workspacePresets = [];
+    }
+}
+
+async function fetchWorkspaceProfiles() {
+    try {
+        const res = await fetch('/api/sessions/workspace-profiles', { headers: { 'X-Session-Token': window.SESSION_TOKEN } });
+        if (res.ok) {
+            const data = await res.json();
+            workspaceProfiles = data.profiles || [];
+        }
+    } catch (e) {
+        console.warn('Failed to fetch workspace profiles', e);
+        workspaceProfiles = [];
     }
 }
 
@@ -414,7 +429,242 @@ function showSessionLauncher() {
     let existing = document.getElementById('session-launcher-modal');
     if (existing) existing.remove();
 
-    fetchWorkspacePresets().then(() => _renderSessionLauncher());
+    Promise.all([fetchWorkspacePresets(), fetchWorkspaceProfiles()]).then(() => _renderSessionLauncher());
+}
+
+function switchLauncherTab(tab) {
+    const templates = document.getElementById('session-tab-templates');
+    const memo = document.getElementById('session-tab-memo');
+    const cast = document.getElementById('session-step-cast');
+    document.querySelectorAll('.session-launcher-tab').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.tab === tab);
+    });
+    if (tab === 'memo') {
+        if (templates) templates.classList.add('hidden');
+        if (cast) cast.classList.add('hidden');
+        if (memo) memo.classList.remove('hidden');
+    } else {
+        if (memo) memo.classList.add('hidden');
+        if (cast) cast.classList.add('hidden');
+        if (templates) templates.classList.remove('hidden');
+    }
+}
+
+function _memoProfileOptions(selected) {
+    const opts = ['<option value="">— select profile —</option>'];
+    workspaceProfiles.forEach(p => {
+        const sel = p.id === selected ? 'selected' : '';
+        opts.push(`<option value="${window.escapeHtml(p.id)}" ${sel}>${window.escapeHtml(p.id)}</option>`);
+    });
+    workspacePresets.forEach(p => {
+        if (!workspaceProfiles.find(pr => pr.id === p.workspace_profile)) return;
+        if (p.workspace_profile === selected) return;
+    });
+    return opts.join('');
+}
+
+function _memoTemplateOptions(selected) {
+    const defaultId = selected || 'project-readonly-coordinator-loop';
+    return sessionTemplates.map(t =>
+        `<option value="${window.escapeHtml(t.id)}" ${t.id === defaultId ? 'selected' : ''}>${window.escapeHtml(t.name)}</option>`
+    ).join('');
+}
+
+function _memoCastEditor(cast) {
+    const agents = _getAvailableAgents();
+    const assignees = [...agents, window.username];
+    const roles = ['coordinator', 'developer', 'ui_lead', 'reviewer', 'safety_gate'];
+    const defaults = {
+        coordinator: 'codex_coordinator',
+        developer: 'claude',
+        ui_lead: 'agy',
+        reviewer: 'codex_reviewer',
+        safety_gate: 'codexsafe',
+    };
+    return roles.map(role => {
+        const assigned = (cast && cast[role]) || defaults[role] || '';
+        const options = assignees.map(a =>
+            `<option value="${window.escapeHtml(a)}" ${a === assigned ? 'selected' : ''}>${window.escapeHtml(a)}</option>`
+        ).join('');
+        return `<div class="session-cast-row">
+            <span class="session-cast-role">${window.escapeHtml(role)}</span>
+            <select class="session-memo-cast-select" data-role="${window.escapeHtml(role)}">${options}</select>
+        </div>`;
+    }).join('');
+}
+
+function _selectedMemoProfile() {
+    const sel = document.getElementById('memo-workspace-profile');
+    const id = sel ? sel.value : '';
+    return workspaceProfiles.find(p => p.id === id) || null;
+}
+
+function _updateMemoSafetyPreview() {
+    const panel = document.getElementById('memo-safety-preview');
+    if (!panel) return;
+    const profile = _selectedMemoProfile();
+    const mode = document.getElementById('memo-workspace-mode')?.value || '';
+    const expectedHead = document.getElementById('memo-expected-head')?.value || '';
+    const memo = document.getElementById('memo-prompt-body')?.value || '';
+    const warnings = [];
+    const errors = [];
+
+    if (memoAnalysisResult?.safety?.errors?.length) {
+        errors.push(...memoAnalysisResult.safety.errors);
+    }
+    if (memoAnalysisResult?.warnings?.length) {
+        warnings.push(...memoAnalysisResult.warnings);
+    }
+
+    if (/READ[\s\-]?ONLY/i.test(memo) && (mode === 'scoped-write' || mode === 'implementation')) {
+        errors.push('READ-ONLY prompt + scoped-write/implementation mode: BLOCK');
+    }
+    if (/scoped[\s\-]?write/i.test(memo) && (mode === 'read-only' || mode === 'read-only-analysis')) {
+        errors.push('Scoped-write prompt + read-only mode: BLOCK');
+    }
+    if (!profile && /twinpet|PaymentModal|UI-09-C/i.test(memo)) {
+        errors.push('No workspace profile selected for repo-specific prompt: BLOCK');
+    }
+    if (profile) {
+        if (expectedHead && profile.expected_head && expectedHead !== profile.expected_head) {
+            errors.push('Expected HEAD mismatches profile default.');
+        }
+    }
+    if ((document.getElementById('memo-prompt-body')?.value || '').length > 500) {
+        warnings.push('Goal is short; full memo will be passed separately.');
+    }
+
+    const writeFiles = profile?.write_files || [];
+    const readPaths = profile?.read_paths || [];
+    const root = profile?.workspace_root || '—';
+
+    panel.innerHTML = `
+        <div class="session-memo-preview-title">Safety preview</div>
+        <dl class="session-preset-details">
+            <dt>Workspace</dt><dd><code>${window.escapeHtml(root)}</code></dd>
+            <dt>Mode</dt><dd>${window.escapeHtml(mode || '—')}</dd>
+            <dt>Expected HEAD</dt><dd><code>${window.escapeHtml(expectedHead || profile?.expected_head || '—')}</code></dd>
+            <dt>Write allowlist</dt><dd>${writeFiles.length ? writeFiles.map(f => window.escapeHtml(f)).join(', ') : 'none'}</dd>
+            <dt>Read paths</dt><dd>${readPaths.length ? readPaths.slice(0, 6).map(f => window.escapeHtml(f)).join(', ') : 'workspace root'}</dd>
+        </dl>
+        ${errors.length ? `<ul class="session-memo-errors">${errors.map(e => `<li>${window.escapeHtml(e)}</li>`).join('')}</ul>` : ''}
+        ${warnings.length ? `<ul class="session-memo-warnings">${warnings.map(w => `<li>${window.escapeHtml(w)}</li>`).join('')}</ul>` : ''}
+        ${!errors.length ? '<div class="session-memo-ok">Selected workspace contract controls file access.</div>' : ''}
+    `;
+}
+
+function _applyMemoSuggestions(suggestions) {
+    if (!suggestions) return;
+    const setVal = (id, val) => { const el = document.getElementById(id); if (el && val) el.value = val; };
+    setVal('memo-goal', suggestions.goal);
+    setVal('memo-channel', suggestions.channel);
+    setVal('memo-workspace-profile', suggestions.workspace_profile);
+    setVal('memo-workspace-mode', suggestions.workspace_mode);
+    setVal('memo-expected-head', suggestions.expected_head);
+    setVal('memo-template', suggestions.template_id);
+    if (suggestions.cast) {
+        Object.entries(suggestions.cast).forEach(([role, agent]) => {
+            const sel = document.querySelector(`.session-memo-cast-select[data-role="${role}"]`);
+            if (sel) sel.value = agent;
+        });
+    }
+    _updateMemoSafetyPreview();
+}
+
+async function analyzePromptMemo() {
+    const memo = document.getElementById('memo-prompt-body')?.value || '';
+    if (!memo.trim()) {
+        alert('Paste a prompt memo first.');
+        return;
+    }
+    const body = {
+        prompt_body: memo,
+        goal: document.getElementById('memo-goal')?.value || '',
+        channel: document.getElementById('memo-channel')?.value || '',
+        workspace_profile: document.getElementById('memo-workspace-profile')?.value || '',
+        workspace_mode: document.getElementById('memo-workspace-mode')?.value || '',
+        expected_head: document.getElementById('memo-expected-head')?.value || '',
+        template_id: document.getElementById('memo-template')?.value || '',
+    };
+    try {
+        const res = await fetch('/api/sessions/analyze-memo', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Session-Token': window.SESSION_TOKEN },
+            body: JSON.stringify(body),
+        });
+        if (!res.ok) {
+            const data = await res.json();
+            alert(data.error || 'Analyze failed');
+            return;
+        }
+        memoAnalysisResult = await res.json();
+        _applyMemoSuggestions(memoAnalysisResult.suggestions);
+        _updateMemoSafetyPreview();
+    } catch (e) {
+        alert('Error: ' + e.message);
+    }
+}
+
+function _collectMemoCast() {
+    const cast = {};
+    document.querySelectorAll('.session-memo-cast-select').forEach(sel => {
+        cast[sel.dataset.role] = sel.value;
+    });
+    return cast;
+}
+
+async function launchMemoSession() {
+    const memo = document.getElementById('memo-prompt-body')?.value || '';
+    if (!memo.trim()) {
+        alert('Paste a full memo prompt before starting.');
+        return;
+    }
+    const goal = document.getElementById('memo-goal')?.value?.trim() || '';
+    const channel = document.getElementById('memo-channel')?.value?.trim() || window.activeChannel;
+    const profile = document.getElementById('memo-workspace-profile')?.value || '';
+    const mode = document.getElementById('memo-workspace-mode')?.value || '';
+    const expectedHead = document.getElementById('memo-expected-head')?.value?.trim() || '';
+    const templateId = document.getElementById('memo-template')?.value || 'project-readonly-coordinator-loop';
+    const cast = _collectMemoCast();
+
+    _updateMemoSafetyPreview();
+    const errors = document.querySelectorAll('#memo-safety-preview .session-memo-errors li');
+    if (errors.length) {
+        alert('Fix safety blocks before starting:\n' + Array.from(errors).map(e => e.textContent).join('\n'));
+        return;
+    }
+
+    const modal = document.getElementById('session-launcher-modal');
+    if (modal) modal.remove();
+
+    const finalChannel = await ensureSessionChannel(channel);
+
+    const payload = {
+        template_id: templateId,
+        channel: finalChannel,
+        cast: cast,
+        goal: goal,
+        prompt_body: memo,
+        started_by: window.username,
+    };
+    if (profile) payload.workspace_profile = profile;
+    if (mode) payload.workspace_mode = mode;
+    if (expectedHead) payload.expected_head = expectedHead;
+
+    try {
+        const res = await fetch('/api/sessions/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Session-Token': window.SESSION_TOKEN },
+            body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+            const data = await res.json();
+            const details = (data.details || []).join('\n');
+            alert((data.error || 'Failed to start session') + (details ? '\n' + details : ''));
+        }
+    } catch (e) {
+        alert('Error starting session: ' + e.message);
+    }
 }
 
 function _renderSessionLauncher() {
@@ -435,14 +685,17 @@ function _renderSessionLauncher() {
         </div>`
     ).join('');
 
-    const presetCards = workspacePresets.map(p =>
-        `<div class="session-tmpl-card session-preset-card" onclick="showPresetPreview('${window.escapeHtml(p.id)}')" title="${window.escapeHtml(p.description || '')}">
-            <span class="session-preset-badge">Scoped Write</span>
+    const presetCards = workspacePresets.map(p => {
+        const isAnalysis = (p.workspace_mode || '').includes('read-only');
+        const badge = isAnalysis ? 'Read-Only Analysis' : 'Scoped Write';
+        const badgeClass = isAnalysis ? 'session-preset-badge-analysis' : 'session-preset-badge';
+        return `<div class="session-tmpl-card session-preset-card" onclick="showPresetPreview('${window.escapeHtml(p.id)}')" title="${window.escapeHtml(p.description || '')}">
+            <span class="${badgeClass}">${badge}</span>
             <div class="session-tmpl-name">${window.escapeHtml(p.label || p.id)}</div>
             <div class="session-tmpl-desc">${window.escapeHtml(p.description || '')}</div>
             <div class="session-preset-meta">Profile: ${window.escapeHtml(p.workspace_profile || '')}</div>
-        </div>`
-    ).join('');
+        </div>`;
+    }).join('');
 
     const presetSection = presetCards
         ? `<div class="session-launcher-section-label">Workspace Presets</div>
@@ -467,22 +720,70 @@ function _renderSessionLauncher() {
         </div>`;
 
     modal.innerHTML = `
-        <div class="session-launcher-dialog">
+        <div class="session-launcher-dialog session-launcher-dialog-wide">
             <div class="session-launcher-header">
                 <span>Start a Session</span>
                 <button onclick="this.closest('.session-launcher-overlay').remove()">&times;</button>
             </div>
-            <div class="session-launcher-goal">
-                <input id="session-goal-input" type="text" placeholder="Goal (optional) -- what should this session achieve?" />
+            <div class="session-launcher-tabs">
+                <button type="button" class="session-launcher-tab active" data-tab="templates" onclick="switchLauncherTab('templates')">Templates</button>
+                <button type="button" class="session-launcher-tab" data-tab="memo" onclick="switchLauncherTab('memo')">Prompt Memo</button>
             </div>
-            <div id="session-step-templates">
+            <div id="session-tab-templates">
+                <div class="session-launcher-goal">
+                    <input id="session-goal-input" type="text" placeholder="Goal (optional) -- short summary for display" maxlength="500" />
+                </div>
                 <div class="session-launcher-templates">${presetSection}${templateOptions}${designCard}</div>
+            </div>
+            <div id="session-tab-memo" class="hidden">
+                <div class="session-memo-hint">Paste full memo prompt here. Goal is only a short summary; the full memo is passed separately to agents.</div>
+                <label class="session-memo-label" for="memo-prompt-body">Prompt memo / full instruction</label>
+                <textarea id="memo-prompt-body" class="session-memo-textarea" rows="12" placeholder="PROMPT ID: ...&#10;MODE: READ-ONLY&#10;PROJECT: ..."></textarea>
+                <label class="session-memo-label" for="memo-goal">Goal / summary (display only, max 500 chars)</label>
+                <input id="memo-goal" class="session-memo-input" type="text" maxlength="500" placeholder="Short summary for session bar and channel display" />
+                <div class="session-memo-grid">
+                    <div>
+                        <label class="session-memo-label" for="memo-workspace-profile">Workspace profile</label>
+                        <select id="memo-workspace-profile" class="session-memo-input" onchange="_updateMemoSafetyPreview()">${_memoProfileOptions('')}</select>
+                    </div>
+                    <div>
+                        <label class="session-memo-label" for="memo-workspace-mode">Workspace mode</label>
+                        <select id="memo-workspace-mode" class="session-memo-input" onchange="_updateMemoSafetyPreview()">
+                            <option value="">— select mode —</option>
+                            <option value="read-only">read-only</option>
+                            <option value="read-only-analysis">read-only analysis (docs-only)</option>
+                            <option value="scoped-write">scoped-write</option>
+                            <option value="implementation">implementation</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="session-memo-label" for="memo-expected-head">Expected HEAD</label>
+                        <input id="memo-expected-head" class="session-memo-input" type="text" placeholder="optional git HEAD" oninput="_updateMemoSafetyPreview()" />
+                    </div>
+                    <div>
+                        <label class="session-memo-label" for="memo-channel">Channel</label>
+                        <input id="memo-channel" class="session-memo-input" type="text" placeholder="auto from PROMPT ID or enter" />
+                    </div>
+                    <div>
+                        <label class="session-memo-label" for="memo-template">Template</label>
+                        <select id="memo-template" class="session-memo-input">${_memoTemplateOptions('project-readonly-coordinator-loop')}</select>
+                    </div>
+                </div>
+                <div class="session-memo-cast-label">Cast</div>
+                <div class="session-cast-list session-memo-cast-list">${_memoCastEditor({})}</div>
+                <div id="memo-safety-preview" class="session-memo-safety-preview"></div>
+                <div class="session-memo-actions">
+                    <button type="button" class="session-draft-btn" onclick="analyzePromptMemo()">Analyze Prompt</button>
+                    <button type="button" class="session-start-btn session-preset-start-btn" onclick="launchMemoSession()">Start Session</button>
+                    <button type="button" class="session-back-btn" onclick="document.getElementById('session-launcher-modal')?.remove()">Cancel</button>
+                </div>
             </div>
             <div id="session-step-cast" class="hidden"></div>
         </div>
     `;
     document.body.appendChild(modal);
     document.getElementById('session-goal-input')?.focus();
+    _updateMemoSafetyPreview();
 }
 
 async function sendDesignRequest() {
@@ -1065,6 +1366,7 @@ Store.watch('activeChannel', function (newChannel) {
 function _sessionsInit() {
     fetchSessionTemplates();
     fetchWorkspacePresets();
+    fetchWorkspaceProfiles();
     fetchAllActiveSessions();
     activeSession = null;
     updateSessionBar();
@@ -1089,6 +1391,10 @@ window.showPresetPreview = showPresetPreview;
 window.sessionCastBack = sessionCastBack;
 window.launchSessionWithCast = launchSessionWithCast;
 window.launchPresetSession = launchPresetSession;
+window.switchLauncherTab = switchLauncherTab;
+window.analyzePromptMemo = analyzePromptMemo;
+window.launchMemoSession = launchMemoSession;
+window._updateMemoSafetyPreview = _updateMemoSafetyPreview;
 window.launchDraftSession = launchDraftSession;
 window.sendDesignRequest = sendDesignRequest;
 window.syncSessionCastRole = syncSessionCastRole;

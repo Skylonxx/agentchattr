@@ -278,7 +278,7 @@ class ScopedWriteEngineTests(unittest.TestCase):
         last = dev_triggers[-1]
         self.assertNotIn("relay_entry", last)
         prompt = last.get("prompt", "")
-        self.assertIn("WORKSPACE CONTRACT (scoped-write", prompt)
+        self.assertIn("WORKSPACE CONTRACT (implementation", prompt)
         self.assertIn(TWINPET, prompt)
         self.assertIn("src/components/PaymentModal.tsx", prompt)
 
