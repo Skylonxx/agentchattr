@@ -171,6 +171,8 @@ class CoordinatorLoopState:
     last_reviewer_verdict: str = ""
     last_developer_analysis: str = ""
     last_ui_lead_notes: str = ""
+    report_orchestrated: bool = False
+    report_records: list[dict[str, Any]] = field(default_factory=list)
     session_prompt_id: str = ""
     session_workspace_profile: str = ""
     session_workspace_mode: str = ""
@@ -220,6 +222,8 @@ class CoordinatorLoopState:
             last_reviewer_verdict=str(data.get("last_reviewer_verdict", "")),
             last_developer_analysis=str(data.get("last_developer_analysis", "")),
             last_ui_lead_notes=str(data.get("last_ui_lead_notes", "")),
+            report_orchestrated=bool(data.get("report_orchestrated", False)),
+            report_records=list(data.get("report_records", [])),
             session_prompt_id=str(data.get("session_prompt_id", "")),
             session_workspace_profile=str(data.get("session_workspace_profile", "")),
             session_workspace_mode=str(data.get("session_workspace_mode", "")),
@@ -260,6 +264,8 @@ class CoordinatorLoopState:
         "last_reviewer_verdict": self.last_reviewer_verdict,
         "last_developer_analysis": self.last_developer_analysis,
         "last_ui_lead_notes": self.last_ui_lead_notes,
+        "report_orchestrated": self.report_orchestrated,
+        "report_records": list(self.report_records),
         "session_prompt_id": self.session_prompt_id,
             "session_workspace_profile": self.session_workspace_profile,
             "session_workspace_mode": self.session_workspace_mode,
@@ -547,6 +553,7 @@ def on_session_start(
         session_prompt_id=str(meta.get("prompt_id") or ""),
         session_workspace_profile=str(meta.get("workspace_profile") or ""),
         session_workspace_mode=str(meta.get("workspace_mode") or ""),
+        report_orchestrated=bool(meta.get("report_orchestrated", False)),
     )
     state.total_transition_count = 1
     action = CoordinatorAction(
@@ -778,7 +785,7 @@ def on_worker_output(
     if role == "ui_lead":
         return _on_ui_lead_output(state, text, worker_context=worker_context)
     if role == "reviewer":
-        return _on_reviewer_output(state, text)
+        return _on_reviewer_output(state, text, worker_context=worker_context)
     return _on_safety_output(state, text)
 
 
@@ -881,12 +888,133 @@ def _build_max_developer_rounds_diagnostics(
     return "\n".join(lines)
 
 
+def _try_report_orchestrated_worker(
+    state: CoordinatorLoopState,
+    role: str,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction | None:
+    """Handle REPORT_READY (or inline REPORT_BEGIN/END) for report-orchestrated sessions."""
+    if not state.report_orchestrated:
+        return None
+
+    from report_orchestration import ingest_worker_report_output, parse_report_ready
+    from worker_workspace import REPORT_BEGIN_MARKER
+
+    first = _first_non_empty_line(text)
+    if first == "PROGRESS":
+        return None
+    if parse_report_ready(text) is None and REPORT_BEGIN_MARKER not in (text or ""):
+        return None
+
+    ctx = worker_context or {}
+    expected_paths = list(ctx.get("report_paths") or [])
+    by_role = ctx.get("report_paths_by_role") or {}
+    if isinstance(by_role, dict) and by_role.get(role):
+        expected_paths = [str(by_role[role])] + expected_paths
+
+    ingest = ingest_worker_report_output(
+        role,
+        text,
+        allowed_roots=list(ctx.get("allowed_report_roots") or []),
+        expected_report_paths=expected_paths or None,
+        max_prompt_chars=int(ctx.get("max_report_prompt_chars") or 120_000),
+    )
+    if not ingest.blocker and not ingest.ok:
+        return None
+    if not ingest.ok:
+        return _terminal_blocker(state, ingest.blocker)
+
+    record = ingest.record
+    parsed = ingest.parsed
+    if not record or not parsed:
+        return _terminal_blocker(state, "BLOCKER: report ingest failed")
+
+    state.report_records.append(record.to_dict())
+    _append_verdict(state, role, "REPORT_READY", parsed.summary or record.path)
+    state.last_output_summary = (parsed.summary or record.path)[:500]
+    status = parsed.status
+
+    if status in ("BLOCKER", "FAIL"):
+        return _terminal_blocker(
+            state,
+            f"{role} report status {status}: {parsed.notes or parsed.summary}",
+        )
+
+    if role == "developer":
+        state.developer_has_substantial_output = True
+        state.last_developer_analysis = ""
+        state.developer_round += 1
+        over_budget = state.developer_round > state.max_developer_rounds
+        if status in ("PASS", "PASS_WITH_NOTES"):
+            if over_budget:
+                return _coordinator_action_after_developer_ready(state, budget_exceeded=True)
+            return _coordinator_action_after_developer_ready(state)
+        if status == "REQUEST_CHANGES":
+            return _coordinator_action(state, "Developer report indicates REQUEST_CHANGES.")
+        if over_budget:
+            return _terminal_blocker(
+                state,
+                _build_max_developer_rounds_diagnostics(state, "REPORT_READY", text, parsed.summary),
+            )
+        return _coordinator_action(state, f"Developer report status {status}. Decide routing.")
+
+    if role == "ui_lead":
+        state.last_ui_lead_notes = ""
+        state.ui_round += 1
+        if status in ("PASS", "PASS_WITH_NOTES"):
+            state.agy_approved = True
+            state.ui_changed = False
+            return _coordinator_action(state, "AGY report approved. Route to reviewer.")
+        state.agy_approved = False
+        state.awaiting_developer_correction = True
+        state.developer_correction_complete = False
+        if state.ui_round > state.max_ui_rounds:
+            return _terminal_blocker(state, "max ui_round exceeded")
+        return _coordinator_action(
+            state,
+            f"AGY report status {status}. Route developer correction.",
+        )
+
+    if role == "reviewer":
+        state.review_round += 1
+        state.last_reviewer_verdict = status
+        if status in ("PASS", "PASS_WITH_NOTES"):
+            state.reviewer_passed = True
+            return _coordinator_action(state, "Reviewer report passed. Route to safety_gate.")
+        state.reviewer_passed = False
+        state.awaiting_developer_correction = True
+        state.developer_correction_complete = False
+        if state.review_round > state.max_review_rounds:
+            return _terminal_blocker(state, "max review_round exceeded")
+        ui_changed = _detect_ui_changed(parsed.notes or parsed.summary)
+        state.ui_changed = ui_changed
+        if ui_changed and state.requires_agy:
+            state.agy_approved = False
+            return _coordinator_action(
+                state,
+                "Reviewer report REQUEST_CHANGES with UI impact. Route ui_lead.",
+            )
+        return _coordinator_action(
+            state,
+            "Reviewer report REQUEST_CHANGES. Route developer with reviewer report.",
+        )
+
+    return None
+
+
 def _on_developer_output(
     state: CoordinatorLoopState,
     text: str,
     *,
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction:
+    if handled := _try_report_orchestrated_worker(
+        state, "developer", text, worker_context=worker_context,
+    ):
+        return handled
+
     token, notes = _parse_developer_verdict(text)
     _append_verdict(state, "developer", token, notes)
     state.last_developer_token = token
@@ -945,6 +1073,11 @@ def _on_ui_lead_output(
     *,
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction:
+    if handled := _try_report_orchestrated_worker(
+        state, "ui_lead", text, worker_context=worker_context,
+    ):
+        return handled
+
     token, notes = _parse_ui_lead_verdict(text)
     _append_verdict(state, "ui_lead", token, notes)
 
@@ -990,7 +1123,17 @@ def _on_ui_lead_output(
     )
 
 
-def _on_reviewer_output(state: CoordinatorLoopState, text: str) -> CoordinatorAction:
+def _on_reviewer_output(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
+    if handled := _try_report_orchestrated_worker(
+        state, "reviewer", text, worker_context=worker_context,
+    ):
+        return handled
+
     token, notes = _parse_reviewer_verdict(text)
     _append_verdict(state, "reviewer", token, notes)
 

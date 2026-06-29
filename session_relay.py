@@ -662,6 +662,7 @@ def build_scoped_write_worker_prompt(
     total_phases: int = 1,
     context_messages: list[dict] | None = None,
     prompt_body: str = "",
+    report_orchestrated: bool = False,
 ) -> str:
     """Build a coordinator-loop worker prompt for workspace-bound sessions."""
     import workspace_policy as wp
@@ -766,8 +767,10 @@ def build_scoped_write_worker_prompt(
                 "REPORT-ONLY ANALYSIS: No Twinpet repo writes (no Task.md/Context.md/docs edits).",
                 "SNAPSHOT MODE: agentchattr injects AUTOMATED PRECHECK RESULTS and",
                 "READ-ONLY FILE SNAPSHOT before this turn. You have no tools.",
-                "Analyze from injected snapshots only. Final report via REPORT_BEGIN/REPORT_END.",
-                "External report is saved outside the repo by agentchattr when possible.",
+                "Analyze from injected snapshots only.",
+                "Save your final analysis as a markdown report under allowed Ai-Report paths.",
+                "Return REPORT_READY with the saved .md path (or REPORT_BEGIN/REPORT_END for inline save).",
+                "Channel carries short status only; the report file is the source of truth.",
             ])
     else:
         lines.extend([
@@ -800,7 +803,11 @@ def build_scoped_write_worker_prompt(
         "  AUTOMATED PRECHECK RESULTS (when present) are authoritative for git HEAD/status.",
         "  Inspect files using plain-text PROGRESS updates, not tool-call syntax.",
     ])
-    contract = coordinator_loop_worker_output_contract(role, workspace_bound=bool(root))
+    contract = coordinator_loop_worker_output_contract(
+        role,
+        workspace_bound=bool(root),
+        report_orchestrated=report_orchestrated,
+    )
     if contract:
         lines.append("")
         lines.append(contract)
@@ -1009,8 +1016,30 @@ def build_coordinator_loop_ui_lead_prompt(
     )
 
 
-def coordinator_loop_worker_output_contract(role: str, *, workspace_bound: bool = False) -> str:
+def coordinator_loop_worker_output_contract(
+    role: str,
+    *,
+    workspace_bound: bool = False,
+    report_orchestrated: bool = False,
+) -> str:
     """Return the strict first-line output contract for a coordinator_loop worker."""
+    if report_orchestrated:
+        return (
+            "OUTPUT CONTRACT (first non-empty line is authoritative):\n"
+            "  REPORT_READY\n\n"
+            "Status:\n"
+            "  PASS / PASS_WITH_NOTES / REQUEST_CHANGES / FAIL\n\n"
+            "Report:\n"
+            "  <absolute .md path under allowed Ai-Report roots>\n\n"
+            "Summary:\n"
+            "  <short summary>\n\n"
+            "Next recommended role:\n"
+            "  coordinator / developer / ui_lead / reviewer / safety_gate\n\n"
+            "Notes:\n"
+            "  <short notes>\n\n"
+            "If you cannot save a report file, you may use REPORT_BEGIN/REPORT_END inline; "
+            "agentchattr will save to the configured external path."
+        )
     if role == "developer":
         lines = [
             "OUTPUT CONTRACT (first non-empty line is authoritative):",

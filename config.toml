@@ -285,6 +285,10 @@ runtime_enforcement_enabled = false
 read_only_external_cwd_enabled = true
 scoped_write_external_cwd_enabled = true
 
+# Report-orchestrated coordinator flow (Prompt Memo / read-only analysis).
+[report_orchestration]
+max_report_prompt_chars = 120000
+
 # Claude --print worker timeouts for session / Prompt Memo turns.
 [session_worker_timeouts]
 default_secs = 120
