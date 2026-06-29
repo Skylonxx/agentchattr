@@ -145,6 +145,15 @@ def is_docs_only_snapshot_mode(
     policy: dict[str, Any] | None,
 ) -> bool:
     """True when worker should receive automated precheck + file snapshots."""
+    if isinstance(item, dict):
+        relay_meta = item.get("relay_meta")
+        if isinstance(relay_meta, dict) and relay_meta.get("handoff_repair"):
+            return False
+        wpc = item.get("workspace_policy_context")
+        if isinstance(wpc, dict) and (
+            wpc.get("handoff_repair") or wpc.get("skip_snapshot_injection")
+        ):
+            return False
     if not is_workspace_bound_queue_item(item):
         return False
     mode = (policy or {}).get("mode") if isinstance(policy, dict) else None

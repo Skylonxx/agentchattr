@@ -1149,6 +1149,7 @@ def make_relay_queue_entry(
     role: str,
     channel: str = "general",
     workspace_policy_context: dict | None = None,
+    handoff_repair: bool = False,
 ) -> dict:
     """Build a queue entry dict for a relay session turn.
 
@@ -1173,8 +1174,13 @@ def make_relay_queue_entry(
         "prompt": prompt,
         "relay_meta": meta.to_dict(),
     }
+    if handoff_repair:
+        entry["relay_meta"]["handoff_repair"] = True
     if workspace_policy_context:
         entry["workspace_policy_context"] = dict(workspace_policy_context)
+        if handoff_repair:
+            entry["workspace_policy_context"]["handoff_repair"] = True
+            entry["workspace_policy_context"]["skip_snapshot_injection"] = True
     return entry
 
 

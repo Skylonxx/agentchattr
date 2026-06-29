@@ -28,6 +28,7 @@ DEFAULT_ALLOWED_REPORT_ROOTS: tuple[str, ...] = (
 
 DEFAULT_MAX_REPORT_PROMPT_CHARS = 120_000
 DEFAULT_MAX_HANDOFF_CHARS = 12_000
+DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE = 2
 MIN_HANDOFF_CHARS = 80
 
 HANDOFF_FOR_AGY_BEGIN = "COORDINATOR_HANDOFF_FOR_AGY_BEGIN"
@@ -125,6 +126,10 @@ class ReportPromptResult:
     prompt: str = ""
     blocker: str = ""
     dispatch_role: str = ""
+    handoff_repair: bool = False
+    handoff_repair_owner_role: str = ""
+    handoff_repair_missing_blocks: list[str] = field(default_factory=list)
+    handoff_repair_invalid_blocks: list[str] = field(default_factory=list)
 
 
 def resolve_external_report_write_roots(policy: dict | None) -> list[str]:
@@ -367,34 +372,146 @@ def handoff_fits_prompt(handoff: str, max_chars: int) -> tuple[bool, int]:
     return total <= max_chars, total
 
 
+_REQUIRED_HANDOFF_MARKERS_BY_OWNER: dict[str, list[tuple[str, str]]] = {
+    "developer": [
+        (HANDOFF_FOR_AGY_BEGIN, HANDOFF_FOR_AGY_END),
+        (HANDOFF_FOR_CODEX_REVIEWER_BEGIN, HANDOFF_FOR_CODEX_REVIEWER_END),
+    ],
+    "ui_lead": [
+        (HANDOFF_FOR_CODEX_REVIEWER_BEGIN, HANDOFF_FOR_CODEX_REVIEWER_END),
+    ],
+    "reviewer": [
+        (HANDOFF_FOR_FINAL_BEGIN, HANDOFF_FOR_FINAL_END),
+    ],
+}
+
+_CORRECTION_HANDOFF_MARKER_PAIR = (
+    HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
+    HANDOFF_FOR_DEVELOPER_CORRECTION_END,
+)
+
+
+def _format_required_handoff_markers(
+    owner_role: str,
+    *,
+    include_correction_handoff: bool = False,
+) -> str:
+    pairs = list(_REQUIRED_HANDOFF_MARKERS_BY_OWNER.get(owner_role, []))
+    if include_correction_handoff:
+        pairs.append(_CORRECTION_HANDOFF_MARKER_PAIR)
+    lines: list[str] = []
+    for begin, end in pairs:
+        lines.extend([begin, "...", end, ""])
+    return "\n".join(lines).rstrip()
+
+
+def format_handoff_repair_limit_blocker(
+    *,
+    role: str,
+    owner_agent: str,
+    missing_blocks: list[str],
+    invalid_blocks: list[str],
+    repair_rounds: int,
+    report_path: str,
+    report_chars: int,
+    last_report_status: str,
+    prompt_chars: int,
+    snapshots_injected: bool,
+    workspace_profile: str,
+    workspace_mode: str,
+    session_id: int | str,
+    channel: str,
+    template: str,
+) -> str:
+    """BLOCKER when handoff repair round budget is exhausted."""
+    lines = [
+        "BLOCKER: coordinator handoff repair limit exceeded",
+        f"- role: {role}",
+        f"- owner_agent: {owner_agent}",
+        f"- missing_blocks: {', '.join(missing_blocks) or '(none)'}",
+        f"- invalid_blocks: {', '.join(invalid_blocks) or '(none)'}",
+        f"- repair_rounds: {repair_rounds}",
+        f"- report_path: {report_path}",
+        f"- report_chars: {report_chars}",
+        f"- last_report_status: {last_report_status or '(none)'}",
+        f"- prompt_chars: {prompt_chars}",
+        f"- snapshots_injected: {'true' if snapshots_injected else 'false'}",
+        f"- workspace_profile: {workspace_profile or '(none)'}",
+        f"- workspace_mode: {workspace_mode or '(none)'}",
+        f"- session_id: {session_id}",
+        f"- channel: {channel}",
+        f"- template: {template or '(unknown)'}",
+    ]
+    return "\n".join(lines)
+
+
 def build_handoff_repair_prompt(
     *,
     owner_role: str,
     report_path: str,
-    missing_block: str,
+    missing_blocks: list[str],
+    invalid_blocks: list[str] | None = None,
     reason: str = "",
     expected_output_path: str = "",
+    report_sha256: str = "",
+    report_size_bytes: int = 0,
+    last_report_status: str = "",
+    include_correction_handoff: bool = False,
 ) -> str:
-    """Ask report owner to add or repair a required handoff block."""
+    """Ask report owner to add or repair required coordinator handoff blocks."""
     role_label = _REPORT_OWNER_ROLE_LABELS.get(owner_role, owner_role)
     target_path = expected_output_path or report_path
-    detail = reason.strip() or f"Required block missing or insufficient: {missing_block}"
+    missing = [b for b in (missing_blocks or []) if b]
+    invalid = [b for b in (invalid_blocks or []) if b]
+    issue_lines: list[str] = []
+    if reason.strip():
+        issue_lines.append(reason.strip())
+    if missing:
+        issue_lines.append("Missing blocks:")
+        issue_lines.extend(f"- {name}" for name in missing)
+    if invalid:
+        issue_lines.append("Invalid or insufficient blocks:")
+        issue_lines.extend(f"- {name}" for name in invalid)
+    if not issue_lines:
+        detail = reason.strip() or "Required coordinator handoff blocks missing or invalid."
+        issue_lines = [detail]
+    meta_lines = [f"Your previous report exists at:\n{report_path}"]
+    if report_sha256:
+        meta_lines.append(f"Report hash: {report_sha256}")
+    if report_size_bytes:
+        meta_lines.append(f"Report size: {report_size_bytes} bytes")
+    if last_report_status:
+        meta_lines.append(f"Last report status: {last_report_status}")
+    marker_section = _format_required_handoff_markers(
+        owner_role,
+        include_correction_handoff=include_correction_handoff,
+    )
     return (
         f"TO: {role_label}\n"
         "FROM: agentchattr Coordinator\n"
         f"ROLE: {role_label}\n"
-        "MODE: Report handoff repair\n\n"
-        "REQUEST_CHANGES: report missing required coordinator handoff block.\n"
-        f"{detail}\n"
-        f"Report path: {report_path}\n\n"
-        "Update the report at the same path.\n"
-        "Add or expand the required handoff block; keep the full report as source of truth.\n"
-        "Do not omit required findings in the main report body.\n"
-        "Do not chunk.\n"
-        "Do not rely on prior chat context.\n"
-        "Return REPORT_READY after writing the revised report.\n\n"
-        f"REQUIRED HANDOFF BLOCK:\n{missing_block}\n\n"
-        f"EXPECTED REPORT OUTPUT PATH:\n{target_path}\n"
+        "MODE: Handoff block repair\n\n"
+        f"{chr(10).join(meta_lines)}\n\n"
+        "The report is missing or has invalid coordinator handoff blocks:\n"
+        f"{chr(10).join(issue_lines)}\n\n"
+        "Rewrite the same report file using REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END.\n"
+        "Keep your existing analysis.\n"
+        "Do not reanalyze source files.\n"
+        "Do not request source snapshots.\n"
+        "Do not modify the Twinpet repo.\n"
+        "Add or fix only the required coordinator handoff blocks.\n\n"
+        "Required exact markers:\n\n"
+        f"{marker_section}\n\n"
+        "REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END FORMAT:\n"
+        "  REPORT_FILE_WRITE_BEGIN\n"
+        f"  Path: {target_path}\n"
+        "  Status: PASS_WITH_NOTES\n"
+        "  Summary: <short summary>\n"
+        "  Next recommended role: coordinator\n"
+        "  ---\n"
+        "  <markdown report body with required handoff blocks>\n"
+        "  REPORT_FILE_WRITE_END\n\n"
+        "Return REPORT_READY after the runtime confirms the report file exists.\n"
     )
 
 
@@ -402,22 +519,38 @@ def build_handoff_repair_result(
     *,
     owner_role: str,
     report_path: str,
-    missing_block: str,
+    missing_blocks: list[str] | None = None,
+    invalid_blocks: list[str] | None = None,
     reason: str = "",
     expected_output_path: str = "",
+    report_sha256: str = "",
+    report_size_bytes: int = 0,
+    last_report_status: str = "",
+    include_correction_handoff: bool = False,
 ) -> ReportPromptResult:
-    """Route back to report owner to repair a missing/insufficient handoff block."""
+    """Route back to report owner to repair missing/insufficient handoff blocks."""
     path = expected_output_path or report_path
+    missing = list(missing_blocks or [])
+    invalid = list(invalid_blocks or [])
     return ReportPromptResult(
         ok=True,
         prompt=build_handoff_repair_prompt(
             owner_role=owner_role,
             report_path=report_path,
-            missing_block=missing_block,
+            missing_blocks=missing,
+            invalid_blocks=invalid,
             reason=reason,
             expected_output_path=path,
+            report_sha256=report_sha256,
+            report_size_bytes=report_size_bytes,
+            last_report_status=last_report_status,
+            include_correction_handoff=include_correction_handoff,
         ),
         dispatch_role=owner_role,
+        handoff_repair=True,
+        handoff_repair_owner_role=owner_role,
+        handoff_repair_missing_blocks=missing,
+        handoff_repair_invalid_blocks=invalid,
     )
 
 
@@ -429,30 +562,24 @@ def build_oversized_handoff_rewrite_result(
     handoff_chars: int,
     max_chars: int,
     expected_output_path: str = "",
+    report_sha256: str = "",
+    report_size_bytes: int = 0,
+    last_report_status: str = "",
 ) -> ReportPromptResult:
     """Route report owner to shrink an oversized handoff block (not the full report)."""
-    role_label = _REPORT_OWNER_ROLE_LABELS.get(owner_role, owner_role)
-    target_path = expected_output_path or report_path
-    return ReportPromptResult(
-        ok=True,
-        prompt=(
-            f"TO: {role_label}\n"
-            "FROM: agentchattr Coordinator\n"
-            f"ROLE: {role_label}\n"
-            "MODE: Report handoff rewrite\n\n"
-            "Your coordinator handoff block is too large for next-agent dispatch.\n"
-            f"Handoff size: {handoff_chars} chars (max {max_chars}).\n"
-            f"Report path: {report_path}\n"
-            f"Oversized block: {handoff_block}\n\n"
-            "Rewrite only the handoff block at the same report path.\n"
-            "Keep it bounded but complete for the target role.\n"
-            "Include UNKNOWN FROM SNAPSHOT items where applicable.\n"
-            "Do not chunk.\n"
-            "Do not rely on prior chat context.\n"
-            "Return REPORT_READY after writing the revised report.\n\n"
-            f"EXPECTED REPORT OUTPUT PATH:\n{target_path}\n"
+    return build_handoff_repair_result(
+        owner_role=owner_role,
+        report_path=report_path,
+        missing_blocks=[],
+        invalid_blocks=[handoff_block],
+        reason=(
+            f"Handoff block too large for dispatch ({handoff_chars} chars; max {max_chars}). "
+            "Rewrite only the handoff block at the same report path."
         ),
-        dispatch_role=owner_role,
+        expected_output_path=expected_output_path,
+        report_sha256=report_sha256,
+        report_size_bytes=report_size_bytes,
+        last_report_status=last_report_status,
     )
 
 
@@ -1093,15 +1220,35 @@ def _validate_handoff_for_dispatch(
     block_name: str,
     max_chars: int,
     expected_output_path: str = "",
+    report_sha256: str = "",
+    report_size_bytes: int = 0,
+    last_report_status: str = "",
+    include_correction_handoff: bool = False,
 ) -> ReportPromptResult | str:
     """Return repair/rewrite result, or handoff text when valid."""
+    if handoff is None:
+        return build_handoff_repair_result(
+            owner_role=owner_role,
+            report_path=report_path,
+            missing_blocks=[block_name],
+            reason=f"REQUEST_CHANGES: report missing {block_name}",
+            expected_output_path=expected_output_path,
+            report_sha256=report_sha256,
+            report_size_bytes=report_size_bytes,
+            last_report_status=last_report_status,
+            include_correction_handoff=include_correction_handoff,
+        )
     if not is_handoff_sufficient(handoff):
         return build_handoff_repair_result(
             owner_role=owner_role,
             report_path=report_path,
-            missing_block=block_name,
-            reason=f"REQUEST_CHANGES: report missing {block_name}",
+            invalid_blocks=[block_name],
+            reason=f"REQUEST_CHANGES: report has invalid or insufficient {block_name}",
             expected_output_path=expected_output_path,
+            report_sha256=report_sha256,
+            report_size_bytes=report_size_bytes,
+            last_report_status=last_report_status,
+            include_correction_handoff=include_correction_handoff,
         )
     assert handoff is not None
     limit = _handoff_max_chars(max_chars)
@@ -1114,6 +1261,9 @@ def _validate_handoff_for_dispatch(
             handoff_chars=total,
             max_chars=limit,
             expected_output_path=expected_output_path,
+            report_sha256=report_sha256,
+            report_size_bytes=report_size_bytes,
+            last_report_status=last_report_status,
         )
     return handoff
 
@@ -1185,6 +1335,9 @@ def build_report_orchestrated_dispatch_prompt(
             block_name=f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}",
             max_chars=max_chars,
             expected_output_path=dev.path,
+            report_sha256=dev.sha256,
+            report_size_bytes=dev.size_bytes,
+            last_report_status=dev.status,
         )
         if isinstance(validated, ReportPromptResult):
             return validated
@@ -1218,6 +1371,9 @@ def build_report_orchestrated_dispatch_prompt(
             block_name=f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN} / {HANDOFF_FOR_CODEX_REVIEWER_END}",
             max_chars=max_chars,
             expected_output_path=dev.path,
+            report_sha256=dev.sha256,
+            report_size_bytes=dev.size_bytes,
+            last_report_status=dev.status,
         )
         if isinstance(validated_dev, ReportPromptResult):
             return validated_dev
@@ -1238,6 +1394,10 @@ def build_report_orchestrated_dispatch_prompt(
                 block_name=f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN} / {HANDOFF_FOR_CODEX_REVIEWER_END}",
                 max_chars=max_chars,
                 expected_output_path=agy.path,
+                report_sha256=agy.sha256,
+                report_size_bytes=agy.size_bytes,
+                last_report_status=agy.status,
+                include_correction_handoff=agy.status in ("REQUEST_CHANGES", "FAIL"),
             )
             if isinstance(validated_agy, ReportPromptResult):
                 return validated_agy
@@ -1274,6 +1434,10 @@ def build_report_orchestrated_dispatch_prompt(
                     block_name=f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN} / {HANDOFF_FOR_DEVELOPER_CORRECTION_END}",
                     max_chars=max_chars,
                     expected_output_path=agy.path,
+                    report_sha256=agy.sha256,
+                    report_size_bytes=agy.size_bytes,
+                    last_report_status=agy.status,
+                    include_correction_handoff=True,
                 )
                 if isinstance(validated, ReportPromptResult):
                     return validated
@@ -1307,6 +1471,10 @@ def build_report_orchestrated_dispatch_prompt(
                     block_name=f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN} / {HANDOFF_FOR_DEVELOPER_CORRECTION_END}",
                     max_chars=max_chars,
                     expected_output_path=reviewer.path,
+                    report_sha256=reviewer.sha256,
+                    report_size_bytes=reviewer.size_bytes,
+                    last_report_status=reviewer.status,
+                    include_correction_handoff=True,
                 )
                 if isinstance(validated, ReportPromptResult):
                     return validated

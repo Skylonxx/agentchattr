@@ -283,8 +283,10 @@ class ReportReadAndIngestTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
-        self.assertIn("missing required coordinator handoff block", result.prompt)
-        self.assertIn("Do not chunk", result.prompt)
+        self.assertIn("MODE: Handoff block repair", result.prompt)
+        self.assertIn(HANDOFF_FOR_AGY_BEGIN, result.prompt)
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", result.prompt)
+        self.assertIn("Do not request source snapshots", result.prompt)
         self.assertNotIn("COMPRESSED", result.prompt)
 
     def test_inline_report_begin_end_saved(self):
@@ -406,9 +408,15 @@ class ReportPromptConstructionTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
-        self.assertIn("REQUEST_CHANGES: report missing required coordinator handoff block", result.prompt)
+        self.assertTrue(result.handoff_repair)
+        self.assertIn("MODE: Handoff block repair", result.prompt)
+        self.assertIn(str(bare), result.prompt)
         self.assertIn(HANDOFF_FOR_AGY_BEGIN, result.prompt)
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", result.prompt)
+        self.assertIn("Do not request source snapshots", result.prompt)
         self.assertNotIn("REPORT CONTENT:", result.prompt)
+        self.assertNotIn("READ-ONLY SNAPSHOTS:", result.prompt)
+        self.assertLess(len(result.prompt), 20_000)
 
     def test_oversized_handoff_routes_handoff_rewrite(self):
         big_handoff = "x" * 5000
@@ -429,8 +437,10 @@ class ReportPromptConstructionTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
-        self.assertIn("handoff block is too large", result.prompt)
-        self.assertIn("Do not chunk", result.prompt)
+        self.assertTrue(result.handoff_repair)
+        self.assertIn("MODE: Handoff block repair", result.prompt)
+        self.assertIn("Handoff block too large", result.prompt)
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", result.prompt)
 
 
 class InitialDeveloperPromptTests(unittest.TestCase):
@@ -854,7 +864,7 @@ class OversizedReportRewriteTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "ui_lead")
-        self.assertIn("handoff block is too large", result.prompt)
+        self.assertIn("Handoff block too large", result.prompt)
 
     def test_oversized_reviewer_correction_handoff_routes_reviewer_rewrite(self):
         rev = Path(self.tmp) / "rev.md"
@@ -882,7 +892,7 @@ class OversizedReportRewriteTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "reviewer")
-        self.assertIn("handoff block is too large", result.prompt)
+        self.assertIn("Handoff block too large", result.prompt)
 
 
 class FinalReportAttachmentTests(unittest.TestCase):
@@ -1175,6 +1185,75 @@ class ReportOrchestrationE2EFlowTests(unittest.TestCase):
         paths = {r.get("path") for r in state.report_records}
         self.assertIn(str(self.dev), paths)
         self.assertIn(str(self.agy), paths)
+
+
+class HandoffRepairPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+
+    def test_handoff_repair_lists_exact_missing_block_names(self):
+        bare = Path(self.tmp) / "bare.md"
+        bare.write_text("# Dev\nNo handoff blocks", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(bare)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+        )
+        self.assertTrue(result.handoff_repair)
+        self.assertIn(f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}", result.prompt)
+        self.assertIn(HANDOFF_FOR_CODEX_REVIEWER_BEGIN, result.prompt)
+        self.assertIn(HANDOFF_FOR_CODEX_REVIEWER_END, result.prompt)
+
+    def test_handoff_repair_prompt_bounded_size(self):
+        bare = Path(self.tmp) / "bare.md"
+        bare.write_text("# Dev\n" + ("x" * 50_000), encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(bare)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+        )
+        self.assertTrue(result.ok)
+        self.assertLess(len(result.prompt), 20_000)
+        self.assertNotIn("x" * 1000, result.prompt)
+
+    def test_repair_limit_blocker_format(self):
+        from report_orchestration import format_handoff_repair_limit_blocker
+
+        blocker = format_handoff_repair_limit_blocker(
+            role="developer",
+            owner_agent="claude",
+            missing_blocks=[f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}"],
+            invalid_blocks=[],
+            repair_rounds=2,
+            report_path=str(Path(self.tmp) / "dev.md"),
+            report_chars=5000,
+            last_report_status="PASS_WITH_NOTES",
+            prompt_chars=4200,
+            snapshots_injected=False,
+            workspace_profile="twinpet-ui-09-c-payment-modal-analysis",
+            workspace_mode="read-only-analysis",
+            session_id=7,
+            channel="twinpet-ui-09-c-read",
+            template="project-readonly-coordinator-loop",
+        )
+        self.assertIn("BLOCKER: coordinator handoff repair limit exceeded", blocker)
+        self.assertIn("snapshots_injected: false", blocker)
+        self.assertIn("repair_rounds: 2", blocker)
 
 
 if __name__ == "__main__":

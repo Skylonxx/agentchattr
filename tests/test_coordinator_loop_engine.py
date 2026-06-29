@@ -788,6 +788,59 @@ class ReportOrchestratedWorkerDispatchTests(CoordinatorLoopEngineTestBase):
         self.assertEqual(s.get("current_phase"), 1)
         self.assertFalse(any(t.get("agent") == "agy" for t in trigger.triggered))
         self.assertTrue(any(t.get("agent") == "claude" for t in trigger.triggered))
+        claude_entry = next(t for t in trigger.triggered if t.get("agent") == "claude")
+        relay = claude_entry.get("relay_entry") or {}
+        self.assertTrue((relay.get("relay_meta") or {}).get("handoff_repair"))
+        wpc = relay.get("workspace_policy_context") or {}
+        self.assertTrue(wpc.get("skip_snapshot_injection"))
+        prompt = relay.get("prompt") or ""
+        self.assertIn("MODE: Handoff block repair", prompt)
+        self.assertLess(len(prompt), 20_000)
+        from worker_workspace import is_docs_only_snapshot_mode
+        self.assertFalse(is_docs_only_snapshot_mode(relay, _policy))
+
+    def test_handoff_repair_limit_blocks_after_max_rounds(self):
+        from pathlib import Path
+        from coordinator_loop import CoordinatorLoopState, _worker_action, on_worker_output
+        from tests.test_report_orchestration import _report_ready
+
+        engine, store, _, trigger, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)
+        tmp = tempfile.mkdtemp()
+        dev_path = Path(tmp) / "dev.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+
+        session, _policy, roots, by_role = self._start_report_session(
+            engine, store, cast, tmp,
+        )
+        by_role["developer"] = str(dev_path)
+        sid = session["id"]
+
+        s = store.get(sid)
+        cls = CoordinatorLoopState.from_dict(s["coordinator_loop_state"])
+        cls.awaiting_role = "developer"
+        cls.classified = True
+        cls.requires_agy = True
+        on_worker_output(
+            cls,
+            "developer",
+            _report_ready(str(dev_path)),
+            worker_context={"allowed_report_roots": roots, "report_paths_by_role": by_role},
+        )
+        cls.max_handoff_repair_rounds_per_role = 2
+        cls.handoff_repair_rounds = {"developer": 2}
+        store.update_coordinator_loop_state(sid, cls.to_dict())
+        action = _worker_action(cls, "ui_lead", "Review UX.")
+        store.update_coordinator_loop_state(
+            sid, cls.to_dict(), worker_prompt=action.routing_body,
+        )
+        trigger.triggered.clear()
+        engine._route_coordinator_loop_action(store.get(sid), action)
+
+        s = store.get(sid)
+        self.assertEqual(s.get("state"), "interrupted")
+        cls_after = CoordinatorLoopState.from_dict(s["coordinator_loop_state"])
+        self.assertIn("handoff repair limit exceeded", cls_after.blocker_reason.lower())
+        self.assertFalse(any(t.get("agent") == "claude" for t in trigger.triggered))
 
     def test_cast_maps_ui_lead_to_agy(self):
         engine, store, _, _, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)

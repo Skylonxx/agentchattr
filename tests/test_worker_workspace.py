@@ -97,6 +97,14 @@ class WorkspaceBoundItemTests(unittest.TestCase):
         item = _analysis_queue_item()
         self.assertTrue(is_docs_only_snapshot_mode(item, session["workspace_policy"]))
 
+    def test_handoff_repair_skips_snapshot_injection(self):
+        session = _analysis_session_record()
+        item = _analysis_queue_item()
+        item["relay_meta"]["handoff_repair"] = True
+        item["workspace_policy_context"]["handoff_repair"] = True
+        item["workspace_policy_context"]["skip_snapshot_injection"] = True
+        self.assertFalse(is_docs_only_snapshot_mode(item, session["workspace_policy"]))
+
     def test_goal_only_item_not_workspace_bound(self):
         self.assertFalse(is_workspace_bound_queue_item({"prompt": "hi"}))
 

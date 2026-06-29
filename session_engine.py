@@ -28,6 +28,7 @@ from report_orchestration import (
     DEFAULT_ALLOWED_REPORT_ROOTS,
     DEFAULT_MAX_REPORT_PROMPT_CHARS,
     build_report_orchestrated_dispatch_prompt,
+    format_handoff_repair_limit_blocker,
     is_report_orchestrated_policy,
     verify_report_write_permission,
 )
@@ -409,7 +410,15 @@ class SessionEngine:
         )
 
     def _make_relay_queue_entry(self, *, prompt: str, session: dict, phase_idx: int,
-                                turn_idx: int, role: str, channel: str) -> dict:
+                                turn_idx: int, role: str, channel: str,
+                                handoff_repair: bool = False) -> dict:
+        wpc = self._session_workspace_policy_context(
+            session, role, phase_idx, turn_idx,
+        )
+        if handoff_repair:
+            wpc = dict(wpc)
+            wpc["handoff_repair"] = True
+            wpc["skip_snapshot_injection"] = True
         return make_relay_queue_entry(
             prompt=prompt,
             session_id=session["id"],
@@ -417,9 +426,8 @@ class SessionEngine:
             turn=turn_idx,
             role=role,
             channel=channel,
-            workspace_policy_context=self._session_workspace_policy_context(
-                session, role, phase_idx, turn_idx,
-            ),
+            workspace_policy_context=wpc,
+            handoff_repair=handoff_repair,
         )
 
     def list_active(self) -> list[dict]:
@@ -1754,6 +1762,76 @@ class SessionEngine:
         if contract:
             prompt = f"{prompt}\n\n{contract}"
 
+        handoff_repair = bool(getattr(result, "handoff_repair", False))
+        repair_owner = (
+            getattr(result, "handoff_repair_owner_role", "") or dispatch_role or role
+        )
+        if handoff_repair:
+            rounds = dict(getattr(cls, "handoff_repair_rounds", {}) or {})
+            max_repairs = int(
+                getattr(cls, "max_handoff_repair_rounds_per_role", 2) or 2,
+            )
+            current_rounds = int(rounds.get(repair_owner, 0))
+            if current_rounds >= max_repairs:
+                tmpl_id = tmpl.get("id", "(unknown)")
+                policy = session.get("workspace_policy") or {}
+                blocker = format_handoff_repair_limit_blocker(
+                    role=repair_owner,
+                    owner_agent=cast.get(repair_owner) or agent,
+                    missing_blocks=list(
+                        getattr(result, "handoff_repair_missing_blocks", []) or [],
+                    ),
+                    invalid_blocks=list(
+                        getattr(result, "handoff_repair_invalid_blocks", []) or [],
+                    ),
+                    repair_rounds=current_rounds,
+                    report_path=str(
+                        (worker_ctx.get("report_paths_by_role") or {}).get(repair_owner)
+                        or "",
+                    ),
+                    report_chars=len(prompt),
+                    last_report_status="",
+                    prompt_chars=len(prompt),
+                    snapshots_injected=False,
+                    workspace_profile=str(
+                        getattr(cls, "session_workspace_profile", "")
+                        or policy.get("policy_id")
+                        or "",
+                    ),
+                    workspace_mode=str(
+                        getattr(cls, "session_workspace_mode", "")
+                        or policy.get("mode")
+                        or "",
+                    ),
+                    session_id=session["id"],
+                    channel=channel,
+                    template=tmpl_id,
+                )
+                self._fail_worker_dispatch_not_started(
+                    session,
+                    cls,
+                    role=role,
+                    assigned_agent=agent,
+                    reason=blocker,
+                    prompt_built=True,
+                    prompt_chars=len(prompt),
+                )
+                return False
+            rounds[repair_owner] = current_rounds + 1
+            cls.handoff_repair_rounds = rounds
+            log.info(
+                "Session %d: handoff repair dispatch role=%s round=%d "
+                "handoff_repair_prompt_chars=%d snapshots_injected=false "
+                "report_path=%s missing_blocks=%s repair_round=%d",
+                session["id"],
+                repair_owner,
+                rounds[repair_owner],
+                len(prompt),
+                str((worker_ctx.get("report_paths_by_role") or {}).get(repair_owner) or ""),
+                getattr(result, "handoff_repair_missing_blocks", []),
+                rounds[repair_owner],
+            )
+
         if effective_role != role:
             realigned = self._realign_session_worker_turn(session, cls, tmpl, effective_role)
             if not realigned:
@@ -1777,6 +1855,13 @@ class SessionEngine:
         store_exec = self._agent_uses_store_exec(effective_agent)
         relay_ok = is_relay_eligible(effective_agent_base)
         dispatch_method = "unknown"
+        wpc = self._session_workspace_policy_context(
+            session, effective_role, phase_idx, turn_idx,
+        )
+        if handoff_repair:
+            wpc = dict(wpc)
+            wpc["handoff_repair"] = True
+            wpc["skip_snapshot_injection"] = True
         try:
             if relay_ok and effective_role in ("developer", "reviewer", "ui_lead"):
                 dispatch_method = "relay_entry"
@@ -1787,6 +1872,7 @@ class SessionEngine:
                     turn_idx=turn_idx,
                     role=effective_role,
                     channel=channel,
+                    handoff_repair=handoff_repair,
                 )
                 self._trigger.trigger_sync(
                     effective_agent, channel=channel, relay_entry=relay_entry,
@@ -1797,9 +1883,7 @@ class SessionEngine:
                     effective_agent,
                     channel=channel,
                     prompt=prompt,
-                    workspace_policy_context=self._session_workspace_policy_context(
-                        session, effective_role, phase_idx, turn_idx,
-                    ),
+                    workspace_policy_context=wpc,
                 )
             else:
                 dispatch_method = "prompt_sync"
@@ -1807,9 +1891,7 @@ class SessionEngine:
                     effective_agent,
                     channel=channel,
                     prompt=prompt,
-                    workspace_policy_context=self._session_workspace_policy_context(
-                        session, effective_role, phase_idx, turn_idx,
-                    ),
+                    workspace_policy_context=wpc,
                 )
         except Exception as exc:
             log.exception(

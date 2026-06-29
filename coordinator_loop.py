@@ -183,6 +183,8 @@ class CoordinatorLoopState:
     verdict_log: list[dict[str, Any]] = field(default_factory=list)
     halt_reason: str = ""
     blocker_reason: str = ""
+    handoff_repair_rounds: dict[str, int] = field(default_factory=dict)
+    max_handoff_repair_rounds_per_role: int = 2
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CoordinatorLoopState:
@@ -235,6 +237,12 @@ class CoordinatorLoopState:
             verdict_log=list(data.get("verdict_log", [])),
             halt_reason=str(data.get("halt_reason", "")),
             blocker_reason=str(data.get("blocker_reason", "")),
+            handoff_repair_rounds={
+                str(k): int(v)
+                for k, v in (data.get("handoff_repair_rounds") or {}).items()
+            } if isinstance(data.get("handoff_repair_rounds"), dict) else {},
+            max_handoff_repair_rounds_per_role=int(
+                data.get("max_handoff_repair_rounds_per_role", 2)),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -278,6 +286,8 @@ class CoordinatorLoopState:
             "verdict_log": list(self.verdict_log),
             "halt_reason": self.halt_reason,
             "blocker_reason": self.blocker_reason,
+            "handoff_repair_rounds": dict(self.handoff_repair_rounds),
+            "max_handoff_repair_rounds_per_role": self.max_handoff_repair_rounds_per_role,
         }
 
 
@@ -953,6 +963,7 @@ def _try_report_orchestrated_worker(
         return _terminal_blocker(state, "BLOCKER: report ingest failed")
 
     state.report_records.append(record.to_dict())
+    state.handoff_repair_rounds.pop(role, None)
     _append_verdict(state, role, "REPORT_READY", parsed.summary or record.path)
     state.last_output_summary = (parsed.summary or record.path)[:500]
     status = parsed.status
