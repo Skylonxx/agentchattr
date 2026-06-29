@@ -659,6 +659,141 @@ class TestCoordinatorLoopFailClosed(CoordinatorLoopEngineTestBase):
         self.assertFalse(trigger.triggered)
 
 
+class ReportOrchestratedWorkerDispatchTests(CoordinatorLoopEngineTestBase):
+    """Report-orchestrated coordinator loop must queue workers, not idle-wait."""
+
+    def _start_report_session(self, engine, store, cast, tmp: str):
+        import config_loader
+        import workspace_policy as wp
+
+        profiles = config_loader.get_workspace_profiles(config_loader.load_config())
+        policy = wp.resolve_session_workspace_policy(
+            profiles=profiles,
+            start_body={
+                "workspace_profile": "twinpet-ui-09-c-payment-modal-analysis",
+                "workspace_mode": "read-only-analysis",
+            },
+        ).policy
+        fields = wp.build_session_workspace_policy_fields(policy)
+        ctx = engine._worker_context_from_session({
+            "id": 1,
+            "workspace_policy": policy,
+            **fields,
+        })
+        roots = [tmp]
+        by_role = dict(ctx.get("report_paths_by_role") or {})
+        session = engine.start_session(
+            COORDINATOR_LOOP_TEMPLATE["id"],
+            "coord",
+            cast,
+            "user",
+            goal="UI-09-C report flow",
+            workspace_policy=policy,
+            workspace_policy_hash=fields.get("workspace_policy_hash"),
+            workspace_policy_version=fields.get("workspace_policy_version"),
+            prompt_body="Prompt memo for report-orchestrated UI-09-C analysis.",
+        )
+        return session, policy, roots, by_role
+
+    def test_ui_lead_dispatches_agy_with_handoff(self):
+        from pathlib import Path
+        from coordinator_loop import CoordinatorLoopState, _worker_action, on_worker_output
+        from tests.test_report_orchestration import _developer_report_body, _report_ready
+
+        engine, store, _, trigger, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)
+        tmp = tempfile.mkdtemp()
+        dev_path = Path(tmp) / "dev.md"
+        agy_path = Path(tmp) / "agy.md"
+        dev_path.write_text(_developer_report_body(), encoding="utf-8")
+
+        session, _policy, roots, by_role = self._start_report_session(
+            engine, store, cast, tmp,
+        )
+        by_role["developer"] = str(dev_path)
+        by_role["ui_lead"] = str(agy_path)
+        sid = session["id"]
+
+        s = store.get(sid)
+        cls = CoordinatorLoopState.from_dict(s["coordinator_loop_state"])
+        cls.awaiting_role = "developer"
+        cls.classified = True
+        cls.requires_agy = True
+        ctx = {
+            "allowed_report_roots": roots,
+            "report_paths_by_role": by_role,
+        }
+        on_worker_output(
+            cls,
+            "developer",
+            _report_ready(str(dev_path), status="PASS_WITH_NOTES"),
+            worker_context=ctx,
+        )
+        store.update_coordinator_loop_state(sid, cls.to_dict())
+        action = _worker_action(cls, "ui_lead", "Review UX from developer handoff.")
+        store.update_coordinator_loop_state(
+            sid, cls.to_dict(), worker_prompt=action.routing_body,
+        )
+        trigger.triggered.clear()
+        engine._route_coordinator_loop_action(store.get(sid), action)
+
+        s = store.get(sid)
+        self.assertEqual(s.get("waiting_on"), "agy")
+        self.assertEqual(s.get("state"), "waiting")
+        self.assertEqual(s["coordinator_loop_state"]["awaiting_role"], "ui_lead")
+        agy_triggers = [t for t in trigger.triggered if t.get("agent") == "agy"]
+        self.assertEqual(len(agy_triggers), 1)
+        prompt = agy_triggers[0].get("prompt") or ""
+        self.assertIn("AGY UI Lead", prompt)
+        self.assertIn("COORDINATOR HANDOFF", prompt)
+        self.assertNotIn("REPORT CONTENT:", prompt)
+
+    def test_missing_handoff_redirects_developer_not_idle_agy(self):
+        from pathlib import Path
+        from coordinator_loop import CoordinatorLoopState, _worker_action, on_worker_output
+        from tests.test_report_orchestration import _report_ready
+
+        engine, store, _, trigger, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)
+        tmp = tempfile.mkdtemp()
+        dev_path = Path(tmp) / "dev.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+
+        session, _policy, roots, by_role = self._start_report_session(
+            engine, store, cast, tmp,
+        )
+        by_role["developer"] = str(dev_path)
+        sid = session["id"]
+
+        s = store.get(sid)
+        cls = CoordinatorLoopState.from_dict(s["coordinator_loop_state"])
+        cls.awaiting_role = "developer"
+        cls.classified = True
+        cls.requires_agy = True
+        on_worker_output(
+            cls,
+            "developer",
+            _report_ready(str(dev_path)),
+            worker_context={"allowed_report_roots": roots, "report_paths_by_role": by_role},
+        )
+        store.update_coordinator_loop_state(sid, cls.to_dict())
+        action = _worker_action(cls, "ui_lead", "Review UX.")
+        store.update_coordinator_loop_state(
+            sid, cls.to_dict(), worker_prompt=action.routing_body,
+        )
+        trigger.triggered.clear()
+        engine._route_coordinator_loop_action(store.get(sid), action)
+
+        s = store.get(sid)
+        self.assertEqual(s.get("waiting_on"), "claude")
+        self.assertEqual(s["coordinator_loop_state"]["awaiting_role"], "developer")
+        self.assertEqual(s.get("current_phase"), 1)
+        self.assertFalse(any(t.get("agent") == "agy" for t in trigger.triggered))
+        self.assertTrue(any(t.get("agent") == "claude" for t in trigger.triggered))
+
+    def test_cast_maps_ui_lead_to_agy(self):
+        engine, store, _, _, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)
+        self.assertEqual(cast.get("ui_lead"), "agy")
+
+
 class TestCoordinatorLoopTemplateFile(unittest.TestCase):
     def test_shipped_template_validates(self):
         from session_store import validate_session_template

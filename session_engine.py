@@ -1588,6 +1588,262 @@ class SessionEngine:
         )
         self._trigger_coordinator_loop(session)
 
+    def _phase_index_for_role(self, tmpl: dict, role: str) -> int | None:
+        for i, phase in enumerate(tmpl.get("phases", [])):
+            if role in phase.get("participants", []):
+                return i
+        return None
+
+    def _format_worker_dispatch_blocker(
+        self,
+        *,
+        session: dict,
+        cls,
+        role: str,
+        assigned_agent: str,
+        reason: str,
+        prompt_built: bool = False,
+        prompt_chars: int = 0,
+        dispatch_method: str = "",
+        store_exec_available: bool = False,
+        relay_eligible: bool = False,
+        trigger_result: str = "",
+        last_exception: str = "",
+    ) -> str:
+        policy = session.get("workspace_policy") or {}
+        tmpl = self._store.get_template(session.get("template_id", "")) or {}
+        lines = [
+            "BLOCKER: worker dispatch not started",
+            "",
+            "Diagnostics:",
+            f"- role: {role}",
+            f"- assigned_agent: {assigned_agent}",
+            f"- phase: {session.get('current_phase')}",
+            f"- session_id: {session.get('id')}",
+            f"- channel: {session.get('channel', 'general')}",
+            f"- template: {tmpl.get('id', '(unknown)')}",
+            f"- report_orchestrated: {bool(getattr(cls, 'report_orchestrated', False))}",
+            f"- prompt_built: {'true' if prompt_built else 'false'}",
+            f"- prompt_chars: {prompt_chars}",
+            f"- dispatch_method: {dispatch_method or '(none)'}",
+            f"- store_exec_available: {'true' if store_exec_available else 'false'}",
+            f"- relay_eligible: {'true' if relay_eligible else 'false'}",
+            f"- trigger_result: {trigger_result or '(none)'}",
+            f"- last_exception: {last_exception or '(none)'}",
+            f"- workspace_profile: {getattr(cls, 'session_workspace_profile', '') or policy.get('policy_id') or '(none)'}",
+            f"- workspace_mode: {getattr(cls, 'session_workspace_mode', '') or policy.get('mode') or '(none)'}",
+            f"- reason: {reason}",
+        ]
+        return "\n".join(lines)
+
+    def _fail_worker_dispatch_not_started(
+        self,
+        session: dict,
+        cls,
+        *,
+        role: str,
+        assigned_agent: str,
+        reason: str,
+        **diag,
+    ) -> None:
+        from coordinator_loop import CoordinatorPhase
+
+        blocker = self._format_worker_dispatch_blocker(
+            session=session,
+            cls=cls,
+            role=role,
+            assigned_agent=assigned_agent,
+            reason=reason,
+            **diag,
+        )
+        cls.phase = CoordinatorPhase.BLOCKER
+        cls.blocker_reason = blocker
+        cls.awaiting_role = ""
+        self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+        channel = session.get("channel", "general")
+        self._messages.add(
+            sender="system",
+            text=blocker[:500],
+            msg_type="session_coord_blocker",
+            channel=channel,
+            metadata={
+                "session_id": session["id"],
+                "phase": cls.phase.value,
+                "terminal_kind": "blocker",
+                "blocker_reason": blocker,
+            },
+        )
+        self._store.interrupt(session["id"], blocker)
+
+    def _realign_session_worker_turn(
+        self,
+        session: dict,
+        cls,
+        tmpl: dict,
+        effective_role: str,
+    ) -> dict | None:
+        """Move session phase/awaiting_role to the effective dispatch target."""
+        phase_idx = self._phase_index_for_role(tmpl, effective_role)
+        if phase_idx is None:
+            return None
+        cls.awaiting_role = effective_role
+        self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+        return self._store.set_phase_and_turn(session["id"], phase_idx, 0)
+
+    def _fire_report_orchestrated_worker(
+        self,
+        session: dict,
+        cls,
+        tmpl: dict,
+        phase: dict,
+        phase_idx: int,
+        turn_idx: int,
+        role: str,
+        agent: str,
+        agent_base: str,
+        instruction: str,
+    ) -> bool:
+        """Build report-orchestrated prompt and queue the assigned worker."""
+        channel = session.get("channel", "general")
+        policy = session.get("workspace_policy") or {}
+        cast = session.get("cast", {})
+        worker_ctx = self._worker_context_from_session(session)
+        result = build_report_orchestrated_dispatch_prompt(
+            role=role,
+            report_records=cls.report_records,
+            project=channel,
+            phase=phase["name"],
+            subject=session.get("goal", "")[:120] or "report-review",
+            instruction=instruction,
+            awaiting_developer_correction=cls.awaiting_developer_correction,
+            developer_correction_source=cls.developer_correction_source,
+            requires_agy=cls.requires_agy,
+            expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
+            external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
+            max_chars=int(worker_ctx.get("max_report_prompt_chars") or DEFAULT_MAX_REPORT_PROMPT_CHARS),
+            prompt_memo_body=self._session_prompt_body(session),
+            policy=policy,
+        )
+        if not result.ok:
+            log.warning(
+                "Session %d: report-orchestrated dispatch blocked: %s",
+                session["id"],
+                result.blocker,
+            )
+            self._fail_worker_dispatch_not_started(
+                session,
+                cls,
+                role=role,
+                assigned_agent=agent,
+                reason=result.blocker,
+                prompt_built=False,
+            )
+            return False
+
+        prompt = result.prompt
+        dispatch_role = result.dispatch_role or role
+        effective_role = dispatch_role
+        effective_agent = cast.get(effective_role) or agent
+        effective_agent_base = self._get_agent_base(effective_agent)
+        workspace_bound = bool((policy.get("workspace") or {}).get("root"))
+        contract = coordinator_loop_worker_output_contract(
+            effective_role,
+            workspace_bound=workspace_bound,
+            report_orchestrated=cls.report_orchestrated,
+        )
+        if contract:
+            prompt = f"{prompt}\n\n{contract}"
+
+        if effective_role != role:
+            realigned = self._realign_session_worker_turn(session, cls, tmpl, effective_role)
+            if not realigned:
+                self._fail_worker_dispatch_not_started(
+                    session,
+                    cls,
+                    role=role,
+                    assigned_agent=agent,
+                    reason=f"no phase for redirected role {effective_role}",
+                    prompt_built=True,
+                    prompt_chars=len(prompt),
+                )
+                return False
+            session = realigned
+            phase_idx = session["current_phase"]
+            phase = tmpl.get("phases", [])[phase_idx]
+            role = effective_role
+            agent = effective_agent
+            agent_base = effective_agent_base
+
+        store_exec = self._agent_uses_store_exec(effective_agent)
+        relay_ok = is_relay_eligible(effective_agent_base)
+        dispatch_method = "unknown"
+        try:
+            if relay_ok and effective_role in ("developer", "reviewer", "ui_lead"):
+                dispatch_method = "relay_entry"
+                relay_entry = self._make_relay_queue_entry(
+                    prompt=prompt,
+                    session=session,
+                    phase_idx=phase_idx,
+                    turn_idx=turn_idx,
+                    role=effective_role,
+                    channel=channel,
+                )
+                self._trigger.trigger_sync(
+                    effective_agent, channel=channel, relay_entry=relay_entry,
+                )
+            elif store_exec:
+                dispatch_method = "store_exec_prompt"
+                self._trigger.trigger_sync(
+                    effective_agent,
+                    channel=channel,
+                    prompt=prompt,
+                    workspace_policy_context=self._session_workspace_policy_context(
+                        session, effective_role, phase_idx, turn_idx,
+                    ),
+                )
+            else:
+                dispatch_method = "prompt_sync"
+                self._trigger.trigger_sync(
+                    effective_agent,
+                    channel=channel,
+                    prompt=prompt,
+                    workspace_policy_context=self._session_workspace_policy_context(
+                        session, effective_role, phase_idx, turn_idx,
+                    ),
+                )
+        except Exception as exc:
+            log.exception(
+                "Session %d: report-orchestrated worker dispatch failed for %s",
+                session["id"],
+                effective_agent,
+            )
+            self._fail_worker_dispatch_not_started(
+                session,
+                cls,
+                role=effective_role,
+                assigned_agent=effective_agent,
+                reason="worker trigger raised exception",
+                prompt_built=True,
+                prompt_chars=len(prompt),
+                dispatch_method=dispatch_method,
+                store_exec_available=store_exec,
+                relay_eligible=relay_ok,
+                last_exception=str(exc),
+            )
+            return False
+
+        cls.awaiting_role = effective_role
+        self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+        self._store.set_waiting(session["id"], effective_agent)
+        log.info(
+            "Session %d: report-orchestrated dispatch %s via %s (%d chars)",
+            session["id"],
+            effective_agent,
+            dispatch_method,
+            len(prompt),
+        )
+        return True
+
     def _trigger_coordinator_loop(self, session: dict):
         """Trigger the current coordinator-loop participant with role-aware prompts."""
         from coordinator_loop import CoordinatorPhase
@@ -1630,7 +1886,6 @@ class SessionEngine:
             self._store.set_waiting(session["id"], agent)
             return
 
-        self._store.set_waiting(session["id"], agent)
         agent_base = self._get_agent_base(agent)
         channel = session.get("channel", "general")
         worker_prompt = session.get("coordinator_loop_worker_prompt", "")
@@ -1677,6 +1932,7 @@ class SessionEngine:
                     agent, channel=channel, prompt=prompt,
                     workspace_policy_context=wpc,
                 )
+            self._store.set_waiting(session["id"], agent)
             return
 
         if role.lower() in _SAFETY_GATE_ROLES:
@@ -1700,101 +1956,21 @@ class SessionEngine:
                 channel=channel,
             )
             self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+            self._store.set_waiting(session["id"], agent)
             return
 
         instruction = worker_prompt or phase.get("prompt", "")
         policy = session.get("workspace_policy") or {}
 
-        def _dispatch_report_orchestrated_prompt() -> tuple[str | None, str]:
-            worker_ctx = self._worker_context_from_session(session)
-            result = build_report_orchestrated_dispatch_prompt(
-                role=role,
-                report_records=cls.report_records,
-                project=channel,
-                phase=phase["name"],
-                subject=session.get("goal", "")[:120] or "report-review",
-                instruction=instruction,
-                awaiting_developer_correction=cls.awaiting_developer_correction,
-                developer_correction_source=cls.developer_correction_source,
-                requires_agy=cls.requires_agy,
-                expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
-                external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
-                max_chars=int(worker_ctx.get("max_report_prompt_chars") or DEFAULT_MAX_REPORT_PROMPT_CHARS),
-                prompt_memo_body=self._session_prompt_body(session),
-                policy=policy,
-            )
-            if result.ok:
-                dispatch_role = result.dispatch_role or role
-                return result.prompt, dispatch_role
-            log.warning(
-                "Session %d: report-orchestrated dispatch blocked: %s",
-                session["id"],
-                result.blocker,
-            )
-            cls.phase = CoordinatorPhase.BLOCKER
-            cls.blocker_reason = result.blocker
-            cls.awaiting_role = ""
-            self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
-            self._store.interrupt(session["id"], result.blocker)
-            return None, role
+        if cls.report_orchestrated and role in ("developer", "ui_lead", "reviewer"):
+            if self._fire_report_orchestrated_worker(
+                session, cls, tmpl, phase, phase_idx, turn_idx,
+                role, agent, agent_base, instruction,
+            ):
+                return
+            return
 
         workspace_bound = bool((policy.get("workspace") or {}).get("root"))
-        cast = session.get("cast", {})
-
-        def _fire_report_orchestrated_prompt(
-            requested_role: str,
-            requested_agent: str,
-            requested_agent_base: str,
-        ) -> bool:
-            prompt, dispatch_role = _dispatch_report_orchestrated_prompt()
-            if prompt is None:
-                return False
-            effective_role = dispatch_role or requested_role
-            effective_agent = cast.get(effective_role) or requested_agent
-            effective_agent_base = self._get_agent_base(effective_agent)
-            contract = coordinator_loop_worker_output_contract(
-                effective_role,
-                workspace_bound=workspace_bound,
-                report_orchestrated=cls.report_orchestrated,
-            )
-            if contract:
-                prompt = f"{prompt}\n\n{contract}"
-            if dispatch_role and dispatch_role != requested_role:
-                cls.awaiting_role = effective_role
-                self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
-            if is_relay_eligible(effective_agent_base) and effective_role in (
-                "developer", "reviewer", "ui_lead",
-            ):
-                relay_entry = self._make_relay_queue_entry(
-                    prompt=prompt,
-                    session=session,
-                    phase_idx=phase_idx,
-                    turn_idx=turn_idx,
-                    role=effective_role,
-                    channel=channel,
-                )
-                self._trigger.trigger_sync(
-                    effective_agent, channel=channel, relay_entry=relay_entry,
-                )
-            else:
-                self._trigger.trigger_sync(
-                    effective_agent, channel=channel, prompt=prompt,
-                    workspace_policy_context=self._session_workspace_policy_context(
-                        session, effective_role, phase_idx, turn_idx,
-                    ),
-                )
-            return True
-
-        if cls.report_orchestrated and role in ("ui_lead", "reviewer"):
-            if _fire_report_orchestrated_prompt(role, agent, agent_base):
-                return
-            return
-
-        if cls.report_orchestrated and role == "developer":
-            if _fire_report_orchestrated_prompt(role, agent, agent_base):
-                return
-            return
-
         report_contract = coordinator_loop_worker_output_contract(
             role,
             workspace_bound=workspace_bound,
@@ -1806,13 +1982,10 @@ class SessionEngine:
                 session, tmpl, phase, phase_idx, turn_idx, role, agent, channel,
                 instruction=instruction,
             )
+            self._store.set_waiting(session["id"], agent)
             return
 
         if self._agent_uses_store_exec(agent):
-            if cls.report_orchestrated:
-                if _fire_report_orchestrated_prompt(role, agent, agent_base):
-                    return
-                return
             prompt = build_coordinator_loop_ui_lead_prompt(
                     session_name=tmpl.get("name", "?"),
                     channel=channel,
@@ -1831,6 +2004,7 @@ class SessionEngine:
                     session, role, phase_idx, turn_idx,
                 ),
             )
+            self._store.set_waiting(session["id"], agent)
             return
 
         context_messages = self._get_recent_context(channel)
@@ -1896,6 +2070,7 @@ class SessionEngine:
             channel=channel,
         )
         self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+        self._store.set_waiting(session["id"], agent)
 
     def is_coordinator_loop_session(self, session: dict) -> bool:
         """True if the session's template opts in to coordinator-loop routing."""

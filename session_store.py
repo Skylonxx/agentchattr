@@ -321,6 +321,7 @@ class SessionStore:
                 return None
             session["state"] = "interrupted"
             session["interrupt_reason"] = reason
+            session["waiting_on"] = ""
             session["updated_at"] = time.time()
             self._save()
             result = dict(session)

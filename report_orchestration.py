@@ -1170,7 +1170,7 @@ def build_report_orchestrated_dispatch_prompt(
         if not dev:
             return ReportPromptResult(
                 ok=False,
-                blocker="BLOCKER: reviewer context missing developer analysis",
+                blocker="BLOCKER: ui_lead context missing developer report",
             )
         ok, dev_content, _ = load_report_content(dev)
         if not ok:
