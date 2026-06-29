@@ -82,6 +82,133 @@ def build_relay_prompt(
     return "\n\n".join(lines)
 
 
+def session_workspace_policy(session: dict | None) -> dict | None:
+    """Return persisted workspace policy from a session dict, if present."""
+    if not isinstance(session, dict):
+        return None
+    policy = session.get("workspace_policy")
+    return dict(policy) if isinstance(policy, dict) else None
+
+
+def role_uses_scoped_workspace(session: dict | None, role: str) -> bool:
+    """True when role participates in an implementation/scoped-write workspace session."""
+    policy = session_workspace_policy(session)
+    if not policy or policy.get("mode") != "implementation":
+        return False
+    import workspace_policy as wp
+    perms = wp.role_permission_for(policy, role)
+    if not perms:
+        return False
+    return perms.get("filesystem") in ("write_allowlist", "read")
+
+
+def role_uses_headless_scoped_workspace(session: dict | None, role: str) -> bool:
+    """Developer/ui_lead must use headless exec (not relay) for scoped Twinpet work."""
+    if not role_uses_scoped_workspace(session, role):
+        return False
+    return role in ("developer", "ui_lead")
+
+
+def build_scoped_write_worker_prompt(
+    *,
+    session_name: str,
+    goal: str,
+    role: str,
+    policy: dict,
+    instruction: str = "",
+    phase_name: str = "",
+    phase_index: int = 0,
+    total_phases: int = 1,
+    context_messages: list[dict] | None = None,
+) -> str:
+    """Build a coordinator-loop worker prompt for scoped-write implementation."""
+    import workspace_policy as wp
+
+    workspace = policy.get("workspace") or {}
+    root = workspace.get("root") or ""
+    write_files = list(policy.get("write_files") or [])
+    forbidden = list(policy.get("forbidden_paths") or [])
+    expected_head = workspace.get("expected_head") or ""
+    perms = wp.role_permission_for(policy, role) or {}
+    fs = perms.get("filesystem", "none")
+
+    lines = [
+        f"SESSION: {session_name}",
+    ]
+    if goal:
+        lines.append(f"GOAL: {goal}")
+    if phase_name:
+        lines.append(f"PHASE: {phase_name} ({phase_index + 1}/{total_phases})")
+    lines.append(f"YOUR ROLE: {role}")
+    if instruction:
+        lines.append(f"INSTRUCTION: {instruction}")
+
+    lines.extend([
+        "",
+        "WORKSPACE CONTRACT (scoped-write — authoritative over template read-only text):",
+        f"WORKING DIRECTORY: {root}",
+        "You MUST treat this path as your workspace root for this turn.",
+        "Do not claim you are in agentchattr-scratch or another repo.",
+    ])
+
+    if expected_head:
+        lines.append(f"EXPECTED GIT HEAD: {expected_head}")
+
+    if fs == "write_allowlist":
+        lines.extend([
+            "",
+            "PREFLIGHT (run before editing):",
+            "  pwd",
+            "  git status --short",
+            "  git rev-parse HEAD",
+            "",
+            "ALLOWED FILE WRITES (exact allowlist only):",
+        ])
+        for wf in write_files:
+            lines.append(f"  - {wf}")
+        lines.extend([
+            "",
+            "FORBIDDEN WRITES (non-exhaustive red zones):",
+            "  POSPage.tsx, useCheckout.ts, asyncCheckout.ts, cartUtils.ts,",
+            "  payment finalization, cart math, keyboard contracts, Firebase/rules, git writes.",
+        ])
+        if forbidden:
+            lines.append("Configured forbidden path patterns also apply.")
+        lines.extend([
+            "",
+            "ALLOWED READ-ONLY GIT: git status, git diff, git log, git show",
+            "FORBIDDEN GIT: git add, commit, push, reset, checkout, clean, stash",
+            "Do not use MCP tools. Do not call chat_read or chat_send.",
+        ])
+    elif fs == "read":
+        lines.extend([
+            "",
+            "READ-ONLY WORKSPACE INSPECTION:",
+            f"Inspect files under {root} only. Do not edit any files.",
+            "ALLOWED READ-ONLY GIT: git status, git diff, git log, git show",
+            "Do not use MCP tools. Do not call chat_read or chat_send.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "READ-ONLY: Do not edit files. Do not run shell commands beyond read-only git.",
+        ])
+
+    if context_messages:
+        lines.append("")
+        lines.append("CONTEXT (recent messages):")
+        for msg in context_messages[-10:]:
+            sender = msg.get("sender", "?")
+            text = msg.get("text", "")
+            lines.append(f"  [{sender}]: {text}")
+
+    lines.append("")
+    lines.append(
+        "Respond with plain text only. Your response will be relayed by the server."
+    )
+    return "\n\n".join(lines)
+
+
 def build_safety_gate_prompt(
     *,
     session_name: str,

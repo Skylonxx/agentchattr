@@ -17,6 +17,7 @@
 
 let activeSession = null;
 let sessionTemplates = [];
+let workspacePresets = [];
 let activeSessionsByChannel = {};
 let sessionIndicatorTargetChannel = null;
 
@@ -153,6 +154,39 @@ async function fetchSessionTemplates() {
     } catch (e) {
         console.warn('Failed to fetch session templates', e);
     }
+}
+
+async function fetchWorkspacePresets() {
+    try {
+        const res = await fetch('/api/sessions/workspace-presets', { headers: { 'X-Session-Token': window.SESSION_TOKEN } });
+        if (res.ok) {
+            const data = await res.json();
+            workspacePresets = data.presets || [];
+        }
+    } catch (e) {
+        console.warn('Failed to fetch workspace presets', e);
+        workspacePresets = [];
+    }
+}
+
+async function ensureSessionChannel(channel) {
+    if (!channel) return window.activeChannel;
+    if (window.channelList.includes(channel)) {
+        if (channel !== window.activeChannel && window.switchChannel) {
+            window.switchChannel(channel);
+        }
+        return channel;
+    }
+    if (window.ws && window.ws.readyState === WebSocket.OPEN) {
+        if (window._setPendingChannelSwitch) window._setPendingChannelSwitch(channel);
+        window.ws.send(JSON.stringify({ type: 'channel_create', name: channel }));
+        for (let i = 0; i < 30; i++) {
+            await new Promise(r => setTimeout(r, 100));
+            if (window.channelList.includes(channel)) break;
+        }
+        if (window.switchChannel) window.switchChannel(channel);
+    }
+    return channel;
 }
 
 async function fetchAllActiveSessions() {
@@ -380,6 +414,13 @@ function showSessionLauncher() {
     let existing = document.getElementById('session-launcher-modal');
     if (existing) existing.remove();
 
+    fetchWorkspacePresets().then(() => _renderSessionLauncher());
+}
+
+function _renderSessionLauncher() {
+    let existing = document.getElementById('session-launcher-modal');
+    if (existing) existing.remove();
+
     const modal = document.createElement('div');
     modal.id = 'session-launcher-modal';
     modal.className = 'session-launcher-overlay';
@@ -393,6 +434,21 @@ function showSessionLauncher() {
             <div class="session-tmpl-roles">${(t.roles || []).map(r => `<span class="session-role-pill">${window.escapeHtml(r)}</span>`).join(' ')}</div>
         </div>`
     ).join('');
+
+    const presetCards = workspacePresets.map(p =>
+        `<div class="session-tmpl-card session-preset-card" onclick="showPresetPreview('${window.escapeHtml(p.id)}')" title="${window.escapeHtml(p.description || '')}">
+            <span class="session-preset-badge">Scoped Write</span>
+            <div class="session-tmpl-name">${window.escapeHtml(p.label || p.id)}</div>
+            <div class="session-tmpl-desc">${window.escapeHtml(p.description || '')}</div>
+            <div class="session-preset-meta">Profile: ${window.escapeHtml(p.workspace_profile || '')}</div>
+        </div>`
+    ).join('');
+
+    const presetSection = presetCards
+        ? `<div class="session-launcher-section-label">Workspace Presets</div>
+           <div class="session-launcher-presets">${presetCards}</div>
+           <div class="session-launcher-section-label">Templates</div>`
+        : '';
 
     // "Design a session" card -- lets user describe what they want and pick an agent to draft it
     const agents = _getAvailableAgents();
@@ -420,7 +476,7 @@ function showSessionLauncher() {
                 <input id="session-goal-input" type="text" placeholder="Goal (optional) -- what should this session achieve?" />
             </div>
             <div id="session-step-templates">
-                <div class="session-launcher-templates">${templateOptions}${designCard}</div>
+                <div class="session-launcher-templates">${presetSection}${templateOptions}${designCard}</div>
             </div>
             <div id="session-step-cast" class="hidden"></div>
         </div>
@@ -481,6 +537,111 @@ function sessionCastBack() {
     const tmplStep = document.getElementById('session-step-templates');
     if (castStep) castStep.classList.add('hidden');
     if (tmplStep) tmplStep.classList.remove('hidden');
+}
+
+function _buildPresetSummaryHtml(preset) {
+    const files = (preset.write_files || [])
+        .map(f => `<li>${window.escapeHtml(f)}</li>`)
+        .join('');
+    return `
+        <div class="session-preset-summary">
+            <div class="session-preset-summary-title">Scoped-write workspace contract</div>
+            <dl class="session-preset-details">
+                <dt>Profile</dt><dd>${window.escapeHtml(preset.workspace_profile || '')}</dd>
+                <dt>Mode</dt><dd>${window.escapeHtml(preset.workspace_mode || '')}</dd>
+                <dt>Expected HEAD</dt><dd><code>${window.escapeHtml(preset.expected_head || '')}</code></dd>
+                <dt>Workspace</dt><dd><code>${window.escapeHtml(preset.workspace_root || '')}</code></dd>
+            </dl>
+            <div class="session-preset-files-label">Allowed files:</div>
+            <ul class="session-preset-files">${files}</ul>
+        </div>`;
+}
+
+function showPresetPreview(presetId) {
+    const preset = workspacePresets.find(p => p.id === presetId);
+    if (!preset) return;
+
+    const tmpl = sessionTemplates.find(t => t.id === preset.template_id);
+    const agents = _getAvailableAgents();
+    const cast = { ...(preset.cast || {}) };
+    const assignees = [...agents, window.username];
+
+    const castStep = document.getElementById('session-step-cast');
+    const tmplStep = document.getElementById('session-step-templates');
+    if (!castStep || !tmplStep) return;
+
+    tmplStep.classList.add('hidden');
+    castStep.classList.remove('hidden');
+
+    const goalInput = document.getElementById('session-goal-input');
+    if (goalInput && preset.goal && !goalInput.value.trim()) {
+        goalInput.value = preset.goal;
+    }
+
+    const roleRows = tmpl
+        ? buildSessionCastEditor(tmpl, cast, assignees)
+        : Object.keys(cast).map(role => {
+            const assigned = cast[role] || '';
+            const options = assignees.map(a =>
+                `<option value="${window.escapeHtml(a)}" ${a === assigned ? 'selected' : ''}>${window.escapeHtml(a)}</option>`
+            ).join('');
+            return `<div class="session-cast-row">
+                <span class="session-cast-role">${window.escapeHtml(role)}</span>
+                <select class="session-cast-select" data-role="${window.escapeHtml(role)}" onchange="syncSessionCastRole(this)">${options}</select>
+            </div>`;
+        }).join('');
+
+    castStep.innerHTML = `
+        <div class="session-cast-header">
+            <button class="session-back-btn" onclick="sessionCastBack()">&larr;</button>
+            <span>${window.escapeHtml(preset.label || preset.id)}</span>
+        </div>
+        ${_buildPresetSummaryHtml(preset)}
+        <div class="session-cast-list">${roleRows}</div>
+        <button class="session-start-btn session-preset-start-btn" onclick="launchPresetSession('${window.escapeHtml(presetId)}')">Start Scoped Write Session</button>
+    `;
+}
+
+async function launchPresetSession(presetId) {
+    const preset = workspacePresets.find(p => p.id === presetId);
+    if (!preset) return;
+
+    const goalInput = document.getElementById('session-goal-input');
+    const goal = (goalInput?.value?.trim()) || preset.goal || '';
+
+    const cast = {};
+    document.querySelectorAll('#session-step-cast .session-cast-select').forEach(sel => {
+        cast[sel.dataset.role] = sel.value;
+    });
+    const finalCast = Object.keys(cast).length ? cast : (preset.cast || {});
+
+    const modal = document.getElementById('session-launcher-modal');
+    if (modal) modal.remove();
+
+    const channel = await ensureSessionChannel(preset.channel || window.activeChannel);
+
+    try {
+        const res = await fetch('/api/sessions/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-Session-Token': window.SESSION_TOKEN },
+            body: JSON.stringify({
+                template_id: preset.template_id,
+                channel: channel,
+                cast: finalCast,
+                goal: goal,
+                started_by: window.username,
+                workspace_profile: preset.workspace_profile,
+                workspace_mode: preset.workspace_mode,
+                expected_head: preset.expected_head,
+            }),
+        });
+        if (!res.ok) {
+            const data = await res.json();
+            alert(data.error || 'Failed to start session');
+        }
+    } catch (e) {
+        alert('Error starting session: ' + e.message);
+    }
 }
 
 async function launchSessionWithCast(templateId) {
@@ -903,6 +1064,7 @@ Store.watch('activeChannel', function (newChannel) {
 
 function _sessionsInit() {
     fetchSessionTemplates();
+    fetchWorkspacePresets();
     fetchAllActiveSessions();
     activeSession = null;
     updateSessionBar();
@@ -923,8 +1085,10 @@ window.submitDraftChanges = submitDraftChanges;
 window.toggleEndSessionConfirm = toggleEndSessionConfirm;
 window.jumpToSessionChannel = jumpToSessionChannel;
 window.showCastPreview = showCastPreview;
+window.showPresetPreview = showPresetPreview;
 window.sessionCastBack = sessionCastBack;
 window.launchSessionWithCast = launchSessionWithCast;
+window.launchPresetSession = launchPresetSession;
 window.launchDraftSession = launchDraftSession;
 window.sendDesignRequest = sendDesignRequest;
 window.syncSessionCastRole = syncSessionCastRole;

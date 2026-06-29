@@ -24,7 +24,7 @@ from agents import AgentTrigger
 from registry import RuntimeRegistry
 from session_store import SessionStore, validate_session_template
 from session_engine import SessionEngine
-from config_loader import get_workspace_profiles
+from config_loader import get_workspace_presets_enriched, get_workspace_profiles
 import workspace_policy as workspace_policy_mod
 from safety_invariants import (
     build_sandbox_flow_channel_name,
@@ -2552,6 +2552,12 @@ async def get_session_templates():
     if not session_store:
         return JSONResponse({"error": "sessions not configured"}, status_code=500)
     return JSONResponse(session_store.get_templates())
+
+
+@app.get("/api/sessions/workspace-presets")
+async def get_workspace_presets():
+    """Return server-approved scoped-write / workspace session presets for the UI."""
+    return JSONResponse({"presets": get_workspace_presets_enriched(config or {})})
 
 
 @app.get("/api/sessions/active")

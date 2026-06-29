@@ -9,11 +9,13 @@ from session_relay import (
     build_safety_gate_prompt,
     build_coordinator_loop_prompt,
     build_coordinator_loop_ui_lead_prompt,
+    build_scoped_write_worker_prompt,
     coordinator_loop_worker_output_contract,
     is_relay_eligible,
     make_relay_queue_entry,
     parse_safety_verdict,
     parse_workflow_verdict,
+    role_uses_headless_scoped_workspace,
     SafetyVerdict,
     AGY_TOKENS,
     CODEX_REVIEWER_TOKENS,
@@ -735,6 +737,13 @@ class SessionEngine:
         agent_base = self._get_agent_base(agent)
         channel = session.get("channel", "general")
 
+        if role_uses_headless_scoped_workspace(session, role):
+            self._trigger_scoped_workspace_worker(
+                session, tmpl, phase, phase_idx, turn_idx, role, agent, channel,
+                instruction=phase.get("prompt", ""),
+            )
+            return
+
         if is_relay_eligible(agent_base):
             self._trigger_relay(session, tmpl, phase, phase_idx, turn_idx,
                                 role, agent, agent_base, channel)
@@ -753,9 +762,65 @@ class SessionEngine:
                 log.error("Session %d: failed to trigger %s: %s",
                           session["id"], agent, exc)
 
+    def _trigger_scoped_workspace_worker(
+        self,
+        session: dict,
+        tmpl: dict,
+        phase: dict,
+        phase_idx: int,
+        turn_idx: int,
+        role: str,
+        agent: str,
+        channel: str,
+        *,
+        instruction: str = "",
+    ):
+        """Trigger developer/ui_lead with scoped-write workspace contract (headless exec)."""
+        policy = session.get("workspace_policy") or {}
+        context_messages = self._get_recent_context(channel)
+        prompt = build_scoped_write_worker_prompt(
+            session_name=tmpl.get("name", "?"),
+            goal=session.get("goal", ""),
+            role=role,
+            policy=policy,
+            instruction=instruction or phase.get("prompt", ""),
+            phase_name=phase.get("name", ""),
+            phase_index=phase_idx,
+            total_phases=len(tmpl.get("phases", [])),
+            context_messages=context_messages,
+        )
+        contract = coordinator_loop_worker_output_contract(role)
+        if contract:
+            prompt = f"{prompt}\n\n{contract}"
+        log.info(
+            "Session %d: scoped-workspace trigger %s (%s) for phase '%s'",
+            session["id"], agent, role, phase.get("name", "?"),
+        )
+        try:
+            self._trigger.trigger_sync(
+                agent,
+                channel=channel,
+                prompt=prompt,
+                workspace_policy_context=self._session_workspace_policy_context(
+                    session, role, phase_idx, turn_idx,
+                ),
+            )
+        except Exception as exc:
+            log.error(
+                "Session %d: failed scoped-workspace trigger %s: %s",
+                session["id"], agent, exc,
+            )
+
     def _trigger_relay(self, session, tmpl, phase, phase_idx, turn_idx,
                        role, agent, agent_base, channel):
         """Trigger a relay-mode agent (Codex/CodexSafe) as text-in/text-out."""
+        if role_uses_headless_scoped_workspace(session, role):
+            self._trigger_scoped_workspace_worker(
+                session, tmpl, phase, phase_idx, turn_idx, role, agent, channel,
+                instruction=phase.get("prompt", ""),
+            )
+            return
+
         is_safety = role.lower() in _SAFETY_GATE_ROLES
 
         if is_safety:
@@ -1542,6 +1607,13 @@ class SessionEngine:
             return
 
         instruction = worker_prompt or phase.get("prompt", "")
+        if role_uses_headless_scoped_workspace(session, role):
+            self._trigger_scoped_workspace_worker(
+                session, tmpl, phase, phase_idx, turn_idx, role, agent, channel,
+                instruction=instruction,
+            )
+            return
+
         if self._agent_uses_store_exec(agent):
             prompt = build_coordinator_loop_ui_lead_prompt(
                 session_name=tmpl.get("name", "?"),

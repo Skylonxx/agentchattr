@@ -256,6 +256,51 @@ def get_workspace_profiles(cfg: dict) -> dict[str, dict]:
     return {profile_id: profile for profile_id, profile in raw.items() if isinstance(profile, dict)}
 
 
+def get_workspace_presets(cfg: dict) -> dict[str, dict]:
+    """Return server-approved UI workspace session presets from committed config."""
+    raw = cfg.get("workspace_presets")
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for preset_id, preset in raw.items():
+        if isinstance(preset, dict):
+            out[str(preset_id)] = dict(preset)
+    return out
+
+
+def get_workspace_presets_enriched(cfg: dict) -> list[dict]:
+    """Return UI session presets enriched with profile root and write_files."""
+    presets_raw = get_workspace_presets(cfg)
+    profiles = get_workspace_profiles(cfg)
+    enriched: list[dict] = []
+    for preset_id, preset in presets_raw.items():
+        profile_id = str(preset.get("workspace_profile") or preset_id)
+        profile = profiles.get(profile_id) or {}
+        write_files = profile.get("default_write_files") or profile.get(
+            "allowed_write_files"
+        ) or []
+        if not isinstance(write_files, (list, tuple)):
+            write_files = []
+        cast = preset.get("cast")
+        if not isinstance(cast, dict):
+            cast = {}
+        enriched.append({
+            "id": preset_id,
+            "label": preset.get("label", preset_id),
+            "description": preset.get("description", ""),
+            "template_id": preset.get("template_id", ""),
+            "channel": preset.get("channel", ""),
+            "workspace_profile": profile_id,
+            "workspace_mode": preset.get("workspace_mode", ""),
+            "expected_head": preset.get("expected_head", ""),
+            "goal": preset.get("goal", ""),
+            "cast": dict(cast),
+            "workspace_root": profile.get("workspace_root", ""),
+            "write_files": [str(f) for f in write_files],
+        })
+    return enriched
+
+
 def get_workspace_policy_config(cfg: dict) -> dict:
     """Return workspace policy runtime config (safe defaults when missing)."""
     section = cfg.get("workspace_policy")

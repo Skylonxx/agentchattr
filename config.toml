@@ -284,3 +284,21 @@ default_forbidden_paths = [
 runtime_enforcement_enabled = false
 read_only_external_cwd_enabled = true
 scoped_write_external_cwd_enabled = true
+
+# UI one-click session presets (server-approved; maps to workspace_profiles).
+[workspace_presets.twinpet-ui-09-c-payment-modal-write]
+label = "Twinpet UI-09-C PaymentModal Scoped Write"
+description = "Scoped-write implementation for PaymentModal files only. No broad Twinpet writes."
+template_id = "project-readonly-coordinator-loop"
+channel = "twinpet-ui-09-c-payment-modal-write"
+workspace_profile = "twinpet-ui-09-c-payment-modal-write"
+workspace_mode = "scoped-write"
+expected_head = "752ed1317a5e0b83b872d563cda451c7621ed22e"
+goal = "Implement UI-09-C PaymentModal visual/UX polish only. Allowed files: src/components/PaymentModal.tsx, src/components/PaymentModal.css, tests/pos-human-checkout.spec.ts only if selector/text changes require it, and docs only after tests pass. Do not touch POSPage, useCheckout, asyncCheckout, cart math, keyboard contracts, or git write commands."
+
+[workspace_presets.twinpet-ui-09-c-payment-modal-write.cast]
+coordinator = "codex_coordinator"
+developer = "claude"
+ui_lead = "agy"
+reviewer = "codex_reviewer"
+safety_gate = "codexsafe"
