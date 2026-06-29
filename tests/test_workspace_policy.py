@@ -605,6 +605,20 @@ class UntrackedDocsShapeTests(unittest.TestCase):
         self.assertFalse(result2.ok)
 
 
+class ScopedWriteModeAliasTests(unittest.TestCase):
+    def test_scoped_write_normalizes_to_implementation(self):
+        self.assertEqual(wp.normalize_workspace_mode("scoped-write"), "implementation")
+        self.assertEqual(wp.normalize_workspace_mode("read-only"), "read-only")
+
+    def test_scoped_write_payload_rejected_without_profile_allowlist(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_example_profiles(),
+            profile_id="example-workspace",
+            start_payload={"workspace_mode": "scoped-write"},
+        )
+        self.assertFalse(result.ok)
+
+
 class StripInternalKeysTests(unittest.TestCase):
     def test_strip_internal_policy_keys(self):
         result = wp.resolve_workspace_policy(

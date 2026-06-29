@@ -250,6 +250,29 @@ class ConfigProfileTests(unittest.TestCase):
             profiles["agentchattr-scratch"]["workspace_root"],
             SCRATCH_ROOT,
         )
+        self.assertIn("twinpet-ui-09-c-payment-modal-write", profiles)
+        self.assertEqual(
+            profiles["twinpet-ui-09-c-payment-modal-write"]["default_mode"],
+            "implementation",
+        )
+
+    def test_scoped_write_session_api_payload(self):
+        profiles = config_loader.get_workspace_profiles(config_loader.load_config(ROOT))
+        result = wp.resolve_session_workspace_policy(
+            profiles=profiles,
+            start_body={
+                "workspace_profile": "twinpet-ui-09-c-payment-modal-write",
+                "workspace_mode": "scoped-write",
+                "expected_head": "752ed1317a5e0b83b872d563cda451c7621ed22e",
+            },
+        )
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.policy["mode"], "implementation")
+        self.assertEqual(result.policy["policy_id"], "twinpet-ui-09-c-payment-modal-write")
+        self.assertIn("src/components/PaymentModal.tsx", result.policy["write_files"])
+        git = result.policy["git_permissions"]
+        for key in wp.GIT_WRITE_KEYS:
+            self.assertFalse(git.get(key), f"git write {key} must stay disabled")
 
     def test_existing_templates_unaffected_without_policy(self):
         tmpl_path = ROOT / "session_templates" / "planning.json"

@@ -36,6 +36,18 @@ VALID_MODES = (
 
 MODE_RANK = {mode: idx for idx, mode in enumerate(VALID_MODES)}
 
+# Session API alias: scoped-write maps to implementation (narrow write_files allowlist).
+SCOPED_WRITE_MODE_ALIASES = frozenset({"scoped-write"})
+
+
+def normalize_workspace_mode(mode: str | None) -> str | None:
+    """Normalize API mode aliases to canonical VALID_MODES values."""
+    if mode is None:
+        return None
+    if mode in SCOPED_WRITE_MODE_ALIASES:
+        return "implementation"
+    return mode
+
 CANONICAL_ROLES = frozenset({
     "coordinator",
     "developer",
@@ -524,6 +536,7 @@ def _apply_start_payload(
 
     mode = payload.get("workspace_mode") or payload.get("mode")
     if mode:
+        mode = normalize_workspace_mode(mode)
         if mode not in VALID_MODES:
             errors.append(f"invalid workspace_mode: {mode!r}")
         else:
@@ -538,6 +551,8 @@ def _apply_start_payload(
                 out["role_permissions"] = dict(_default_role_permissions(mode))
                 if mode in ("scratch-readonly", "read-only"):
                     out["write_files"] = []
+                elif mode in ("docs-only", "implementation") and not out.get("write_files"):
+                    out["write_files"] = list(out.get("_profile_allowed_write_files") or [])
 
     payload_writes = payload.get("write_files")
     if payload_writes is not None:
@@ -620,6 +635,9 @@ def _validate_mode_constraints(policy: dict[str, Any], mode: str) -> list[str]:
             norm = _normalize_rel_path(str(wf))
             if norm.startswith("src/") or "/src/" in f"/{norm}/":
                 errors.append(f"docs-only rejects source path: {norm!r}")
+    elif mode == "implementation":
+        if not write_files:
+            errors.append("implementation mode requires explicit write_files")
     elif mode in ("git-stage", "git-commit", "git-push"):
         git_perms = policy.get("git_permissions") or {}
         if mode == "git-stage" and not git_perms.get("stage"):
@@ -912,7 +930,7 @@ def extract_policy_start_fields(body: dict[str, Any]) -> tuple[dict[str, Any] | 
     if mode is None and "mode" in body:
         mode = body.get("mode")
     if mode is not None:
-        payload["workspace_mode"] = mode
+        payload["workspace_mode"] = normalize_workspace_mode(mode)
 
     if "write_files" in body:
         payload["write_files"] = body["write_files"]

@@ -263,8 +263,10 @@ def get_workspace_policy_config(cfg: dict) -> dict:
         return {
             "runtime_enforcement_enabled": False,
             "read_only_external_cwd_enabled": False,
+            "scoped_write_external_cwd_enabled": False,
         }
     return {
         "runtime_enforcement_enabled": bool(section.get("runtime_enforcement_enabled")),
         "read_only_external_cwd_enabled": bool(section.get("read_only_external_cwd_enabled")),
+        "scoped_write_external_cwd_enabled": bool(section.get("scoped_write_external_cwd_enabled")),
     }

@@ -754,6 +754,10 @@ class ConfigFlagTests(unittest.TestCase):
         self.assertFalse(wpr.is_read_only_external_cwd_enabled({}))
         self.assertFalse(wpr.is_read_only_external_cwd_enabled({"workspace_policy": {}}))
 
+    def test_scoped_write_external_cwd_default_off(self):
+        self.assertFalse(wpr.is_scoped_write_external_cwd_enabled({}))
+        self.assertFalse(wpr.is_scoped_write_external_cwd_enabled({"workspace_policy": {}}))
+
     def test_config_loader_helper(self):
         import config_loader
 
@@ -761,7 +765,237 @@ class ConfigFlagTests(unittest.TestCase):
         wp_cfg = config_loader.get_workspace_policy_config(cfg)
         self.assertFalse(wp_cfg["runtime_enforcement_enabled"])
         self.assertTrue(wp_cfg["read_only_external_cwd_enabled"])
+        self.assertTrue(wp_cfg["scoped_write_external_cwd_enabled"])
         self.assertIn("twinpet-pos", config_loader.get_workspace_profiles(cfg))
+        self.assertIn(
+            "twinpet-ui-09-c-payment-modal-write",
+            config_loader.get_workspace_profiles(cfg),
+        )
+
+
+TWINPET_WRITE_FILES = [
+    "src/components/PaymentModal.tsx",
+    "src/components/PaymentModal.css",
+    "tests/pos-human-checkout.spec.ts",
+    "Task.md",
+    "Context.md",
+    "docs/reports/latest-report.md",
+]
+
+
+def _twinpet_scoped_write_profiles() -> dict:
+    return {
+        "twinpet-ui-09-c-payment-modal-write": {
+            "workspace_root": TWINPET,
+            "allowed_modes": ["read-only", "implementation"],
+            "default_mode": "implementation",
+            "max_mode": "implementation",
+            "require_git_repo": True,
+            "allowed_write_files": list(TWINPET_WRITE_FILES),
+            "default_write_files": list(TWINPET_WRITE_FILES),
+            "max_write_files": 6,
+            "default_forbidden_paths": [
+                "src/pages/POSPage.tsx",
+                "src/hooks/pos/useCheckout.ts",
+                "src/lib/pos/asyncCheckout.ts",
+                "src/lib/pos/cartUtils.ts",
+                "functions/**",
+                "firebase.json",
+                "firestore.rules",
+                "storage.rules",
+                "android/**",
+                "ios/**",
+                ".claude/**",
+                "config.local.toml",
+                ".git/**",
+            ],
+        },
+    }
+
+
+class TwinpetScopedWriteProfileTests(unittest.TestCase):
+    def test_profile_loads_from_config(self):
+        import config_loader
+
+        profiles = config_loader.get_workspace_profiles(config_loader.load_config(ROOT))
+        profile = profiles["twinpet-ui-09-c-payment-modal-write"]
+        self.assertEqual(profile["default_mode"], "implementation")
+        self.assertEqual(profile["allowed_write_files"], TWINPET_WRITE_FILES)
+
+    def test_scoped_write_alias_resolves_to_implementation(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_scoped_write_profiles(),
+            profile_id="twinpet-ui-09-c-payment-modal-write",
+            start_payload={
+                "workspace_mode": "scoped-write",
+                "expected_head": "752ed1317a5e0b83b872d563cda451c7621ed22e",
+            },
+        )
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.policy["mode"], "implementation")
+        self.assertEqual(result.policy["write_files"], TWINPET_WRITE_FILES)
+        self.assertEqual(
+            result.policy["workspace"]["expected_head"],
+            "752ed1317a5e0b83b872d563cda451c7621ed22e",
+        )
+
+    def test_read_only_profile_unchanged(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_profiles(),
+            profile_id="twinpet-pos",
+            start_payload={"workspace_mode": "read-only"},
+        )
+        self.assertTrue(result.ok, result.errors)
+        self.assertEqual(result.policy.get("write_files"), [])
+
+    def test_rejects_pos_page_write_files_payload(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_scoped_write_profiles(),
+            profile_id="twinpet-ui-09-c-payment-modal-write",
+            start_payload={
+                "workspace_mode": "implementation",
+                "write_files": ["src/pages/POSPage.tsx"],
+            },
+        )
+        self.assertFalse(result.ok)
+
+    def test_rejects_wildcard_write_files(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_scoped_write_profiles(),
+            profile_id="twinpet-ui-09-c-payment-modal-write",
+            start_payload={
+                "workspace_mode": "implementation",
+                "write_files": ["src/components/*"],
+            },
+        )
+        self.assertFalse(result.ok)
+
+    def test_rejects_arbitrary_workspace_root(self):
+        payload, err = wp.extract_policy_start_fields(
+            {"workspace_root": "C:/Users/Evil/other"},
+        )
+        self.assertIsNone(payload)
+        self.assertIn("workspace_root", err or "")
+
+    def test_rejects_unknown_profile(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_scoped_write_profiles(),
+            profile_id="unknown-profile",
+            start_payload={"workspace_mode": "implementation"},
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "UNKNOWN_PROFILE")
+
+    def test_rejects_docs_only_on_scoped_write_profile(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_scoped_write_profiles(),
+            profile_id="twinpet-ui-09-c-payment-modal-write",
+            start_payload={"workspace_mode": "docs-only"},
+        )
+        self.assertFalse(result.ok)
+
+    def test_local_override_cannot_broaden_write_files(self):
+        result = wp.resolve_workspace_policy(
+            profiles=_twinpet_scoped_write_profiles(),
+            profile_id="twinpet-ui-09-c-payment-modal-write",
+            local_override={"write_files": ["src/pages/POSPage.tsx"]},
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.code, "LOCAL_BROADEN_REJECTED")
+
+    def test_implementation_resolves_external_cwd_for_developer(self):
+        if not Path(TWINPET).is_dir():
+            self.skipTest("Twinpet path not present on this machine")
+        profiles = _twinpet_scoped_write_profiles()
+        resolved = wp.resolve_workspace_policy(
+            profiles=profiles,
+            profile_id="twinpet-ui-09-c-payment-modal-write",
+            start_payload={"workspace_mode": "scoped-write"},
+        )
+        self.assertTrue(resolved.ok, resolved.errors)
+        cwd = wpr.resolve_role_cwd(
+            resolved.policy,
+            "developer",
+            enforcement_enabled=True,
+            profiles=profiles,
+        )
+        self.assertEqual(Path(cwd), Path(TWINPET).resolve())
+
+    def test_exec_cwd_requires_scoped_write_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "repo"
+            root.mkdir()
+            profiles = {
+                "write-repo": {
+                    "workspace_root": str(root).replace("\\", "/"),
+                    "allowed_modes": ["implementation"],
+                    "default_mode": "implementation",
+                    "max_mode": "implementation",
+                    "allowed_write_files": ["Task.md"],
+                    "default_write_files": ["Task.md"],
+                },
+            }
+            resolved = wp.resolve_workspace_policy(
+                profiles=profiles,
+                profile_id="write-repo",
+            )
+            fields = wp.build_session_workspace_policy_fields(resolved.policy)
+            session = {"id": 9, **fields}
+            data_dir = Path(tmp) / "data"
+            data_dir.mkdir()
+            (data_dir / "session_runs.json").write_text(
+                json.dumps([session]), encoding="utf-8",
+            )
+            ctx = wpr.build_session_queue_workspace_context(
+                session, "developer", 0, 0,
+            )
+            item = {"workspace_policy_context": ctx}
+            cfg_off = {"workspace_policy": {"scoped_write_external_cwd_enabled": False}}
+            self.assertEqual(
+                wpr.resolve_exec_cwd_for_item(
+                    item, data_dir=data_dir, config=cfg_off,
+                    default_cwd=SCRATCH, profiles=profiles,
+                ),
+                SCRATCH,
+            )
+            cfg_on = {"workspace_policy": {"scoped_write_external_cwd_enabled": True}}
+            self.assertEqual(
+                Path(wpr.resolve_exec_cwd_for_item(
+                    item, data_dir=data_dir, config=cfg_on,
+                    default_cwd=SCRATCH, profiles=profiles,
+                )),
+                root.resolve(),
+            )
+
+    def test_dirty_set_allows_allowlisted_files(self):
+        policy = {
+            "mode": "implementation",
+            "write_files": TWINPET_WRITE_FILES,
+            "forbidden_paths": ["src/pages/POSPage.tsx"],
+        }
+        result = wpr.verify_dirty_set(
+            porcelain_output=" M src/components/PaymentModal.tsx\n",
+            policy=policy,
+        )
+        self.assertTrue(result.ok)
+
+    def test_dirty_set_blocks_red_zone_files(self):
+        policy = {
+            "mode": "implementation",
+            "write_files": TWINPET_WRITE_FILES,
+            "forbidden_paths": ["src/pages/POSPage.tsx"],
+        }
+        result = wpr.verify_dirty_set(
+            porcelain_output=" M src/pages/POSPage.tsx\n",
+            policy=policy,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.blocker, "BLOCKER:unauthorized_dirty_tree")
+
+    def test_git_write_commands_remain_blocked(self):
+        for cmd in ("git add .", "git commit -m x", "git push"):
+            result = wpr.check_command_guard(cmd)
+            self.assertFalse(result.ok, cmd)
 
 
 if __name__ == "__main__":

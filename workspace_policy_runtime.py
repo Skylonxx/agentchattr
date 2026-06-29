@@ -77,6 +77,22 @@ def is_read_only_external_cwd_enabled(cfg: dict | None) -> bool:
     return bool(section.get("read_only_external_cwd_enabled"))
 
 
+def is_scoped_write_external_cwd_enabled(cfg: dict | None) -> bool:
+    section = (cfg or {}).get("workspace_policy")
+    if not isinstance(section, dict):
+        return False
+    return bool(section.get("scoped_write_external_cwd_enabled"))
+
+
+def external_cwd_enabled_for_mode(cfg: dict | None, mode: str | None) -> bool:
+    """Return True when external cwd routing is enabled for the policy mode."""
+    if mode == "read-only":
+        return is_read_only_external_cwd_enabled(cfg)
+    if mode == "implementation":
+        return is_scoped_write_external_cwd_enabled(cfg)
+    return False
+
+
 def normalize_workspace_root(path: str) -> str:
     """Normalize an absolute workspace root for comparison and subprocess cwd."""
     if not path or not isinstance(path, str):
@@ -319,7 +335,7 @@ def resolve_role_cwd(
     if mode == "scratch-readonly":
         return default_scratch
 
-    if mode != "read-only":
+    if mode not in ("read-only", "implementation"):
         return default_scratch
 
     workspace = canonical.get("workspace") or {}
@@ -333,8 +349,14 @@ def resolve_role_cwd(
         return default_scratch
 
     fs = perms.get("filesystem", "none")
-    if fs not in ("read", "none"):
-        return default_scratch
+    if mode == "read-only":
+        if fs not in ("read", "none"):
+            return default_scratch
+    elif mode == "implementation":
+        if fs == "none":
+            return default_scratch
+        if fs not in ("read", "write_allowlist"):
+            return default_scratch
 
     normalized_root = normalize_workspace_root(root)
     if not normalized_root:
@@ -363,9 +385,7 @@ def resolve_exec_cwd_for_item(
     default_cwd: str,
     profiles: dict[str, dict[str, Any]] | None = None,
 ) -> str:
-    """Resolve subprocess cwd for a queue item (verified read-only external roots only)."""
-    if not is_read_only_external_cwd_enabled(config):
-        return default_cwd
+    """Resolve subprocess cwd for a queue item (verified external profile roots)."""
     if not isinstance(item, dict):
         return default_cwd
 
@@ -387,6 +407,10 @@ def resolve_exec_cwd_for_item(
         data_dir=data_dir,
     )
     if not policy:
+        return default_cwd
+
+    mode = policy.get("mode")
+    if not external_cwd_enabled_for_mode(config, mode):
         return default_cwd
 
     role = wpc.get("session_role") or "developer"

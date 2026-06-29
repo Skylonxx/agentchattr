@@ -953,6 +953,83 @@ def _resolve_exec_cwd(item, *, data_dir, config, default_cwd) -> str:
     )
 
 
+def _git_porcelain_at_cwd(cwd: str) -> str:
+    """Best-effort ``git status --porcelain`` for workspace dirty-set checks."""
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _workspace_dirty_blocker(
+    item,
+    *,
+    data_dir,
+    config,
+    effective_cwd: str,
+    when: str,
+) -> str | None:
+    """Return blocker token when dirty-set verification fails; None when allowed."""
+    from workspace_policy_runtime import (
+        canonical_policy_from_queue_context,
+        external_cwd_enabled_for_mode,
+        verify_dirty_set,
+        verify_session_workspace_policy,
+    )
+
+    if not isinstance(item, dict):
+        return None
+    wpc = item.get("workspace_policy_context")
+    if not isinstance(wpc, dict):
+        return None
+
+    verify = verify_session_workspace_policy(
+        relay_meta=item.get("relay_meta"),
+        workspace_policy_context=wpc,
+        data_dir=data_dir,
+        enforcement_enabled=True,
+    )
+    if not verify.ok:
+        return None
+
+    policy = canonical_policy_from_queue_context(
+        queue_context=wpc,
+        data_dir=data_dir,
+    )
+    if not policy:
+        return None
+
+    mode = policy.get("mode")
+    if not external_cwd_enabled_for_mode(config, mode):
+        return None
+
+    enforcement = policy.get("enforcement") or {}
+    if when == "pre" and not enforcement.get("abort_on_unauthorized_dirty"):
+        return None
+    if when == "post" and not enforcement.get("post_turn_diff_check"):
+        return None
+
+    dirty = verify_dirty_set(
+        porcelain_output=_git_porcelain_at_cwd(effective_cwd),
+        policy=policy,
+    )
+    if dirty.ok:
+        return None
+    return dirty.blocker or "BLOCKER:unauthorized_dirty_tree"
+
+
 # ---------------------------------------------------------------------------
 # Relay outcome markers (fail-loud: a relay turn never silently posts nothing)
 # ---------------------------------------------------------------------------
@@ -1109,15 +1186,32 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
             default_cwd=cwd,
         )
 
-        # Reply channel: relay turns carry it in relay_meta.channel; direct-mention
-        # turns carry it in the work item's "channel" field (set by the queue watcher
-        # from the @mention's source channel). Falls back to "general" only when
-        # neither source is available.
         reply_channel = (
             (relay_meta or {}).get("channel")
-            or item.get("channel", "")
+            or (item.get("channel", "") if isinstance(item, dict) else "")
             or "general"
         )
+
+        pre_dirty = _workspace_dirty_blocker(
+            item,
+            data_dir=data_dir,
+            config=config,
+            effective_cwd=effective_cwd,
+            when="pre",
+        )
+        if pre_dirty:
+            print(f"  > {agent} workspace dirty-tree blocked (pre-turn): {pre_dirty}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        pre_dirty,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay dirty-tree blocker: {exc}")
+            continue
 
         # Relay mode is METADATA-DRIVEN: structured relay_meta.disable_mcp is the
         # authoritative signal to strip MCP args/env (see _should_disable_mcp).
@@ -1184,6 +1278,27 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
                     captured = ""
             if not captured and proc.stdout:
                 captured = proc.stdout.decode("utf-8", errors="replace").strip()
+
+        post_dirty = _workspace_dirty_blocker(
+            item,
+            data_dir=data_dir,
+            config=config,
+            effective_cwd=effective_cwd,
+            when="post",
+        )
+        if post_dirty:
+            print(f"  > {agent} workspace dirty-tree blocked (post-turn): {post_dirty}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        post_dirty,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay post-turn dirty blocker: {exc}")
+            continue
 
         # Fail-loud relay: EVERY outcome posts exactly one non-empty message to
         # the session's channel (relay_meta.channel, carried in reply_channel) —
@@ -1511,7 +1626,8 @@ def _run_claude_direct_print_turn(
 def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
                                 trigger_flag=None, running_flag=None,
                                 data_dir=None, no_restart=False,
-                                server_port=8300, get_token_fn=None):
+                                server_port=8300, get_token_fn=None,
+                                config=None):
     """Headless Claude runner using ``claude --print`` with stdin payloads."""
     import queue as _queue
 
@@ -1551,9 +1667,56 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
             prompt = item
             reply_channel = "general"
 
+        blocker = _policy_blocker_for_exec_item(
+            item,
+            data_dir=data_dir,
+            config=config,
+        )
+        if blocker:
+            print(f"  > {agent} workspace policy blocked: {blocker}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        blocker,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay policy blocker: {exc}")
+            continue
+
+        effective_cwd = _resolve_exec_cwd(
+            item,
+            data_dir=data_dir,
+            config=config,
+            default_cwd=cwd,
+        )
+
+        pre_dirty = _workspace_dirty_blocker(
+            item,
+            data_dir=data_dir,
+            config=config,
+            effective_cwd=effective_cwd,
+            when="pre",
+        )
+        if pre_dirty:
+            print(f"  > {agent} workspace dirty-tree blocked (pre-turn): {pre_dirty}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        pre_dirty,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay dirty-tree blocker: {exc}")
+            continue
+
         _run_claude_direct_print_turn(
             command=command,
-            cwd=cwd,
+            cwd=effective_cwd,
             env=env,
             agent=agent,
             prompt=prompt,
@@ -1562,6 +1725,27 @@ def run_agent_claude_print_exec(command, cwd, env, agent, start_watcher, *,
             get_token_fn=get_token_fn,
             log_path=log_path,
         )
+
+        post_dirty = _workspace_dirty_blocker(
+            item,
+            data_dir=data_dir,
+            config=config,
+            effective_cwd=effective_cwd,
+            when="post",
+        )
+        if post_dirty:
+            print(f"  > {agent} workspace dirty-tree blocked (post-turn): {post_dirty}")
+            if get_token_fn is not None:
+                try:
+                    _relay_to_chat(
+                        server_port,
+                        get_token_fn(),
+                        post_dirty,
+                        channel=reply_channel,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  > {agent} failed to relay post-turn dirty blocker: {exc}")
+            continue
 
         if running_flag is not None and work.empty():
             running_flag[0] = False
@@ -2464,6 +2648,7 @@ def main():
                 no_restart=args.no_restart,
                 server_port=server_port,
                 get_token_fn=get_token,
+                config=config,
             )
         elif _is_claude_relay_mode(run_mode):
             # DORMANT Claude relay runner. Reachable only via this run_mode

@@ -235,9 +235,52 @@ max_mode = "read-only"
 require_git_repo = true
 default_forbidden_paths = [".git/**"]
 
+# UI-09-C PaymentModal scoped write — narrow allowlist only; no broad Twinpet writes.
+[workspace_profiles.twinpet-ui-09-c-payment-modal-write]
+workspace_root = "C:/Users/Narachat/twinpet-pos"
+allowed_modes = ["read-only", "implementation"]
+default_mode = "implementation"
+max_mode = "implementation"
+require_git_repo = true
+allowed_write_files = [
+  "src/components/PaymentModal.tsx",
+  "src/components/PaymentModal.css",
+  "tests/pos-human-checkout.spec.ts",
+  "Task.md",
+  "Context.md",
+  "docs/reports/latest-report.md",
+]
+default_write_files = [
+  "src/components/PaymentModal.tsx",
+  "src/components/PaymentModal.css",
+  "tests/pos-human-checkout.spec.ts",
+  "Task.md",
+  "Context.md",
+  "docs/reports/latest-report.md",
+]
+max_write_files = 6
+default_forbidden_paths = [
+  "src/pages/POSPage.tsx",
+  "src/hooks/pos/useCheckout.ts",
+  "src/lib/pos/asyncCheckout.ts",
+  "src/lib/pos/cartUtils.ts",
+  "functions/**",
+  "firebase.json",
+  "firestore.rules",
+  "storage.rules",
+  "android/**",
+  "ios/**",
+  ".claude/**",
+  "config.local.toml",
+  ".git/**",
+]
+
 # Phase 3B runtime enforcement (default OFF — metadata verification scaffolding only).
 # read_only_external_cwd_enabled routes verified read-only session turns to approved
 # external profile roots (e.g. twinpet-pos). Does not enable writes or docs-only.
+# scoped_write_external_cwd_enabled routes verified implementation/scoped-write turns
+# to approved external roots with write_files allowlist enforcement.
 [workspace_policy]
 runtime_enforcement_enabled = false
 read_only_external_cwd_enabled = true
+scoped_write_external_cwd_enabled = true
