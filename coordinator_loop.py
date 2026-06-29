@@ -930,7 +930,12 @@ def _try_report_orchestrated_worker(
     if not state.report_orchestrated:
         return None
 
-    from report_orchestration import ingest_worker_report_output, parse_report_ready
+    from report_orchestration import (
+        get_report_for_role,
+        ingest_worker_report_output,
+        parse_report_ready,
+        upsert_report_record,
+    )
     from worker_workspace import REPORT_BEGIN_MARKER
 
     first = _first_non_empty_line(text)
@@ -944,6 +949,9 @@ def _try_report_orchestrated_worker(
     by_role = ctx.get("report_paths_by_role") or {}
     if isinstance(by_role, dict) and by_role.get(role):
         expected_paths = [str(by_role[role])] + expected_paths
+
+    prior = get_report_for_role(state.report_records, role)
+    prior_hash = prior.sha256 if prior else ""
 
     ingest = ingest_worker_report_output(
         role,
@@ -962,8 +970,9 @@ def _try_report_orchestrated_worker(
     if not record or not parsed:
         return _terminal_blocker(state, "BLOCKER: report ingest failed")
 
-    state.report_records.append(record.to_dict())
-    state.handoff_repair_rounds.pop(role, None)
+    state.report_records = upsert_report_record(state.report_records, record)
+    if not prior_hash or prior_hash != record.sha256:
+        state.handoff_repair_rounds.pop(role, None)
     _append_verdict(state, role, "REPORT_READY", parsed.summary or record.path)
     state.last_output_summary = (parsed.summary or record.path)[:500]
     status = parsed.status

@@ -843,6 +843,74 @@ class ReportOrchestratedWorkerDispatchTests(CoordinatorLoopEngineTestBase):
         self.assertIn("handoff repair limit exceeded", cls_after.blocker_reason.lower())
         self.assertFalse(any(t.get("agent") == "claude" for t in trigger.triggered))
 
+    def test_handoff_repair_then_valid_report_dispatches_agy(self):
+        from pathlib import Path
+        from coordinator_loop import CoordinatorLoopState, _worker_action, on_worker_output
+        from tests.test_report_orchestration import (
+            _developer_report_body,
+            _report_ready,
+        )
+
+        engine, store, _, trigger, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)
+        tmp = tempfile.mkdtemp()
+        dev_path = Path(tmp) / "dev.md"
+        agy_path = Path(tmp) / "agy.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+
+        session, _policy, roots, by_role = self._start_report_session(
+            engine, store, cast, tmp,
+        )
+        by_role["developer"] = str(dev_path)
+        by_role["ui_lead"] = str(agy_path)
+        sid = session["id"]
+        ctx = {"allowed_report_roots": roots, "report_paths_by_role": by_role}
+
+        s = store.get(sid)
+        cls = CoordinatorLoopState.from_dict(s["coordinator_loop_state"])
+        cls.awaiting_role = "developer"
+        cls.classified = True
+        cls.requires_agy = True
+        on_worker_output(
+            cls,
+            "developer",
+            _report_ready(str(dev_path)),
+            worker_context=ctx,
+        )
+        store.update_coordinator_loop_state(sid, cls.to_dict())
+
+        action = _worker_action(cls, "ui_lead", "Review UX.")
+        store.update_coordinator_loop_state(
+            sid, cls.to_dict(), worker_prompt=action.routing_body,
+        )
+        trigger.triggered.clear()
+        engine._route_coordinator_loop_action(store.get(sid), action)
+        self.assertEqual(store.get(sid).get("waiting_on"), "claude")
+
+        dev_path.write_text(_developer_report_body(), encoding="utf-8")
+        cls = CoordinatorLoopState.from_dict(store.get(sid)["coordinator_loop_state"])
+        cls.awaiting_role = "developer"
+        on_worker_output(
+            cls,
+            "developer",
+            _report_ready(str(dev_path), status="PASS_WITH_NOTES"),
+            worker_context=ctx,
+        )
+        store.update_coordinator_loop_state(sid, cls.to_dict())
+
+        cls = CoordinatorLoopState.from_dict(store.get(sid)["coordinator_loop_state"])
+        action = _worker_action(cls, "ui_lead", "Review UX after repair.")
+        store.update_coordinator_loop_state(
+            sid, cls.to_dict(), worker_prompt=action.routing_body,
+        )
+        trigger.triggered.clear()
+        engine._route_coordinator_loop_action(store.get(sid), action)
+
+        s = store.get(sid)
+        self.assertEqual(s.get("waiting_on"), "agy")
+        self.assertFalse(any(t.get("agent") == "claude" for t in trigger.triggered))
+        agy_triggers = [t for t in trigger.triggered if t.get("agent") == "agy"]
+        self.assertEqual(len(agy_triggers), 1)
+
     def test_cast_maps_ui_lead_to_agy(self):
         engine, store, _, _, cast = self._make_engine(COORDINATOR_LOOP_TEMPLATE)
         self.assertEqual(cast.get("ui_lead"), "agy")

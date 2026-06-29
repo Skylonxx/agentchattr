@@ -39,6 +39,7 @@ from report_orchestration import (
     save_inline_report_to_path,
     validate_initial_developer_preflight,
     validate_report_path,
+    upsert_report_record,
     verify_report_write_permission,
 )
 from session_relay import coordinator_loop_worker_output_contract
@@ -1336,6 +1337,117 @@ class HandoffRepairPromptTests(unittest.TestCase):
         self.assertIn("BLOCKER: coordinator handoff repair limit exceeded", blocker)
         self.assertIn("snapshots_injected: false", blocker)
         self.assertIn("repair_rounds: 2", blocker)
+
+
+class HandoffRepairReleaseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+
+    def test_stale_record_refreshes_from_disk_before_ui_lead_validation(self):
+        dev_path = Path(self.tmp) / "dev.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=self.roots,
+        )
+        self.assertTrue(ingest.ok)
+        assert ingest.record is not None
+        dev_path.write_text(_developer_report_body(), encoding="utf-8")
+
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertFalse(result.handoff_repair)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR AGY:", result.prompt)
+        self.assertTrue(result.report_reread_after_repair)
+        refreshed = result.refreshed_report_records or []
+        self.assertEqual(len(refreshed), 1)
+        self.assertNotEqual(refreshed[0]["sha256"], ingest.record.sha256)
+
+    def test_handoff_repair_cycle_releases_ui_lead_without_second_claude_dispatch(self):
+        dev_path = Path(self.tmp) / "dev.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=self.roots,
+        )
+        missing = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(missing.handoff_repair)
+        self.assertEqual(missing.dispatch_role, "developer")
+        self.assertTrue(missing.handoff_validation_failed)
+        self.assertEqual(missing.intended_next_role, "ui_lead")
+
+        dev_path.write_text(_developer_report_body(), encoding="utf-8")
+        repaired = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path), status="PASS_WITH_NOTES"),
+            allowed_roots=self.roots,
+        )
+        self.assertTrue(repaired.ok)
+        records = upsert_report_record([ingest.record.to_dict()], repaired.record)
+
+        release = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=records,
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(release.ok, release.blocker)
+        self.assertFalse(release.handoff_repair)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR AGY:", release.prompt)
+        self.assertIn("Questions for AGY", release.prompt)
+
+    def test_handoff_validation_diagnostics_include_marker_lists(self):
+        dev_path = Path(self.tmp) / "dev.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.handoff_repair)
+        self.assertIn(
+            f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}",
+            result.handoff_repair_missing_blocks,
+        )
+        self.assertIn(HANDOFF_FOR_AGY_BEGIN, result.parser_expected_marker_names)
+
+    def test_unchanged_repair_report_keeps_prior_hash(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        dev_path = Path(self.tmp) / "dev.md"
+        dev_path.write_text("# Developer\nNo handoff blocks.", encoding="utf-8")
+        ctx = {"allowed_report_roots": self.roots, "report_paths_by_role": {"developer": str(dev_path)}}
+        state, _ = on_session_start("goal", session_meta={"report_orchestrated": True})
+        state.handoff_repair_rounds = {"developer": 1}
+        on_worker_output(state, "developer", _report_ready(str(dev_path)), worker_context=ctx)
+        self.assertEqual(state.handoff_repair_rounds.get("developer"), 1)
 
 
 if __name__ == "__main__":

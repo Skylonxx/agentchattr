@@ -138,6 +138,34 @@ class ReportPromptResult:
     handoff_repair_report_context_injected: bool = False
     handoff_repair_report_hash: str = ""
     handoff_repair_report_chars: int = 0
+    handoff_validation_failed: bool = False
+    intended_next_role: str = ""
+    owner_role: str = ""
+    owner_agent: str = ""
+    report_path: str = ""
+    report_hash_before: str = ""
+    report_hash_after: str = ""
+    report_chars: int = 0
+    found_marker_names: list[str] = field(default_factory=list)
+    parser_expected_marker_names: list[str] = field(default_factory=list)
+    repair_round: int = 0
+    max_repair_rounds: int = DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE
+    using_cached_report: bool = False
+    report_reread_after_repair: bool = False
+    handoff_validation_reason: str = ""
+    refreshed_report_records: list[dict[str, Any]] | None = None
+
+
+PARSER_EXPECTED_HANDOFF_MARKER_NAMES: tuple[str, ...] = (
+    HANDOFF_FOR_AGY_BEGIN,
+    HANDOFF_FOR_AGY_END,
+    HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+    HANDOFF_FOR_CODEX_REVIEWER_END,
+    HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
+    HANDOFF_FOR_DEVELOPER_CORRECTION_END,
+    HANDOFF_FOR_FINAL_BEGIN,
+    HANDOFF_FOR_FINAL_END,
+)
 
 
 def resolve_external_report_write_roots(policy: dict | None) -> list[str]:
@@ -631,6 +659,45 @@ def build_handoff_repair_prompt(
     )
 
 
+def _annotate_handoff_repair_result(
+    result: ReportPromptResult,
+    *,
+    intended_next_role: str,
+    owner_role: str,
+    report_path: str,
+    report_hash_before: str,
+    report_hash_after: str,
+    report_chars: int,
+    missing_blocks: list[str],
+    invalid_blocks: list[str],
+    found_marker_names: list[str],
+    using_cached_report: bool = False,
+    report_reread_after_repair: bool = False,
+    reason: str = "",
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE,
+) -> ReportPromptResult:
+    result.handoff_validation_failed = True
+    result.intended_next_role = intended_next_role
+    result.owner_role = owner_role
+    result.report_path = report_path
+    result.report_hash_before = report_hash_before
+    result.report_hash_after = report_hash_after
+    result.report_chars = report_chars
+    result.found_marker_names = list(found_marker_names)
+    result.parser_expected_marker_names = list(PARSER_EXPECTED_HANDOFF_MARKER_NAMES)
+    result.repair_round = repair_round
+    result.max_repair_rounds = max_repair_rounds
+    result.using_cached_report = using_cached_report
+    result.report_reread_after_repair = report_reread_after_repair
+    result.handoff_validation_reason = reason.strip()
+    if missing_blocks:
+        result.handoff_repair_missing_blocks = list(missing_blocks)
+    if invalid_blocks:
+        result.handoff_repair_invalid_blocks = list(invalid_blocks)
+    return result
+
+
 def build_handoff_repair_result(
     *,
     owner_role: str,
@@ -647,6 +714,13 @@ def build_handoff_repair_result(
     report_content: str | None = None,
     max_report_context_chars: int = DEFAULT_MAX_HANDOFF_REPAIR_REPORT_CONTEXT_CHARS,
     max_prompt_chars: int = DEFAULT_MAX_HANDOFF_REPAIR_PROMPT_CHARS,
+    intended_next_role: str = "",
+    report_hash_before: str = "",
+    using_cached_report: bool = False,
+    report_reread_after_repair: bool = False,
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE,
+    found_marker_names: list[str] | None = None,
 ) -> ReportPromptResult:
     """Route back to report owner to repair missing/insufficient handoff blocks."""
     path = expected_output_path or report_path
@@ -731,18 +805,34 @@ def build_handoff_repair_result(
             invalid_blocks=invalid,
         )
         return ReportPromptResult(ok=False, blocker=blocker, dispatch_role=owner_role)
-    return ReportPromptResult(
-        ok=True,
-        prompt=prompt,
-        dispatch_role=owner_role,
-        handoff_repair=True,
-        handoff_repair_owner_role=owner_role,
-        handoff_repair_missing_blocks=missing,
-        handoff_repair_invalid_blocks=invalid,
-        handoff_repair_report_context_chars=len(report_context),
-        handoff_repair_report_context_injected=bool(report_context.strip()),
-        handoff_repair_report_hash=digest,
-        handoff_repair_report_chars=len(content),
+    return _annotate_handoff_repair_result(
+        ReportPromptResult(
+            ok=True,
+            prompt=prompt,
+            dispatch_role=owner_role,
+            handoff_repair=True,
+            handoff_repair_owner_role=owner_role,
+            handoff_repair_missing_blocks=missing,
+            handoff_repair_invalid_blocks=invalid,
+            handoff_repair_report_context_chars=len(report_context),
+            handoff_repair_report_context_injected=bool(report_context.strip()),
+            handoff_repair_report_hash=digest,
+            handoff_repair_report_chars=len(content),
+        ),
+        intended_next_role=intended_next_role,
+        owner_role=owner_role,
+        report_path=str(resolved),
+        report_hash_before=report_hash_before or digest,
+        report_hash_after=digest,
+        report_chars=len(content),
+        missing_blocks=missing,
+        invalid_blocks=invalid,
+        found_marker_names=found_marker_names or scan_found_handoff_marker_names(content),
+        using_cached_report=using_cached_report,
+        report_reread_after_repair=report_reread_after_repair,
+        reason=reason,
+        repair_round=repair_round,
+        max_repair_rounds=max_repair_rounds,
     )
 
 
@@ -859,13 +949,160 @@ def get_report_for_role(records: list[dict[str, Any]], role: str) -> ReportRecor
     return None
 
 
-def load_report_content(record: ReportRecord) -> tuple[bool, str, str]:
-    ok, content, sha256, _size = read_report_file(record.path)
+def upsert_report_record(
+    records: list[dict[str, Any]],
+    record: ReportRecord,
+) -> list[dict[str, Any]]:
+    """Replace the latest same role+path record, or append when new."""
+    out = list(records or [])
+    for idx in range(len(out) - 1, -1, -1):
+        entry = out[idx]
+        if (
+            str(entry.get("role") or "") == record.role
+            and str(entry.get("path") or "") == record.path
+        ):
+            out[idx] = record.to_dict()
+            return out
+    out.append(record.to_dict())
+    return out
+
+
+def refresh_report_record_from_disk(record: ReportRecord) -> tuple[ReportRecord, bool]:
+    """Re-read report file; refresh sha256/size when disk content changed."""
+    ok, _content, sha256, size_bytes = read_report_file(record.path)
+    if not ok or sha256 == record.sha256:
+        return record, False
+    return (
+        ReportRecord(
+            role=record.role,
+            path=record.path,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            status=record.status,
+            summary=record.summary,
+            created_at=record.created_at,
+        ),
+        True,
+    )
+
+
+def refresh_report_records_from_disk(
+    records: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], bool]:
+    """Re-read every stored report path; update metadata when file content changed."""
+    out: list[dict[str, Any]] = []
+    any_refreshed = False
+    for entry in records or []:
+        record, refreshed = refresh_report_record_from_disk(ReportRecord.from_dict(entry))
+        out.append(record.to_dict())
+        any_refreshed = any_refreshed or refreshed
+    return out, any_refreshed
+
+
+def scan_found_handoff_marker_names(content: str) -> list[str]:
+    """Return begin/end marker names present in report content."""
+    found: list[str] = []
+    for begin, end in _ALL_HANDOFF_MARKER_PAIRS:
+        if begin in (content or "") and end in (content or ""):
+            found.extend([begin, end])
+    return found
+
+
+def collect_owner_handoff_validation(
+    content: str,
+    owner_role: str,
+    *,
+    include_correction_handoff: bool = False,
+) -> tuple[list[str], list[str], list[str]]:
+    """Return missing_blocks, invalid_blocks, found_marker_names for an owner report."""
+    pairs = list(_REQUIRED_HANDOFF_MARKERS_BY_OWNER.get(owner_role, []))
+    if include_correction_handoff:
+        pairs.append(_CORRECTION_HANDOFF_MARKER_PAIR)
+    missing: list[str] = []
+    invalid: list[str] = []
+    for begin, end in pairs:
+        label = f"{begin} / {end}"
+        block = extract_handoff_block(content, begin, end)
+        if block is None:
+            missing.append(label)
+        elif not is_handoff_sufficient(block):
+            invalid.append(label)
+    return missing, invalid, scan_found_handoff_marker_names(content)
+
+
+def format_handoff_validation_diagnostics(
+    *,
+    intended_next_role: str,
+    dispatch_role: str,
+    owner_role: str,
+    owner_agent: str = "",
+    report_path: str = "",
+    report_hash_before: str = "",
+    report_hash_after: str = "",
+    report_chars: int = 0,
+    missing_blocks: list[str] | None = None,
+    invalid_blocks: list[str] | None = None,
+    found_marker_names: list[str] | None = None,
+    parser_expected_marker_names: list[str] | None = None,
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE,
+    using_cached_report: bool = False,
+    report_reread_after_repair: bool = False,
+    reason: str = "",
+) -> str:
+    """Human-readable diagnostics when handoff validation redirects away from intended role."""
+    expected = parser_expected_marker_names or list(PARSER_EXPECTED_HANDOFF_MARKER_NAMES)
+    lines = [
+        "handoff_validation_failed=true",
+        f"intended_next_role={intended_next_role or '(none)'}",
+        f"dispatch_role={dispatch_role or '(none)'}",
+        f"owner_role={owner_role or '(none)'}",
+        f"owner_agent={owner_agent or '(none)'}",
+        f"report_path={report_path or '(none)'}",
+        f"report_hash_before={report_hash_before or '(none)'}",
+        f"report_hash_after={report_hash_after or '(none)'}",
+        f"report_chars={report_chars}",
+        f"missing_blocks={', '.join(missing_blocks or []) or '(none)'}",
+        f"invalid_blocks={', '.join(invalid_blocks or []) or '(none)'}",
+        f"found_marker_names={', '.join(found_marker_names or []) or '(none)'}",
+        f"parser_expected_marker_names={', '.join(expected)}",
+        f"repair_round={repair_round}",
+        f"max_repair_rounds={max_repair_rounds}",
+        f"using_cached_report={'true' if using_cached_report else 'false'}",
+        f"report_reread_after_repair={'true' if report_reread_after_repair else 'false'}",
+    ]
+    if reason.strip():
+        lines.append(f"reason={reason.strip()}")
+    return "\n".join(lines)
+
+
+def load_report_content(
+    record: ReportRecord,
+) -> tuple[bool, str, str, ReportRecord | None, bool]:
+    """Load report body from disk; refresh record metadata when file hash changed."""
+    ok, content, sha256, size_bytes = read_report_file(record.path)
     if not ok:
-        return False, content, ""
+        return False, content, "", None, False
     if sha256 != record.sha256:
-        return False, f"BLOCKER: report hash mismatch for {record.path}", ""
-    return True, content, sha256
+        refreshed = ReportRecord(
+            role=record.role,
+            path=record.path,
+            sha256=sha256,
+            size_bytes=size_bytes,
+            status=record.status,
+            summary=record.summary,
+            created_at=record.created_at,
+        )
+        return True, content, sha256, refreshed, True
+    return True, content, sha256, None, False
+
+
+def apply_refreshed_report_record(
+    records: list[dict[str, Any]],
+    refreshed: ReportRecord,
+) -> list[dict[str, Any]]:
+    """Update stored report metadata after a disk refresh."""
+    return upsert_report_record(records, refreshed)
 
 
 _REPORT_OWNER_ROLE_LABELS = {
@@ -960,7 +1197,7 @@ def build_report_orchestrated_final_attachment(
         else:
             lines.append(f"  {label}: NONE")
     if reviewer:
-        ok, rev_content, _ = load_report_content(reviewer)
+        ok, rev_content, _, _, _ = load_report_content(reviewer)
         if ok:
             final_handoff = extract_handoff_block(
                 rev_content, HANDOFF_FOR_FINAL_BEGIN, HANDOFF_FOR_FINAL_END,
@@ -1422,8 +1659,24 @@ def _validate_handoff_for_dispatch(
     include_correction_handoff: bool = False,
     allowed_roots: list[str] | None = None,
     report_content: str | None = None,
+    intended_next_role: str = "",
+    report_hash_before: str = "",
+    using_cached_report: bool = False,
+    report_reread_after_repair: bool = False,
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE,
 ) -> ReportPromptResult | str:
     """Return repair/rewrite result, or handoff text when valid."""
+    found_marker_names = scan_found_handoff_marker_names(report_content or "")
+    repair_kwargs = {
+        "intended_next_role": intended_next_role,
+        "report_hash_before": report_hash_before or report_sha256,
+        "using_cached_report": using_cached_report,
+        "report_reread_after_repair": report_reread_after_repair,
+        "repair_round": repair_round,
+        "max_repair_rounds": max_repair_rounds,
+        "found_marker_names": found_marker_names,
+    }
     if handoff is None:
         return build_handoff_repair_result(
             owner_role=owner_role,
@@ -1437,6 +1690,7 @@ def _validate_handoff_for_dispatch(
             include_correction_handoff=include_correction_handoff,
             allowed_roots=allowed_roots,
             report_content=report_content,
+            **repair_kwargs,
         )
     if not is_handoff_sufficient(handoff):
         return build_handoff_repair_result(
@@ -1451,6 +1705,7 @@ def _validate_handoff_for_dispatch(
             include_correction_handoff=include_correction_handoff,
             allowed_roots=allowed_roots,
             report_content=report_content,
+            **repair_kwargs,
         )
     assert handoff is not None
     limit = _handoff_max_chars(max_chars)
@@ -1490,10 +1745,29 @@ def build_report_orchestrated_dispatch_prompt(
     policy: dict[str, Any] | None = None,
 ) -> ReportPromptResult:
     """Build next-worker prompt from stored report records (not channel history)."""
-    dev = get_report_for_role(report_records, "developer")
-    agy = get_report_for_role(report_records, "ui_lead")
-    reviewer = get_report_for_role(report_records, "reviewer")
+    records_in = list(report_records or [])
+    records_in, reread = refresh_report_records_from_disk(records_in)
+    dev = get_report_for_role(records_in, "developer")
+    agy = get_report_for_role(records_in, "ui_lead")
+    reviewer = get_report_for_role(records_in, "reviewer")
     roots = list(external_report_write_roots or resolve_external_report_write_roots(policy))
+
+    def _with_refreshed_records(result: ReportPromptResult) -> ReportPromptResult:
+        result.refreshed_report_records = records_in
+        if reread:
+            result.report_reread_after_repair = True
+        return result
+
+    def _load_record_content(record: ReportRecord) -> tuple[bool, str, ReportRecord]:
+        nonlocal records_in, reread
+        ok, content, _sha, refreshed, did_reread = load_report_content(record)
+        if not ok:
+            return False, content, record
+        if refreshed is not None:
+            records_in = apply_refreshed_report_record(records_in, refreshed)
+            reread = reread or did_reread
+            record = refreshed
+        return True, content, record
 
     if role == "developer" and not awaiting_developer_correction:
         ok, blocker = validate_initial_developer_preflight(
@@ -1523,13 +1797,14 @@ def build_report_orchestrated_dispatch_prompt(
 
     if role == "ui_lead":
         if not dev:
-            return ReportPromptResult(
+            return _with_refreshed_records(ReportPromptResult(
                 ok=False,
                 blocker="BLOCKER: ui_lead context missing developer report",
-            )
-        ok, dev_content, _ = load_report_content(dev)
+            ))
+        hash_before = dev.sha256
+        ok, dev_content, dev = _load_record_content(dev)
         if not ok:
-            return ReportPromptResult(ok=False, blocker=dev_content)
+            return _with_refreshed_records(ReportPromptResult(ok=False, blocker=dev_content))
         agy_handoff = extract_handoff_block(
             dev_content, HANDOFF_FOR_AGY_BEGIN, HANDOFF_FOR_AGY_END,
         )
@@ -1545,10 +1820,13 @@ def build_report_orchestrated_dispatch_prompt(
             last_report_status=dev.status,
             allowed_roots=roots,
             report_content=dev_content,
+            intended_next_role="ui_lead",
+            report_hash_before=hash_before,
+            report_reread_after_repair=reread,
         )
         if isinstance(validated, ReportPromptResult):
-            return validated
-        return build_ui_lead_report_prompt(
+            return _with_refreshed_records(validated)
+        return _with_refreshed_records(build_ui_lead_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
@@ -1557,17 +1835,18 @@ def build_report_orchestrated_dispatch_prompt(
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
-        )
+        ))
 
     if role == "reviewer":
         if not dev:
-            return ReportPromptResult(
+            return _with_refreshed_records(ReportPromptResult(
                 ok=False,
                 blocker="BLOCKER: reviewer context missing developer analysis",
-            )
-        ok, dev_content, _ = load_report_content(dev)
+            ))
+        dev_hash_before = dev.sha256
+        ok, dev_content, dev = _load_record_content(dev)
         if not ok:
-            return ReportPromptResult(ok=False, blocker=dev_content)
+            return _with_refreshed_records(ReportPromptResult(ok=False, blocker=dev_content))
         dev_handoff = extract_handoff_block(
             dev_content, HANDOFF_FOR_CODEX_REVIEWER_BEGIN, HANDOFF_FOR_CODEX_REVIEWER_END,
         )
@@ -1583,14 +1862,18 @@ def build_report_orchestrated_dispatch_prompt(
             last_report_status=dev.status,
             allowed_roots=roots,
             report_content=dev_content,
+            intended_next_role="reviewer",
+            report_hash_before=dev_hash_before,
+            report_reread_after_repair=reread,
         )
         if isinstance(validated_dev, ReportPromptResult):
-            return validated_dev
+            return _with_refreshed_records(validated_dev)
         agy_handoff = ""
         if agy:
-            agy_ok, agy_content, _ = load_report_content(agy)
+            agy_hash_before = agy.sha256
+            agy_ok, agy_content, agy = _load_record_content(agy)
             if not agy_ok:
-                return ReportPromptResult(ok=False, blocker=agy_content)
+                return _with_refreshed_records(ReportPromptResult(ok=False, blocker=agy_content))
             agy_handoff = extract_handoff_block(
                 agy_content,
                 HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
@@ -1609,11 +1892,14 @@ def build_report_orchestrated_dispatch_prompt(
                 include_correction_handoff=agy.status in ("REQUEST_CHANGES", "FAIL"),
                 allowed_roots=roots,
                 report_content=agy_content,
+                intended_next_role="reviewer",
+                report_hash_before=agy_hash_before,
+                report_reread_after_repair=reread,
             )
             if isinstance(validated_agy, ReportPromptResult):
-                return validated_agy
+                return _with_refreshed_records(validated_agy)
             agy_handoff = validated_agy
-        return build_reviewer_report_prompt(
+        return _with_refreshed_records(build_reviewer_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
@@ -1624,14 +1910,14 @@ def build_report_orchestrated_dispatch_prompt(
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
-        )
+        ))
 
     if role == "developer" and awaiting_developer_correction:
         correction_source = (developer_correction_source or "").strip().lower()
         if correction_source == "ui_lead" and agy:
-            agy_ok, agy_content, _ = load_report_content(agy)
+            agy_ok, agy_content, agy = _load_record_content(agy)
             if not agy_ok:
-                return ReportPromptResult(ok=False, blocker=agy_content)
+                return _with_refreshed_records(ReportPromptResult(ok=False, blocker=agy_content))
             correction_handoff = extract_handoff_block(
                 agy_content,
                 HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
@@ -1653,9 +1939,9 @@ def build_report_orchestrated_dispatch_prompt(
                     report_content=agy_content,
                 )
                 if isinstance(validated, ReportPromptResult):
-                    return validated
+                    return _with_refreshed_records(validated)
                 correction_handoff = validated
-            return build_developer_ui_lead_correction_report_prompt(
+            return _with_refreshed_records(build_developer_ui_lead_correction_report_prompt(
                 project=project,
                 phase=phase,
                 subject=subject,
@@ -1666,11 +1952,11 @@ def build_report_orchestrated_dispatch_prompt(
                 instruction=instruction,
                 expected_output_path=expected_output_path,
                 external_report_write_roots=external_report_write_roots,
-            )
+            ))
         if reviewer:
-            rev_ok, rev_content, _ = load_report_content(reviewer)
+            rev_ok, rev_content, reviewer = _load_record_content(reviewer)
             if not rev_ok:
-                return ReportPromptResult(ok=False, blocker=rev_content)
+                return _with_refreshed_records(ReportPromptResult(ok=False, blocker=rev_content))
             correction_handoff = extract_handoff_block(
                 rev_content,
                 HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
@@ -1692,9 +1978,9 @@ def build_report_orchestrated_dispatch_prompt(
                     report_content=rev_content,
                 )
                 if isinstance(validated, ReportPromptResult):
-                    return validated
+                    return _with_refreshed_records(validated)
                 correction_handoff = validated
-            return build_developer_correction_report_prompt(
+            return _with_refreshed_records(build_developer_correction_report_prompt(
                 project=project,
                 phase=phase,
                 subject=subject,
@@ -1704,12 +1990,12 @@ def build_report_orchestrated_dispatch_prompt(
                 instruction=instruction,
                 expected_output_path=expected_output_path,
                 external_report_write_roots=external_report_write_roots,
-            )
+            ))
 
-    return ReportPromptResult(
+    return _with_refreshed_records(ReportPromptResult(
         ok=False,
         blocker=f"BLOCKER: no report-orchestrated prompt available for role={role}",
-    )
+    ))
 
 
 def build_developer_ui_lead_correction_report_prompt(

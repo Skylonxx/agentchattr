@@ -29,6 +29,7 @@ from report_orchestration import (
     DEFAULT_MAX_REPORT_PROMPT_CHARS,
     build_report_orchestrated_dispatch_prompt,
     format_handoff_repair_limit_blocker,
+    format_handoff_validation_diagnostics,
     is_report_orchestrated_policy,
     verify_report_write_permission,
 )
@@ -1748,6 +1749,10 @@ class SessionEngine:
             )
             return False
 
+        if result.refreshed_report_records is not None:
+            cls.report_records = list(result.refreshed_report_records)
+            self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+
         prompt = result.prompt
         dispatch_role = result.dispatch_role or role
         effective_role = dispatch_role
@@ -1819,6 +1824,46 @@ class SessionEngine:
                 return False
             rounds[repair_owner] = current_rounds + 1
             cls.handoff_repair_rounds = rounds
+            diag = format_handoff_validation_diagnostics(
+                intended_next_role=getattr(result, "intended_next_role", "") or role,
+                dispatch_role=repair_owner,
+                owner_role=getattr(result, "owner_role", "") or repair_owner,
+                owner_agent=cast.get(repair_owner) or agent,
+                report_path=str(
+                    getattr(result, "report_path", "")
+                    or (worker_ctx.get("report_paths_by_role") or {}).get(repair_owner)
+                    or "",
+                ),
+                report_hash_before=getattr(result, "report_hash_before", ""),
+                report_hash_after=getattr(result, "handoff_repair_report_hash", ""),
+                report_chars=int(getattr(result, "handoff_repair_report_chars", 0) or 0),
+                missing_blocks=list(
+                    getattr(result, "handoff_repair_missing_blocks", []) or [],
+                ),
+                invalid_blocks=list(
+                    getattr(result, "handoff_repair_invalid_blocks", []) or [],
+                ),
+                found_marker_names=list(
+                    getattr(result, "found_marker_names", []) or [],
+                ),
+                parser_expected_marker_names=list(
+                    getattr(result, "parser_expected_marker_names", []) or [],
+                ),
+                repair_round=rounds[repair_owner],
+                max_repair_rounds=max_repairs,
+                using_cached_report=bool(getattr(result, "using_cached_report", False)),
+                report_reread_after_repair=bool(
+                    getattr(result, "report_reread_after_repair", False),
+                ),
+                reason=getattr(result, "handoff_validation_reason", ""),
+            )
+            log.info(
+                "Session %d: handoff repair dispatch role=%s round=%d\n%s",
+                session["id"],
+                repair_owner,
+                rounds[repair_owner],
+                diag,
+            )
             log.info(
                 "Session %d: handoff repair dispatch role=%s round=%d "
                 "handoff_repair_prompt_chars=%d report_context_chars=%d "
