@@ -165,6 +165,7 @@ class CoordinatorLoopState:
     max_safety_rounds: int = DEFAULT_MAX_ROUNDS
     max_total_transitions: int = DEFAULT_MAX_TOTAL_TRANSITIONS
     awaiting_developer_correction: bool = False
+    developer_correction_source: str = ""
     developer_correction_complete: bool = False
     developer_has_substantial_output: bool = False
     last_developer_token: str = ""
@@ -216,6 +217,7 @@ class CoordinatorLoopState:
             max_total_transitions=int(
                 data.get("max_total_transitions", DEFAULT_MAX_TOTAL_TRANSITIONS)),
             awaiting_developer_correction=bool(data.get("awaiting_developer_correction", False)),
+            developer_correction_source=str(data.get("developer_correction_source", "")),
             developer_correction_complete=bool(data.get("developer_correction_complete", False)),
             developer_has_substantial_output=bool(data.get("developer_has_substantial_output", False)),
             last_developer_token=str(data.get("last_developer_token", "")),
@@ -258,6 +260,7 @@ class CoordinatorLoopState:
             "max_safety_rounds": self.max_safety_rounds,
             "max_total_transitions": self.max_total_transitions,
             "awaiting_developer_correction": self.awaiting_developer_correction,
+            "developer_correction_source": self.developer_correction_source,
             "developer_correction_complete": self.developer_correction_complete,
             "developer_has_substantial_output": self.developer_has_substantial_output,
             "last_developer_token": self.last_developer_token,
@@ -600,7 +603,11 @@ def on_coordinator_output(state: CoordinatorLoopState, text: str) -> Coordinator
     if parsed.kind == "final":
         if not state.safety_passed:
             return _malformed_coordinator(state, "FINAL rejected before safety pass")
-        return _terminal_final(state, parsed.body)
+        final_body = parsed.body or ""
+        if state.report_orchestrated:
+            from report_orchestration import build_report_orchestrated_final_attachment
+            final_body = f"{final_body.rstrip()}\n{build_report_orchestrated_final_attachment(state.report_records)}"
+        return _terminal_final(state, final_body)
 
     if parsed.kind == "blocker":
         return _terminal_blocker(state, parsed.reason)
@@ -823,7 +830,15 @@ def _next_role_hint_after_developer_ready(
     state: CoordinatorLoopState,
     *,
     budget_exceeded: bool = False,
+    correction_source: str = "",
 ) -> str:
+    if correction_source == "ui_lead" or (
+        state.developer_correction_complete and not state.agy_approved
+    ):
+        return (
+            "Developer correction after AGY REQUEST_CHANGES is complete. "
+            "Route ui_lead for UX re-check with explicit TO: header."
+        )
     if state.requires_agy and not state.agy_approved:
         return (
             "Developer analysis/correction is READY_FOR_COORDINATOR with substantial content. "
@@ -852,12 +867,18 @@ def _coordinator_action_after_developer_ready(
     *,
     budget_exceeded: bool = False,
 ) -> CoordinatorAction:
+    correction_source = state.developer_correction_source
     if state.awaiting_developer_correction:
         state.awaiting_developer_correction = False
         state.developer_correction_complete = True
+        state.developer_correction_source = ""
     return _coordinator_action(
         state,
-        _next_role_hint_after_developer_ready(state, budget_exceeded=budget_exceeded),
+        _next_role_hint_after_developer_ready(
+            state,
+            budget_exceeded=budget_exceeded,
+            correction_source=correction_source,
+        ),
     )
 
 
@@ -969,6 +990,7 @@ def _try_report_orchestrated_worker(
             return _coordinator_action(state, "AGY report approved. Route to reviewer.")
         state.agy_approved = False
         state.awaiting_developer_correction = True
+        state.developer_correction_source = "ui_lead"
         state.developer_correction_complete = False
         if state.ui_round > state.max_ui_rounds:
             return _terminal_blocker(state, "max ui_round exceeded")
@@ -985,6 +1007,7 @@ def _try_report_orchestrated_worker(
             return _coordinator_action(state, "Reviewer report passed. Route to safety_gate.")
         state.reviewer_passed = False
         state.awaiting_developer_correction = True
+        state.developer_correction_source = "reviewer"
         state.developer_correction_complete = False
         if state.review_round > state.max_review_rounds:
             return _terminal_blocker(state, "max review_round exceeded")
@@ -1114,6 +1137,7 @@ def _on_ui_lead_output(
     state.ui_round += 1
     state.agy_approved = False
     state.awaiting_developer_correction = True
+    state.developer_correction_source = "ui_lead"
     state.developer_correction_complete = False
     if state.ui_round > state.max_ui_rounds:
         return _terminal_blocker(state, "max ui_round exceeded")
@@ -1152,6 +1176,7 @@ def _on_reviewer_output(
     state.reviewer_passed = False
     state.last_reviewer_verdict = token
     state.awaiting_developer_correction = True
+    state.developer_correction_source = "reviewer"
     state.developer_correction_complete = False
     if state.review_round > state.max_review_rounds:
         return _terminal_blocker(state, "max review_round exceeded")

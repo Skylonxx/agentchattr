@@ -1705,7 +1705,7 @@ class SessionEngine:
         instruction = worker_prompt or phase.get("prompt", "")
         policy = session.get("workspace_policy") or {}
 
-        def _dispatch_report_orchestrated_prompt() -> str | None:
+        def _dispatch_report_orchestrated_prompt() -> tuple[str | None, str]:
             worker_ctx = self._worker_context_from_session(session)
             result = build_report_orchestrated_dispatch_prompt(
                 role=role,
@@ -1715,6 +1715,7 @@ class SessionEngine:
                 subject=session.get("goal", "")[:120] or "report-review",
                 instruction=instruction,
                 awaiting_developer_correction=cls.awaiting_developer_correction,
+                developer_correction_source=cls.developer_correction_source,
                 requires_agy=cls.requires_agy,
                 expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
                 external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
@@ -1723,7 +1724,8 @@ class SessionEngine:
                 policy=policy,
             )
             if result.ok:
-                return result.prompt
+                dispatch_role = result.dispatch_role or role
+                return result.prompt, dispatch_role
             log.warning(
                 "Session %d: report-orchestrated dispatch blocked: %s",
                 session["id"],
@@ -1734,56 +1736,70 @@ class SessionEngine:
             cls.awaiting_role = ""
             self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
             self._store.interrupt(session["id"], result.blocker)
-            return None
+            return None, role
 
         workspace_bound = bool((policy.get("workspace") or {}).get("root"))
-        report_contract = coordinator_loop_worker_output_contract(
-            role,
-            workspace_bound=workspace_bound,
-            report_orchestrated=cls.report_orchestrated,
-        )
+        cast = session.get("cast", {})
 
-        if cls.report_orchestrated and role in ("ui_lead", "reviewer"):
-            prompt = _dispatch_report_orchestrated_prompt()
+        def _fire_report_orchestrated_prompt(
+            requested_role: str,
+            requested_agent: str,
+            requested_agent_base: str,
+        ) -> bool:
+            prompt, dispatch_role = _dispatch_report_orchestrated_prompt()
             if prompt is None:
-                return
-            if report_contract:
-                prompt = f"{prompt}\n\n{report_contract}"
-            if is_relay_eligible(agent_base):
+                return False
+            effective_role = dispatch_role or requested_role
+            effective_agent = cast.get(effective_role) or requested_agent
+            effective_agent_base = self._get_agent_base(effective_agent)
+            contract = coordinator_loop_worker_output_contract(
+                effective_role,
+                workspace_bound=workspace_bound,
+                report_orchestrated=cls.report_orchestrated,
+            )
+            if contract:
+                prompt = f"{prompt}\n\n{contract}"
+            if dispatch_role and dispatch_role != requested_role:
+                cls.awaiting_role = effective_role
+                self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+            if is_relay_eligible(effective_agent_base) and effective_role in (
+                "developer", "reviewer", "ui_lead",
+            ):
                 relay_entry = self._make_relay_queue_entry(
                     prompt=prompt,
                     session=session,
                     phase_idx=phase_idx,
                     turn_idx=turn_idx,
-                    role=role,
+                    role=effective_role,
                     channel=channel,
                 )
-                self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+                self._trigger.trigger_sync(
+                    effective_agent, channel=channel, relay_entry=relay_entry,
+                )
             else:
                 self._trigger.trigger_sync(
-                    agent, channel=channel, prompt=prompt,
+                    effective_agent, channel=channel, prompt=prompt,
                     workspace_policy_context=self._session_workspace_policy_context(
-                        session, role, phase_idx, turn_idx,
+                        session, effective_role, phase_idx, turn_idx,
                     ),
                 )
+            return True
+
+        if cls.report_orchestrated and role in ("ui_lead", "reviewer"):
+            if _fire_report_orchestrated_prompt(role, agent, agent_base):
+                return
             return
 
         if cls.report_orchestrated and role == "developer":
-            prompt = _dispatch_report_orchestrated_prompt()
-            if prompt is None:
+            if _fire_report_orchestrated_prompt(role, agent, agent_base):
                 return
-            if report_contract:
-                prompt = f"{prompt}\n\n{report_contract}"
-            relay_entry = self._make_relay_queue_entry(
-                prompt=prompt,
-                session=session,
-                phase_idx=phase_idx,
-                turn_idx=turn_idx,
-                role=role,
-                channel=channel,
-            )
-            self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
             return
+
+        report_contract = coordinator_loop_worker_output_contract(
+            role,
+            workspace_bound=workspace_bound,
+            report_orchestrated=cls.report_orchestrated,
+        )
 
         if role_uses_headless_scoped_workspace(session, role):
             self._trigger_scoped_workspace_worker(
@@ -1794,11 +1810,10 @@ class SessionEngine:
 
         if self._agent_uses_store_exec(agent):
             if cls.report_orchestrated:
-                prompt = _dispatch_report_orchestrated_prompt()
-                if prompt is None:
+                if _fire_report_orchestrated_prompt(role, agent, agent_base):
                     return
-            else:
-                prompt = build_coordinator_loop_ui_lead_prompt(
+                return
+            prompt = build_coordinator_loop_ui_lead_prompt(
                     session_name=tmpl.get("name", "?"),
                     channel=channel,
                     goal=session.get("goal", ""),
@@ -1807,7 +1822,7 @@ class SessionEngine:
                     total_phases=len(phases),
                     instruction=instruction,
                     context_messages=self._get_recent_context(channel),
-                )
+            )
             if report_contract:
                 prompt = f"{prompt}\n\n{report_contract}"
             self._trigger.trigger_sync(

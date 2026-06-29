@@ -112,6 +112,7 @@ class ReportPromptResult:
     ok: bool
     prompt: str = ""
     blocker: str = ""
+    dispatch_role: str = ""
 
 
 def resolve_external_report_write_roots(policy: dict | None) -> list[str]:
@@ -385,19 +386,6 @@ def ingest_worker_report_output(
     if not read_ok:
         return ReportIngestResult(ok=False, blocker=content_or_err)
 
-    fits, total_chars = report_content_fits_prompt(content_or_err, max_prompt_chars)
-    if not fits:
-        return ReportIngestResult(
-            ok=False,
-            blocker=(
-                "BLOCKER: report too large for next prompt\n\n"
-                f"report_chars={total_chars}\n"
-                f"max_chars={max_prompt_chars}\n\n"
-                "Required action:\n"
-                "Ask the report owner to rewrite the report into a review-ready bounded report."
-            ),
-        )
-
     record = ReportRecord(
         role=role,
         path=str(resolved),
@@ -425,19 +413,106 @@ def load_report_content(record: ReportRecord) -> tuple[bool, str, str]:
     return True, content, sha256
 
 
-def build_report_owner_rewrite_prompt(*, role: str, report_path: str, report_chars: int, max_chars: int) -> str:
+_REPORT_OWNER_ROLE_LABELS = {
+    "developer": "Claude Developer",
+    "ui_lead": "AGY UI Lead",
+    "reviewer": "Codex Reviewer",
+}
+
+
+def build_report_owner_rewrite_prompt(
+    *,
+    owner_role: str,
+    report_path: str,
+    report_chars: int,
+    max_chars: int,
+    expected_output_path: str = "",
+) -> str:
+    """Ask the report owner to rewrite an oversized report at the same path."""
+    role_label = _REPORT_OWNER_ROLE_LABELS.get(owner_role, owner_role)
+    target_path = expected_output_path or report_path
     return (
-        f"TO: {role}\n"
+        f"TO: {role_label}\n"
         "FROM: agentchattr Coordinator\n"
-        "ROLE: Report owner\n"
+        f"ROLE: {role_label}\n"
         "MODE: Report rewrite\n\n"
-        f"Your report is too large for reviewer handoff ({report_chars} chars; max {max_chars}).\n"
+        "Your report is too large for next-agent handoff.\n"
+        f"Report size: {report_chars} chars (max {max_chars}).\n"
         f"Path: {report_path}\n\n"
-        "Rewrite it into a review-ready report that preserves all critical findings "
-        "and removes only redundant prose.\n"
-        "Do not omit unknowns, risks, data flow, or approval-required behavior changes.\n"
-        "Return REPORT_READY with the updated .md path when done."
+        "Rewrite the report at the same path into a bounded review-ready report.\n"
+        "Do not omit required findings.\n"
+        "Do not omit UNKNOWN FROM SNAPSHOT items.\n"
+        "Do not omit risks, data flow, approval-required behavior changes, or verdict.\n"
+        "Do not chunk.\n"
+        "Do not rely on prior chat context.\n"
+        "Return REPORT_READY after writing the revised report.\n\n"
+        f"EXPECTED REPORT OUTPUT PATH:\n{target_path}\n"
     )
+
+
+def build_oversized_report_rewrite_result(
+    *,
+    owner_role: str,
+    report_path: str,
+    report_chars: int,
+    max_chars: int,
+    expected_output_path: str = "",
+) -> ReportPromptResult:
+    """Route an oversized report back to its owner for bounded rewrite (no chunking)."""
+    path = expected_output_path or report_path
+    return ReportPromptResult(
+        ok=True,
+        prompt=build_report_owner_rewrite_prompt(
+            owner_role=owner_role,
+            report_path=report_path,
+            report_chars=report_chars,
+            max_chars=max_chars,
+            expected_output_path=path,
+        ),
+        dispatch_role=owner_role,
+    )
+
+
+def build_report_orchestrated_final_attachment(
+    report_records: list[dict[str, Any]],
+) -> str:
+    """Build FINAL footer with report paths and hashes from report_records."""
+    dev = get_report_for_role(report_records, "developer")
+    agy = get_report_for_role(report_records, "ui_lead")
+    reviewer = get_report_for_role(report_records, "reviewer")
+    lines = [
+        "",
+        "REPORT ORCHESTRATION SUMMARY (from registered report files; not channel history):",
+        "",
+        "Claude report:",
+        dev.path if dev else "NONE",
+        "",
+        "AGY report:",
+        agy.path if agy else "NONE",
+        "",
+        "Codex report:",
+        reviewer.path if reviewer else "NONE",
+        "",
+        "Report hashes:",
+    ]
+    for record, label in (
+        (dev, "developer"),
+        (agy, "ui_lead"),
+        (reviewer, "reviewer"),
+    ):
+        if record:
+            lines.append(f"  {label}: {record.sha256}")
+        else:
+            lines.append(f"  {label}: NONE")
+    lines.extend([
+        "",
+        "Files changed inside Twinpet repo:",
+        "NONE",
+        "",
+        "Twinpet source modified:",
+        "NO",
+    ])
+    return "\n".join(lines)
 
 
 def build_report_review_prompt(
@@ -749,6 +824,7 @@ def build_report_orchestrated_dispatch_prompt(
     subject: str,
     instruction: str = "",
     awaiting_developer_correction: bool = False,
+    developer_correction_source: str = "",
     requires_agy: bool = False,
     max_chars: int = DEFAULT_MAX_REPORT_PROMPT_CHARS,
     expected_output_path: str = "",
@@ -798,12 +874,12 @@ def build_report_orchestrated_dispatch_prompt(
             return ReportPromptResult(ok=False, blocker=content)
         fits, total = report_content_fits_prompt(content, max_chars)
         if not fits:
-            return ReportPromptResult(
-                ok=False,
-                blocker=(
-                    "BLOCKER: report too large for next prompt\n\n"
-                    f"report_chars={total}\nmax_chars={max_chars}"
-                ),
+            return build_oversized_report_rewrite_result(
+                owner_role="developer",
+                report_path=dev.path,
+                report_chars=total,
+                max_chars=max_chars,
+                expected_output_path=dev.path,
             )
         return build_ui_lead_report_prompt(
             project=project,
@@ -830,14 +906,33 @@ def build_report_orchestrated_dispatch_prompt(
             agy_ok, agy_content, _ = load_report_content(agy)
             if not agy_ok:
                 return ReportPromptResult(ok=False, blocker=agy_content)
+        dev_fits, dev_total = report_content_fits_prompt(dev_content, max_chars)
+        if not dev_fits:
+            return build_oversized_report_rewrite_result(
+                owner_role="developer",
+                report_path=dev.path,
+                report_chars=dev_total,
+                max_chars=max_chars,
+                expected_output_path=dev.path,
+            )
+        if agy and agy_content:
+            agy_fits, agy_total = report_content_fits_prompt(agy_content, max_chars)
+            if not agy_fits:
+                return build_oversized_report_rewrite_result(
+                    owner_role="ui_lead",
+                    report_path=agy.path,
+                    report_chars=agy_total,
+                    max_chars=max_chars,
+                    expected_output_path=agy.path,
+                )
         combined_len = len(dev_content) + len(agy_content)
         if combined_len > max_chars:
-            return ReportPromptResult(
-                ok=False,
-                blocker=(
-                    "BLOCKER: report too large for next prompt\n\n"
-                    f"report_chars={combined_len}\nmax_chars={max_chars}"
-                ),
+            return build_oversized_report_rewrite_result(
+                owner_role="developer",
+                report_path=dev.path,
+                report_chars=combined_len,
+                max_chars=max_chars,
+                expected_output_path=dev.path,
             )
         return build_reviewer_report_prompt(
             project=project,
@@ -852,44 +947,138 @@ def build_report_orchestrated_dispatch_prompt(
             external_report_write_roots=external_report_write_roots,
         )
 
-    if role == "developer" and awaiting_developer_correction and reviewer:
-        ok, rev_content, _ = load_report_content(reviewer)
-        if not ok:
-            return ReportPromptResult(ok=False, blocker=rev_content)
-        prior_dev_record: ReportRecord | None = None
-        prior_dev_content = ""
-        if dev:
-            dev_ok, prior_dev_content, _ = load_report_content(dev)
-            if not dev_ok:
-                return ReportPromptResult(ok=False, blocker=prior_dev_content)
-            prior_dev_record = dev
-        combined_len = len(rev_content) + len(prior_dev_content)
-        fits, total = report_content_fits_prompt("x" * combined_len, max_chars)
-        if not fits:
-            return ReportPromptResult(
-                ok=False,
-                blocker=(
-                    "BLOCKER: report too large for next prompt\n\n"
-                    f"report_chars={total}\nmax_chars={max_chars}"
-                ),
+    if role == "developer" and awaiting_developer_correction:
+        correction_source = (developer_correction_source or "").strip().lower()
+        if correction_source == "ui_lead" and agy:
+            ok, agy_content, _ = load_report_content(agy)
+            if not ok:
+                return ReportPromptResult(ok=False, blocker=agy_content)
+            prior_dev_record: ReportRecord | None = None
+            prior_dev_content = ""
+            if dev:
+                dev_ok, prior_dev_content, _ = load_report_content(dev)
+                if not dev_ok:
+                    return ReportPromptResult(ok=False, blocker=prior_dev_content)
+                prior_dev_record = dev
+            combined_len = len(agy_content) + len(prior_dev_content)
+            fits, total = report_content_fits_prompt("x" * combined_len, max_chars)
+            if not fits:
+                return build_oversized_report_rewrite_result(
+                    owner_role="developer",
+                    report_path=dev.path if dev else (prior_dev_record.path if prior_dev_record else ""),
+                    report_chars=total,
+                    max_chars=max_chars,
+                    expected_output_path=expected_output_path or (dev.path if dev else ""),
+                )
+            return build_developer_ui_lead_correction_report_prompt(
+                project=project,
+                phase=phase,
+                subject=subject,
+                agy_record=agy,
+                agy_content=agy_content,
+                developer_record=prior_dev_record,
+                developer_content=prior_dev_content,
+                prompt_memo_body=prompt_memo_body,
+                instruction=instruction,
+                expected_output_path=expected_output_path,
+                external_report_write_roots=external_report_write_roots,
             )
-        return build_developer_correction_report_prompt(
-            project=project,
-            phase=phase,
-            subject=subject,
-            reviewer_record=reviewer,
-            reviewer_content=rev_content,
-            developer_record=prior_dev_record,
-            developer_content=prior_dev_content,
-            instruction=instruction,
-            expected_output_path=expected_output_path,
-            external_report_write_roots=external_report_write_roots,
-        )
+        if reviewer:
+            ok, rev_content, _ = load_report_content(reviewer)
+            if not ok:
+                return ReportPromptResult(ok=False, blocker=rev_content)
+            prior_dev_record = None
+            prior_dev_content = ""
+            if dev:
+                dev_ok, prior_dev_content, _ = load_report_content(dev)
+                if not dev_ok:
+                    return ReportPromptResult(ok=False, blocker=prior_dev_content)
+                prior_dev_record = dev
+            rev_fits, rev_total = report_content_fits_prompt(rev_content, max_chars)
+            if not rev_fits:
+                return build_oversized_report_rewrite_result(
+                    owner_role="reviewer",
+                    report_path=reviewer.path,
+                    report_chars=rev_total,
+                    max_chars=max_chars,
+                    expected_output_path=reviewer.path,
+                )
+            combined_len = len(rev_content) + len(prior_dev_content)
+            fits, total = report_content_fits_prompt("x" * combined_len, max_chars)
+            if not fits:
+                return build_oversized_report_rewrite_result(
+                    owner_role="developer",
+                    report_path=dev.path if dev else "",
+                    report_chars=total,
+                    max_chars=max_chars,
+                    expected_output_path=expected_output_path or (dev.path if dev else ""),
+                )
+            return build_developer_correction_report_prompt(
+                project=project,
+                phase=phase,
+                subject=subject,
+                reviewer_record=reviewer,
+                reviewer_content=rev_content,
+                developer_record=prior_dev_record,
+                developer_content=prior_dev_content,
+                instruction=instruction,
+                expected_output_path=expected_output_path,
+                external_report_write_roots=external_report_write_roots,
+            )
 
     return ReportPromptResult(
         ok=False,
         blocker=f"BLOCKER: no report-orchestrated prompt available for role={role}",
     )
+
+
+def build_developer_ui_lead_correction_report_prompt(
+    *,
+    project: str,
+    phase: str,
+    subject: str,
+    agy_record: ReportRecord,
+    agy_content: str,
+    developer_record: ReportRecord | None = None,
+    developer_content: str = "",
+    prompt_memo_body: str = "",
+    instruction: str = "",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
+) -> ReportPromptResult:
+    sources: list[tuple[ReportRecord, str]] = []
+    if developer_record and developer_content:
+        sources.append((developer_record, developer_content))
+    sources.append((agy_record, agy_content))
+    task_lines = [
+        "Address AGY UX findings using the supplied AGY report",
+    ]
+    if developer_record:
+        task_lines.append("and prior developer report")
+    task_lines.append(
+        ".\nUpdate your analysis report; do not modify Twinpet product source files."
+    )
+    result = build_report_review_prompt(
+        target_role="developer",
+        role_label="Claude Developer",
+        mode="Report correction from UI Lead review",
+        project=project,
+        phase=phase,
+        subject=subject,
+        task="".join(task_lines),
+        source_reports=sources,
+        instruction=instruction,
+        expected_output_path=expected_output_path,
+        external_report_write_roots=external_report_write_roots,
+    )
+    if prompt_memo_body.strip():
+        result = ReportPromptResult(
+            ok=result.ok,
+            prompt=f"{result.prompt}\n\nORIGINAL PROMPT MEMO:\n{prompt_memo_body.strip()}",
+            blocker=result.blocker,
+            dispatch_role=result.dispatch_role,
+        )
+    return result
 
 
 def build_developer_correction_report_prompt(

@@ -10,10 +10,16 @@ from pathlib import Path
 import config_loader
 import coordinator_loop as cl
 import workspace_policy as wp
-from coordinator_loop import on_coordinator_output, on_session_start, on_worker_output
+from coordinator_loop import (
+    CoordinatorPhase,
+    on_coordinator_output,
+    on_session_start,
+    on_worker_output,
+)
 from report_orchestration import (
     DEFAULT_MAX_REPORT_PROMPT_CHARS,
     build_report_orchestrated_dispatch_prompt,
+    build_report_orchestrated_final_attachment,
     ingest_worker_report_output,
     is_report_orchestrated_policy,
     is_twinpet_repo_path,
@@ -160,7 +166,7 @@ class ReportReadAndIngestTests(unittest.TestCase):
         self.assertFalse(ingest.ok)
         self.assertIn("external report write failed", ingest.blocker)
 
-    def test_report_too_large_blocks_not_chunks(self):
+    def test_report_too_large_ingests_then_rewrite_at_dispatch(self):
         huge = Path(self.tmp) / "huge.md"
         huge.write_text("x" * 5000, encoding="utf-8")
         ingest = ingest_worker_report_output(
@@ -169,9 +175,20 @@ class ReportReadAndIngestTests(unittest.TestCase):
             allowed_roots=self.roots,
             max_prompt_chars=1000,
         )
-        self.assertFalse(ingest.ok)
-        self.assertIn("too large", ingest.blocker)
-        self.assertNotIn("COMPRESSED", ingest.blocker)
+        self.assertTrue(ingest.ok)
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            max_chars=1000,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "developer")
+        self.assertIn("too large for next-agent handoff", result.prompt)
+        self.assertIn("Do not chunk", result.prompt)
+        self.assertNotIn("COMPRESSED", result.prompt)
 
     def test_inline_report_begin_end_saved(self):
         target = str(Path(self.tmp) / "inline.md")
@@ -268,7 +285,7 @@ class ReportPromptConstructionTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("missing developer analysis", result.blocker)
 
-    def test_oversize_blocks(self):
+    def test_oversize_developer_routes_rewrite_prompt(self):
         big = Path(self.tmp) / "big.md"
         big.write_text("y" * 8000, encoding="utf-8")
         ingest = ingest_worker_report_output(
@@ -284,8 +301,10 @@ class ReportPromptConstructionTests(unittest.TestCase):
             subject="review",
             max_chars=1000,
         )
-        self.assertFalse(result.ok)
-        self.assertIn("too large", result.blocker)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "developer")
+        self.assertIn("Rewrite the report at the same path", result.prompt)
+        self.assertIn("Do not chunk", result.prompt)
 
 
 class InitialDeveloperPromptTests(unittest.TestCase):
@@ -455,6 +474,7 @@ class InitialDeveloperPromptTests(unittest.TestCase):
             phase="correction",
             subject="address reviewer",
             awaiting_developer_correction=True,
+            developer_correction_source="reviewer",
             expected_output_path=str(dev_path),
             external_report_write_roots=correction_roots,
             prompt_memo_body=self.prompt_memo,
@@ -558,6 +578,352 @@ class ReportOrchestrationRoutingTests(unittest.TestCase):
         )
         self.assertTrue(state.awaiting_developer_correction)
         self.assertEqual(state.last_reviewer_verdict, "REQUEST_CHANGES")
+
+
+def _worker_ctx(tmp: str, dev: Path, agy: Path | None = None, rev: Path | None = None) -> dict:
+    by_role = {"developer": str(dev)}
+    if agy:
+        by_role["ui_lead"] = str(agy)
+    if rev:
+        by_role["reviewer"] = str(rev)
+    return {
+        "allowed_report_roots": [tmp],
+        "report_paths": [str(dev)],
+        "report_paths_by_role": by_role,
+        "max_report_prompt_chars": DEFAULT_MAX_REPORT_PROMPT_CHARS,
+    }
+
+
+class AgyOnlyCorrectionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+        self.dev_path = Path(self.tmp) / "dev.md"
+        self.dev_path.write_text("# Dev\nPrior analysis", encoding="utf-8")
+        self.agy_path = Path(self.tmp) / "agy.md"
+        self.agy_path.write_text("# AGY\nREQUEST UX changes", encoding="utf-8")
+        self.policy = _analysis_policy()
+        self.memo = "Prompt memo for AGY correction path."
+
+    def test_agy_request_changes_routes_developer_correction(self):
+        state, _ = on_session_start(
+            "analysis",
+            session_meta={"report_orchestrated": True},
+        )
+        on_coordinator_output(state, "CLASSIFY: UI\nui")
+        ctx = _worker_ctx(self.tmp, self.dev_path, self.agy_path)
+        on_coordinator_output(state, "NEXT: developer\nBegin.")
+        on_worker_output(state, "developer", _report_ready(str(self.dev_path)), worker_context=ctx)
+        on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
+        on_worker_output(
+            state,
+            "ui_lead",
+            _report_ready(str(self.agy_path), status="REQUEST_CHANGES"),
+            worker_context=ctx,
+        )
+        self.assertTrue(state.awaiting_developer_correction)
+        self.assertEqual(state.developer_correction_source, "ui_lead")
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=state.report_records,
+            project="twinpet",
+            phase="correction",
+            subject="agy correction",
+            awaiting_developer_correction=True,
+            developer_correction_source="ui_lead",
+            prompt_memo_body=self.memo,
+            policy=self.policy,
+            expected_output_path=str(self.dev_path),
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertIn("Report correction from UI Lead review", result.prompt)
+        self.assertIn("REQUEST UX changes", result.prompt)
+        self.assertIn("Prior analysis", result.prompt)
+        self.assertNotIn("no report-orchestrated prompt available", result.blocker)
+
+    def test_after_agy_correction_routes_ui_lead_recheck(self):
+        state, _ = on_session_start(
+            "analysis",
+            session_meta={"report_orchestrated": True},
+        )
+        on_coordinator_output(state, "CLASSIFY: UI\nui")
+        ctx = _worker_ctx(self.tmp, self.dev_path, self.agy_path)
+        on_coordinator_output(state, "NEXT: developer\nBegin.")
+        on_worker_output(state, "developer", _report_ready(str(self.dev_path)), worker_context=ctx)
+        on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
+        on_worker_output(
+            state,
+            "ui_lead",
+            _report_ready(str(self.agy_path), status="REQUEST_CHANGES"),
+            worker_context=ctx,
+        )
+        on_coordinator_output(state, "NEXT: developer\nCorrect per AGY.")
+        action = on_worker_output(
+            state,
+            "developer",
+            _report_ready(str(self.dev_path), status="PASS"),
+            worker_context=ctx,
+        )
+        self.assertEqual(action.target_role, "coordinator")
+        self.assertIn("ui_lead", action.prompt_context.lower())
+
+
+class OversizedReportRewriteTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+
+    def test_oversized_agy_routes_ui_lead_rewrite(self):
+        dev = Path(self.tmp) / "dev.md"
+        dev.write_text("d" * 200, encoding="utf-8")
+        agy = Path(self.tmp) / "agy.md"
+        agy.write_text("a" * 5000, encoding="utf-8")
+        dev_ingest = ingest_worker_report_output(
+            "developer", _report_ready(str(dev)), allowed_roots=self.roots,
+        )
+        agy_ingest = ingest_worker_report_output(
+            "ui_lead", _report_ready(str(agy)), allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="reviewer",
+            report_records=[dev_ingest.record.to_dict(), agy_ingest.record.to_dict()],
+            project="twinpet",
+            phase="review",
+            subject="review",
+            max_chars=1000,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "ui_lead")
+        self.assertIn("too large for next-agent handoff", result.prompt)
+
+    def test_oversized_reviewer_routes_reviewer_rewrite_on_correction(self):
+        rev = Path(self.tmp) / "rev.md"
+        rev.write_text("r" * 5000, encoding="utf-8")
+        dev = Path(self.tmp) / "dev.md"
+        dev.write_text("# dev", encoding="utf-8")
+        rev_ingest = ingest_worker_report_output(
+            "reviewer", _report_ready(str(rev)), allowed_roots=self.roots,
+        )
+        dev_ingest = ingest_worker_report_output(
+            "developer", _report_ready(str(dev)), allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[dev_ingest.record.to_dict(), rev_ingest.record.to_dict()],
+            project="twinpet",
+            phase="correction",
+            subject="correction",
+            awaiting_developer_correction=True,
+            developer_correction_source="reviewer",
+            max_chars=1000,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "reviewer")
+        self.assertIn("Rewrite the report at the same path", result.prompt)
+
+
+class FinalReportAttachmentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+        self.dev = Path(self.tmp) / "dev.md"
+        self.dev.write_text("# dev", encoding="utf-8")
+        self.rev = Path(self.tmp) / "rev.md"
+        self.rev.write_text("# rev", encoding="utf-8")
+
+    def test_final_auto_includes_report_paths(self):
+        ctx = _worker_ctx(self.tmp, self.dev, rev=self.rev)
+        state, _ = on_session_start("g", session_meta={"report_orchestrated": True})
+        on_coordinator_output(state, "CLASSIFY: UI\nui")
+        state.agy_approved = True
+        on_coordinator_output(state, "NEXT: developer\nAnalyze.")
+        on_worker_output(state, "developer", _report_ready(str(self.dev)), worker_context=ctx)
+        on_coordinator_output(state, "NEXT: reviewer\nReview.")
+        on_worker_output(state, "reviewer", _report_ready(str(self.rev)), worker_context=ctx)
+        on_coordinator_output(state, "NEXT: safety_gate\nGate.")
+        on_worker_output(state, "safety_gate", "PASS\nok")
+        final = on_coordinator_output(state, "FINAL:\nAll reports filed.")
+        self.assertTrue(final.is_terminal)
+        body = final.routing_body or final.prompt_context
+        self.assertIn("Claude report:", body)
+        self.assertIn(str(self.dev), body)
+        self.assertIn("Codex report:", body)
+        self.assertIn(str(self.rev), body)
+        self.assertIn("AGY report:", body)
+        self.assertIn("NONE", body)
+        self.assertIn("Twinpet source modified:", body)
+        self.assertIn("NO", body)
+
+    def test_final_attachment_without_channel_history(self):
+        records = []
+        for role, path in (("developer", self.dev), ("reviewer", self.rev)):
+            ingest = ingest_worker_report_output(
+                role, _report_ready(str(path)), allowed_roots=self.roots,
+            )
+            records.append(ingest.record.to_dict())
+        attachment = build_report_orchestrated_final_attachment(records)
+        self.assertIn(str(self.dev), attachment)
+        self.assertIn("AGY report:\nNONE", attachment)
+        self.assertIn("from registered report files", attachment)
+
+
+class ReportOrchestrationE2EFlowTests(unittest.TestCase):
+    """End-to-end report-flow: dev → AGY → reviewer → correction → re-check → safety → FINAL."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+        self.policy = _analysis_policy()
+        self.memo = "UI-09-C PaymentModal read-only analysis E2E memo."
+        self.dev = Path(self.tmp) / "dev.md"
+        self.agy = Path(self.tmp) / "agy.md"
+        self.rev = Path(self.tmp) / "rev.md"
+        self.rev2 = Path(self.tmp) / "rev-pass.md"
+
+    def _write_reports(self):
+        self.dev.write_text("# Developer\nPaymentModal analysis", encoding="utf-8")
+        self.agy.write_text("# AGY\nUX review notes", encoding="utf-8")
+        self.rev.write_text("# Reviewer\nREQUEST changes to blueprint", encoding="utf-8")
+        self.rev2.write_text("# Reviewer\nPASS on re-check", encoding="utf-8")
+
+    def test_full_report_flow_role_path(self):
+        self._write_reports()
+        ctx = _worker_ctx(self.tmp, self.dev, self.agy, self.rev)
+        ctx["report_paths_by_role"]["reviewer"] = str(self.rev)
+        policy_path = str((self.policy.get("report_paths") or [""])[0])
+        policy_roots = list(self.policy.get("external_report_write_roots") or [])
+
+        initial = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet-ui-09-c-analysis",
+            phase="Developer",
+            subject="initial",
+            prompt_memo_body=self.memo,
+            policy=self.policy,
+            expected_output_path=policy_path,
+            external_report_write_roots=policy_roots,
+        )
+        self.assertTrue(initial.ok, initial.blocker)
+        self.assertIn("PROMPT MEMO:", initial.prompt)
+
+        state, _ = on_session_start(
+            "UI-09-C analysis",
+            session_meta={"report_orchestrated": True, "workspace_mode": "read-only"},
+        )
+        on_coordinator_output(state, "CLASSIFY: UI\nui")
+
+        on_coordinator_output(state, "NEXT: developer\nBegin analysis.")
+        dev_action = on_worker_output(
+            state, "developer", _report_ready(str(self.dev)), worker_context=ctx,
+        )
+        self.assertEqual(dev_action.target_role, "coordinator")
+        self.assertEqual(len(state.report_records), 1)
+
+        ui_prompt = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=state.report_records,
+            project="twinpet",
+            phase="UI Lead",
+            subject="ux",
+            expected_output_path=str(self.agy),
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(ui_prompt.ok)
+        self.assertIn("PaymentModal analysis", ui_prompt.prompt)
+
+        on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
+        on_worker_output(
+            state, "ui_lead", _report_ready(str(self.agy)), worker_context=ctx,
+        )
+        self.assertEqual(len(state.report_records), 2)
+
+        rev_prompt = build_report_orchestrated_dispatch_prompt(
+            role="reviewer",
+            report_records=state.report_records,
+            project="twinpet",
+            phase="Reviewer",
+            subject="review",
+            expected_output_path=str(self.rev),
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(rev_prompt.ok)
+        self.assertIn("PaymentModal analysis", rev_prompt.prompt)
+        self.assertIn("UX review notes", rev_prompt.prompt)
+        self.assertIn("do not inspect repository files", rev_prompt.prompt.lower())
+
+        on_coordinator_output(state, "NEXT: reviewer\nReview.")
+        on_worker_output(
+            state,
+            "reviewer",
+            _report_ready(str(self.rev), status="REQUEST_CHANGES"),
+            worker_context=ctx,
+        )
+        self.assertTrue(state.awaiting_developer_correction)
+        self.assertEqual(state.developer_correction_source, "reviewer")
+
+        corr_prompt = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=state.report_records,
+            project="twinpet",
+            phase="Correction",
+            subject="fix",
+            awaiting_developer_correction=True,
+            developer_correction_source="reviewer",
+            prompt_memo_body=self.memo,
+            policy=self.policy,
+            expected_output_path=str(self.dev),
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(corr_prompt.ok, corr_prompt.blocker)
+        self.assertIn("Report correction", corr_prompt.prompt)
+        self.assertIn("REQUEST changes", corr_prompt.prompt)
+        self.assertIn("PaymentModal analysis", corr_prompt.prompt)
+
+        on_coordinator_output(state, "NEXT: developer\nCorrect.")
+        on_worker_output(
+            state,
+            "developer",
+            _report_ready(str(self.dev), status="PASS"),
+            worker_context=ctx,
+        )
+        self.assertTrue(state.developer_correction_complete)
+
+        recheck_prompt = build_report_orchestrated_dispatch_prompt(
+            role="reviewer",
+            report_records=state.report_records,
+            project="twinpet",
+            phase="Re-check",
+            subject="re-check",
+            expected_output_path=str(self.rev2),
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(recheck_prompt.ok)
+
+        on_coordinator_output(state, "NEXT: reviewer\nRe-check.")
+        ctx["report_paths_by_role"]["reviewer"] = str(self.rev2)
+        on_worker_output(
+            state,
+            "reviewer",
+            _report_ready(str(self.rev2), status="PASS"),
+            worker_context=ctx,
+        )
+        self.assertTrue(state.reviewer_passed)
+
+        on_coordinator_output(state, "NEXT: safety_gate\nFinal gate.")
+        on_worker_output(state, "safety_gate", "PASS\nboundaries ok")
+
+        final = on_coordinator_output(state, "FINAL:\nUI-09-C analysis complete.")
+        self.assertEqual(state.phase, CoordinatorPhase.FINAL)
+        body = final.routing_body or ""
+        self.assertIn(str(self.dev), body)
+        self.assertIn(str(self.agy), body)
+        roles = {r.get("role") for r in state.report_records}
+        self.assertEqual(roles, {"developer", "ui_lead", "reviewer"})
+        paths = {r.get("path") for r in state.report_records}
+        self.assertIn(str(self.dev), paths)
+        self.assertIn(str(self.agy), paths)
 
 
 if __name__ == "__main__":
