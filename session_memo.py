@@ -330,7 +330,9 @@ def validate_memo_start(
 
         allowed = prof.get("allowed_modes") or []
         if canonical_mode and canonical_mode not in allowed:
-            if ui_mode == "read-only-analysis" and "docs-only" in allowed:
+            if ui_mode == "read-only-analysis" and (
+                "docs-only" in allowed or "read-only" in allowed
+            ):
                 pass
             else:
                 errors.append(

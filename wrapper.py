@@ -1597,6 +1597,13 @@ def _build_claude_print_command(command: str, prompt: str, *, use_stdin: bool = 
     return [command, "--print", "--tools", "", prompt], None
 
 
+def _format_report_save_notes(result) -> list[str]:
+    """Format external report save outcome for chat relay."""
+    if result.saved and result.path:
+        return [f"- saved report to: {result.path}"]
+    return list(result.notes or [])
+
+
 def _run_claude_workspace_print_turn(
     *,
     command,
@@ -1612,12 +1619,13 @@ def _run_claude_workspace_print_turn(
 ):
     """Workspace-bound Claude --print turn with cwd resolution, snapshot injection."""
     from worker_workspace import (
+        ReportSaveResult,
         build_docs_only_worker_augmentation,
         is_docs_only_snapshot_mode,
         is_workspace_bound_queue_item,
         load_canonical_policy_for_item,
         run_workspace_precheck,
-        try_save_docs_only_report,
+        try_save_external_analysis_report,
     )
 
     prompt = str(item.get("prompt") or "")
@@ -1694,10 +1702,10 @@ def _run_claude_workspace_print_turn(
         queue_item=work_item,
         config=config,
         data_dir=data_dir,
-        on_success_save_report=lambda text: (
-            try_save_docs_only_report(text, policy, effective_cwd or default_cwd)
+        on_success_save_report=lambda text: _format_report_save_notes(
+            try_save_external_analysis_report(text, policy, effective_cwd or default_cwd)
             if isinstance(policy, dict) and is_docs_only_snapshot_mode(item, policy)
-            else []
+            else ReportSaveResult(),
         ),
     )
 

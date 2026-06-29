@@ -29,7 +29,7 @@ from worker_workspace import (
     read_allowlisted_file_snapshot,
     resolve_workspace_exec_cwd_or_blocker,
     run_workspace_precheck_structured,
-    try_save_docs_only_report,
+    try_save_external_analysis_report,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,7 +112,7 @@ class WorkspaceTimeoutTests(unittest.TestCase):
         )
         self.assertEqual(diag["role"], "developer")
         self.assertEqual(diag["workspace_profile"], "twinpet-ui-09-c-payment-modal-analysis")
-        self.assertEqual(diag["workspace_mode"], "docs-only")
+        self.assertEqual(diag["workspace_mode"], "read-only")
         self.assertEqual(diag["prompt_id"], "TWINPET-UI-09-C-READONLY-ANALYSIS-BLUEPRINT-001")
         self.assertTrue(diag["prompt_body_mode"])
 
@@ -310,28 +310,101 @@ class ToolCallLeakageTests(unittest.TestCase):
         self.assertTrue(out.startswith("BLOCKER: tool-call markup leaked"))
 
 
-class ReportSaveTests(unittest.TestCase):
+class ReadOnlyAnalysisPolicyTests(unittest.TestCase):
+    def test_porcelain_parser_recovers_trimmed_leading_space(self):
+        entries = wpr.parse_git_porcelain("M Context.md\n M Task.md\n")
+        paths = [e["path"] for e in entries]
+        self.assertIn("Context.md", paths)
+        self.assertNotIn("ontext.md", paths)
+
+    def test_analysis_profile_has_no_repo_write_files(self):
+        session = _analysis_session_record()
+        policy = session["workspace_policy"]
+        self.assertEqual(policy["mode"], "read-only")
+        self.assertEqual(policy.get("write_files") or [], [])
+        self.assertTrue(policy.get("analysis_report_only"))
+
+    def test_read_only_analysis_mode_alias(self):
+        self.assertEqual(wp.normalize_workspace_mode("read-only-analysis"), "read-only")
+
+
+class ReadOnlyDirtyTreeTests(unittest.TestCase):
+    def setUp(self):
+        self.policy = _analysis_session_record()["workspace_policy"]
+
+    def test_docs_dirty_does_not_block(self):
+        porcelain = " M Task.md\n M Context.md\n"
+        docs, blocking = wpr.classify_dirty_entries_report_only_analysis(
+            porcelain, policy=self.policy,
+        )
+        self.assertEqual(len(blocking), 0)
+        self.assertGreaterEqual(len(docs), 1)
+        result = wpr.verify_dirty_set_report_only_analysis(
+            porcelain_output=porcelain, policy=self.policy,
+        )
+        self.assertTrue(result.ok)
+
+    def test_src_dirty_blocks(self):
+        porcelain = " M src/components/PaymentModal.tsx\n"
+        _, blocking = wpr.classify_dirty_entries_report_only_analysis(
+            porcelain, policy=self.policy,
+        )
+        self.assertIn("src/components/PaymentModal.tsx", blocking)
+        result = wpr.verify_dirty_set_report_only_analysis(
+            porcelain_output=porcelain, policy=self.policy,
+        )
+        self.assertFalse(result.ok)
+
+    def test_tests_dirty_blocks(self):
+        porcelain = " M tests/pos-human-checkout.spec.ts\n"
+        result = wpr.verify_dirty_set_report_only_analysis(
+            porcelain_output=porcelain, policy=self.policy,
+        )
+        self.assertFalse(result.ok)
+
+
+class ExternalReportSaveTests(unittest.TestCase):
     def test_extract_report_block(self):
         text = "intro\nREPORT_BEGIN\n# Title\nbody\nREPORT_END\n"
         self.assertEqual(extract_report_block(text), "# Title\nbody")
 
-    def test_save_to_allowed_workspace_path(self):
+    def test_saves_outside_repo_only(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
+        root = Path(tmp.name) / "twinpet"
+        root.mkdir()
+        ext = Path(tmp.name) / "report-out.md"
         policy = {
-            "mode": "docs-only",
-            "write_files": ["docs/reports/latest-report.md"],
-            "report_paths": [],
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "write_files": [],
+            "report_paths": [str(ext)],
         }
         body = "REPORT_BEGIN\n# Analysis\nDone.\nREPORT_END"
-        saved = try_save_docs_only_report(body, policy, root)
-        self.assertTrue(any("saved report" in s for s in saved))
-        self.assertTrue((root / "docs/reports/latest-report.md").exists())
+        result = try_save_external_analysis_report(body, policy, root)
+        self.assertTrue(result.saved)
+        self.assertTrue(ext.exists())
+        self.assertFalse((root / "docs").exists())
+
+    def test_external_save_failure_falls_back_with_notes(self):
+        policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "write_files": [],
+            "report_paths": ["Z:/nonexistent_drive/report.md"],
+        }
+        body = "REPORT_BEGIN\n# Analysis\nDone.\nREPORT_END"
+        with mock.patch("worker_workspace.Path.write_text", side_effect=OSError("denied")):
+            with mock.patch("worker_workspace.Path.mkdir"):
+                result = try_save_external_analysis_report(
+                    body, policy, "C:/Users/Narachat/twinpet-pos",
+                )
+        self.assertFalse(result.saved)
+        self.assertTrue(any("PASS WITH NOTES" in n for n in result.notes))
 
 
 class PromptContractTests(unittest.TestCase):
-    def test_scoped_prompt_mentions_no_tools_for_docs_only(self):
+    def test_scoped_prompt_mentions_no_tools_for_read_only(self):
         from session_relay import build_scoped_write_worker_prompt
 
         session = _analysis_session_record()
@@ -343,9 +416,10 @@ class PromptContractTests(unittest.TestCase):
             prompt_body="PROMPT ID: X\nmemo body",
         )
         self.assertIn("FULL TASK MEMO", prompt)
-        self.assertIn("SNAPSHOT MODE", prompt)
+        self.assertIn("REPORT-ONLY ANALYSIS", prompt)
         self.assertIn("no tools", prompt.lower())
         self.assertIn("tool_call", prompt)
+        self.assertIn("No Twinpet repo writes", prompt)
 
 
 class TwinpetSmokeTests(unittest.TestCase):
@@ -375,9 +449,12 @@ class TwinpetSmokeTests(unittest.TestCase):
         self.assertIn("PaymentModal.tsx", augment)
         self.assertIn("PaymentModal.css", augment)
         self.assertGreater(meta.file_count, 0)
+        self.assertIn("pre-existing docs tracker dirty files", augment)
         st = subprocess.run(["git", "status", "--short"], cwd=TWINPET, capture_output=True, text=True)
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=TWINPET, capture_output=True, text=True)
-        self.assertEqual(st.stdout.strip(), "")
+        porcelain = st.stdout or ""
+        self.assertNotIn("src/", porcelain)
+        self.assertNotIn("tests/", porcelain)
         self.assertEqual(head.stdout.strip(), EXPECTED_HEAD)
 
 

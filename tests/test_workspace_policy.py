@@ -609,6 +609,7 @@ class ScopedWriteModeAliasTests(unittest.TestCase):
     def test_scoped_write_normalizes_to_implementation(self):
         self.assertEqual(wp.normalize_workspace_mode("scoped-write"), "implementation")
         self.assertEqual(wp.normalize_workspace_mode("read-only"), "read-only")
+        self.assertEqual(wp.normalize_workspace_mode("read-only-analysis"), "read-only")
 
     def test_scoped_write_payload_rejected_without_profile_allowlist(self):
         result = wp.resolve_workspace_policy(

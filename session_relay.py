@@ -225,6 +225,15 @@ def build_scoped_write_worker_prompt(
             "ALLOWED READ-ONLY GIT: git status, git diff, git log, git show",
             "Do not use MCP tools. Do not call chat_read or chat_send.",
         ])
+        if mode == "read-only":
+            lines.extend([
+                "",
+                "REPORT-ONLY ANALYSIS: No Twinpet repo writes (no Task.md/Context.md/docs edits).",
+                "SNAPSHOT MODE: agentchattr injects AUTOMATED PRECHECK RESULTS and",
+                "READ-ONLY FILE SNAPSHOT before this turn. You have no tools.",
+                "Analyze from injected snapshots only. Final report via REPORT_BEGIN/REPORT_END.",
+                "External report is saved outside the repo by agentchattr when possible.",
+            ])
     else:
         lines.extend([
             "",

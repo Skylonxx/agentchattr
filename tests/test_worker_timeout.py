@@ -71,7 +71,7 @@ class TimeoutResolutionTests(unittest.TestCase):
                 "workspace_policy_context": {
                     "session_id": 1,
                     "session_role": "developer",
-                    "policy_mode": "docs-only",
+                    "policy_mode": "read-only",
                     "policy_id": "twinpet-ui-09-c-payment-modal-analysis",
                     "workspace_root": "C:/Users/Narachat/twinpet-pos",
                     "has_prompt_body": True,
@@ -110,19 +110,19 @@ class TimeoutDiagnosticsTests(unittest.TestCase):
             item={
                 "workspace_policy_context": {
                     "session_role": "developer",
-                    "policy_mode": "docs-only",
+                    "policy_mode": "read-only",
                 },
             },
             session={
                 "prompt_id": "TEST-001",
                 "prompt_body": "memo",
-                "workspace_policy": {"policy_id": "twinpet-ui-09-c-payment-modal-analysis", "mode": "docs-only"},
+                "workspace_policy": {"policy_id": "twinpet-ui-09-c-payment-modal-analysis", "mode": "read-only"},
             },
         )
         self.assertEqual(diag["status"], "WORKER_TIMEOUT")
         self.assertEqual(diag["role"], "developer")
         self.assertEqual(diag["workspace_profile"], "twinpet-ui-09-c-payment-modal-analysis")
-        self.assertEqual(diag["workspace_mode"], "docs-only")
+        self.assertEqual(diag["workspace_mode"], "read-only")
         self.assertEqual(diag["cwd"], "C:/Users/Narachat/twinpet-pos")
         self.assertTrue(diag["prompt_body_mode"])
 

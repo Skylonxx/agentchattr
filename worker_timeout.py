@@ -74,6 +74,8 @@ def resolve_claude_print_timeout(
         return timeouts["implementation_secs"]
     if mode == "docs-only":
         return timeouts["docs_only_secs"]
+    if mode == "read-only" and (has_prompt_body or long_prompt or wpc.get("workspace_root")):
+        return timeouts["docs_only_secs"]
     if has_prompt_body or long_prompt:
         return timeouts["prompt_memo_secs"]
     if mode == "read-only" and wpc.get("workspace_root"):

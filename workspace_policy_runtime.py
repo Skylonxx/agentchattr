@@ -563,11 +563,18 @@ def parse_git_porcelain(porcelain_output: str) -> list[dict[str, str]]:
     """Parse `git status --porcelain` into normalized entries."""
     entries: list[dict[str, str]] = []
     for raw_line in (porcelain_output or "").splitlines():
-        line = raw_line.rstrip("\n")
+        line = raw_line.rstrip("\r")
         if len(line) < 3 or line.startswith("#"):
             continue
-        xy = line[:2]
-        path_part = line[3:].strip()
+        if len(line) >= 3 and line[2] == " ":
+            xy = line[:2]
+            path_part = line[3:].strip()
+        elif len(line) >= 2 and line[1] == " ":
+            # Recover when leading column space was trimmed (e.g. strip() turned " M Context.md" into "M Context.md").
+            xy = " " + line[0]
+            path_part = line[2:].strip()
+        else:
+            continue
         if " -> " in path_part:
             path = path_part.split(" -> ", 1)[1].strip()
         else:
@@ -593,6 +600,11 @@ def verify_dirty_set(
     policy: dict[str, Any],
 ) -> RuntimeGuardResult:
     """Compare porcelain dirty set against policy write_files allowlist."""
+    if is_report_only_readonly_policy(policy):
+        return verify_dirty_set_report_only_analysis(
+            porcelain_output=porcelain_output,
+            policy=policy,
+        )
     mode = policy.get("mode")
     write_files = policy.get("write_files") or []
     if mode in ("scratch-readonly", "read-only") or not write_files:
@@ -613,6 +625,97 @@ def verify_dirty_set(
                 blocker="BLOCKER:unauthorized_dirty_tree",
                 reason=f"path not in write_files allowlist: {path!r}",
             )
+    return RuntimeGuardResult(True)
+
+
+DOCS_TRACKER_PATHS = frozenset({
+    "task.md",
+    "context.md",
+    "docs/reports/latest-report.md",
+})
+
+PRODUCT_DIR_PREFIXES = (
+    "src/",
+    "tests/",
+    "functions/",
+    "android/",
+    "ios/",
+    ".claude/",
+)
+
+
+def is_report_only_readonly_policy(policy: dict[str, Any] | None) -> bool:
+    """True for strict read-only analysis profiles with no repo writes."""
+    if not isinstance(policy, dict):
+        return False
+    if policy.get("analysis_report_only"):
+        return True
+    if policy.get("policy_id") == "twinpet-ui-09-c-payment-modal-analysis":
+        return policy.get("mode") == "read-only"
+    return False
+
+
+def _normalize_dirty_path(path: str) -> str:
+    return path.replace("\\", "/").strip().lstrip("./")
+
+
+def _is_docs_tracker_dirty_path(path: str) -> bool:
+    norm = _normalize_dirty_path(path).lower()
+    return norm in DOCS_TRACKER_PATHS
+
+
+def _is_product_area_dirty_path(path: str, policy: dict[str, Any]) -> bool:
+    norm = _normalize_dirty_path(path)
+    low = norm.lower()
+    if any(low.startswith(prefix) for prefix in PRODUCT_DIR_PREFIXES):
+        return True
+    forbidden = policy.get("forbidden_paths") or []
+    for pattern in forbidden:
+        if isinstance(pattern, str) and wp.path_matches_forbidden(norm, pattern):
+            if pattern.replace("\\", "/").lower() in (
+                "task.md", "context.md", "docs/reports/latest-report.md",
+            ):
+                continue
+            return True
+    return False
+
+
+def classify_dirty_entries_report_only_analysis(
+    porcelain_output: str,
+    *,
+    policy: dict[str, Any],
+) -> tuple[list[str], list[str]]:
+    """Return (docs_tracker_dirty, blocking_dirty) path lists."""
+    docs_dirty: list[str] = []
+    blocking: list[str] = []
+    for entry in parse_git_porcelain(porcelain_output):
+        path = entry["path"]
+        if _is_docs_tracker_dirty_path(path):
+            docs_dirty.append(_normalize_dirty_path(path))
+        elif _is_product_area_dirty_path(path, policy):
+            blocking.append(_normalize_dirty_path(path))
+        else:
+            blocking.append(_normalize_dirty_path(path))
+    return docs_dirty, blocking
+
+
+def verify_dirty_set_report_only_analysis(
+    *,
+    porcelain_output: str,
+    policy: dict[str, Any],
+) -> RuntimeGuardResult:
+    """Allow pre-existing docs tracker dirt; block product/code/test dirt."""
+    docs_dirty, blocking = classify_dirty_entries_report_only_analysis(
+        porcelain_output, policy=policy,
+    )
+    if blocking:
+        paths = ", ".join(blocking[:5])
+        suffix = f" (+{len(blocking) - 5} more)" if len(blocking) > 5 else ""
+        return RuntimeGuardResult(
+            False,
+            blocker="BLOCKER:unauthorized_dirty_tree",
+            reason=f"dirty product/code paths before analysis: {paths}{suffix}",
+        )
     return RuntimeGuardResult(True)
 
 

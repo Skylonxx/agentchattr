@@ -108,8 +108,8 @@ class MemoSafetyTests(unittest.TestCase):
             },
         )
         self.assertTrue(result.ok, result.errors)
-        self.assertEqual(result.policy["mode"], "docs-only")
-        self.assertNotIn("src/components/PaymentModal.tsx", result.policy["write_files"])
+        self.assertEqual(result.policy["mode"], "read-only")
+        self.assertEqual(result.policy.get("write_files") or [], [])
 
 
 class PromptBodyPersistenceTests(unittest.TestCase):

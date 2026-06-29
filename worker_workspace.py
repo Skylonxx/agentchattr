@@ -11,7 +11,9 @@ from typing import Any
 from workspace_policy_runtime import (
     DEFAULT_SCRATCH_CWD,
     canonical_policy_from_queue_context,
+    classify_dirty_entries_report_only_analysis,
     external_cwd_enabled_for_mode,
+    is_report_only_readonly_policy,
     normalize_workspace_root,
     resolve_exec_cwd_for_item,
     verify_dirty_set,
@@ -38,6 +40,13 @@ class PrecheckResult:
     text: str = ""
     head: str = ""
     porcelain: str = ""
+
+
+@dataclass
+class ReportSaveResult:
+    saved: bool = False
+    path: str = ""
+    notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -324,7 +333,7 @@ def run_workspace_precheck_structured(
             text=True,
             timeout=20,
         )
-        porcelain = (status.stdout or "").strip()
+        porcelain = (status.stdout or "").rstrip("\n\r")
         lines.append(f"- git status --porcelain: {porcelain or '(clean)'}")
     except (OSError, subprocess.TimeoutExpired) as exc:
         blocker = f"BLOCKER: workspace precheck failed\n- git status: {exc}"
@@ -340,6 +349,15 @@ def run_workspace_precheck_structured(
                 ok=False, blocker=blocker, text="\n".join(lines),
                 head=head_val, porcelain=porcelain,
             )
+        if is_report_only_readonly_policy(policy) and porcelain:
+            docs_dirty, _blocking = classify_dirty_entries_report_only_analysis(
+                porcelain, policy=policy,
+            )
+            if docs_dirty:
+                lines.append(
+                    "- pre-existing docs tracker dirty files (non-blocking): "
+                    + ", ".join(docs_dirty)
+                )
 
     lines.extend([
         "",
@@ -349,6 +367,8 @@ def run_workspace_precheck_structured(
         "- Analyze ONLY from AUTOMATED PRECHECK RESULTS and READ-ONLY FILE SNAPSHOT below.",
         "- If the snapshot is insufficient, return: BLOCKER: insufficient snapshot",
         "- For final report markdown, wrap content between REPORT_BEGIN and REPORT_END lines.",
+        "- Do NOT write Task.md, Context.md, or any file inside the Twinpet repo.",
+        "- Report will be saved outside the repo by agentchattr when possible.",
     ])
     return PrecheckResult(
         ok=True, text="\n".join(lines), head=head_val, porcelain=porcelain,
@@ -472,28 +492,82 @@ def extract_report_block(text: str) -> str | None:
     return block or None
 
 
-def try_save_docs_only_report(
+def _path_outside_workspace(path: Path, workspace_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(workspace_root.resolve())
+        return False
+    except ValueError:
+        return True
+
+
+def try_save_external_analysis_report(
     text: str,
     policy: dict[str, Any],
     workspace_root: str | Path,
-) -> list[str]:
-    """Save REPORT_BEGIN/END block to allowed workspace report paths. Returns status lines."""
+) -> ReportSaveResult:
+    """Save REPORT_BEGIN/END block to external report paths only (never Twinpet repo)."""
     block = extract_report_block(text)
     if not block:
-        return []
+        return ReportSaveResult()
+    if not isinstance(policy, dict):
+        return ReportSaveResult(
+            notes=["PASS WITH NOTES: report in REPORT_BEGIN/REPORT_END above (no policy context)."],
+        )
     mode = policy.get("mode")
     if mode not in ("docs-only", "read-only"):
-        return []
-    write_files = list(policy.get("write_files") or [])
-    report_candidates = [
-        p for p in write_files
-        if isinstance(p, str) and p.replace("\\", "/").endswith(".md")
-    ]
-    if not report_candidates:
-        return []
+        return ReportSaveResult()
+    if not is_report_only_readonly_policy(policy) and list(policy.get("write_files") or []):
+        return try_save_legacy_docs_report(text, policy, workspace_root)
+
+    root = Path(workspace_root).resolve()
+    ext_paths = list(policy.get("report_paths") or [])
+    if not ext_paths:
+        return ReportSaveResult(
+            notes=[
+                "PASS WITH NOTES: external report path not configured; "
+                "report available in REPORT_BEGIN/REPORT_END above.",
+            ],
+        )
+    notes: list[str] = []
+    for ext in ext_paths:
+        if not isinstance(ext, str) or not ext.strip():
+            continue
+        try:
+            target = Path(ext).resolve()
+        except (OSError, ValueError):
+            notes.append(f"PASS WITH NOTES: invalid external report path: {ext}")
+            continue
+        if not _path_outside_workspace(target, root):
+            notes.append(f"skipped in-repo report path (read-only analysis): {ext}")
+            continue
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(block, encoding="utf-8")
+            return ReportSaveResult(saved=True, path=str(target), notes=[f"- saved report to: {target}"])
+        except OSError as exc:
+            notes.append(f"PASS WITH NOTES: could not save external report {ext}: {exc}")
+    if not notes:
+        notes.append(
+            "PASS WITH NOTES: external report save unavailable; "
+            "report available in REPORT_BEGIN/REPORT_END above.",
+        )
+    return ReportSaveResult(notes=notes)
+
+
+def try_save_legacy_docs_report(
+    text: str,
+    policy: dict[str, Any],
+    workspace_root: str | Path,
+) -> ReportSaveResult:
+    """Legacy docs-only save (workspace + external paths) for non-report-only profiles."""
+    block = extract_report_block(text)
+    if not block:
+        return ReportSaveResult()
     root = Path(workspace_root)
-    saved: list[str] = []
-    for rel in report_candidates:
+    saved_lines: list[str] = []
+    for rel in list(policy.get("write_files") or []):
+        if not isinstance(rel, str) or not rel.endswith(".md"):
+            continue
         norm = _normalize_rel_path(rel)
         target = _resolve_allowlisted_file(root, norm)
         if target is None:
@@ -501,21 +575,34 @@ def try_save_docs_only_report(
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(block, encoding="utf-8")
-            saved.append(f"- saved report to workspace: {norm}")
+            saved_lines.append(f"- saved report to workspace: {norm}")
         except OSError as exc:
-            saved.append(f"- could not save {norm}: {exc}")
-    ext_paths = list(policy.get("report_paths") or [])
-    for ext in ext_paths:
+            saved_lines.append(f"- could not save {norm}: {exc}")
+    for ext in list(policy.get("report_paths") or []):
         if not isinstance(ext, str) or not ext.strip():
             continue
         try:
             p = Path(ext)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(block, encoding="utf-8")
-            saved.append(f"- saved report to: {ext}")
+            return ReportSaveResult(saved=True, path=str(p), notes=saved_lines + [f"- saved report to: {ext}"])
         except OSError as exc:
-            saved.append(f"- could not save external report {ext}: {exc}")
-    return saved
+            saved_lines.append(f"- could not save external report {ext}: {exc}")
+    if saved_lines:
+        return ReportSaveResult(saved=any("saved report" in s for s in saved_lines), notes=saved_lines)
+    return ReportSaveResult()
+
+
+def try_save_docs_only_report(
+    text: str,
+    policy: dict[str, Any],
+    workspace_root: str | Path,
+) -> list[str]:
+    """Backward-compatible wrapper returning status lines."""
+    result = try_save_external_analysis_report(text, policy, workspace_root)
+    return result.notes if result.notes else (
+        [f"- saved report to: {result.path}"] if result.saved else []
+    )
 
 
 def worker_context_from_queue_item(item: dict[str, Any] | None) -> dict[str, Any]:

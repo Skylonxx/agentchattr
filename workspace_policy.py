@@ -48,7 +48,7 @@ def normalize_workspace_mode(mode: str | None) -> str | None:
     if mode in SCOPED_WRITE_MODE_ALIASES:
         return "implementation"
     if mode in READ_ONLY_ANALYSIS_MODE_ALIASES:
-        return "docs-only"
+        return "read-only"
     return mode
 
 CANONICAL_ROLES = frozenset({
@@ -430,6 +430,7 @@ def _profile_to_policy(profile_id: str, profile: dict[str, Any]) -> dict[str, An
         "forbidden_commands": list(profile.get("forbidden_commands") or _default_forbidden_commands()),
         "git_permissions": dict(profile.get("git_permissions") or _default_git_permissions()),
         "report_paths": list(profile.get("default_report_paths") or []),
+        "analysis_report_only": bool(profile.get("analysis_report_only", False)),
         "role_permissions": dict(_default_role_permissions(default_mode)),
         "enforcement": {
             "fail_closed": True,

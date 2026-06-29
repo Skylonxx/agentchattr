@@ -311,12 +311,13 @@ ui_lead = "agy"
 reviewer = "codex_reviewer"
 safety_gate = "codexsafe"
 
-# UI-09-C PaymentModal read-only analysis — docs/report writes only; no src/test code writes.
+# UI-09-C PaymentModal read-only analysis — repo read-only; external report only.
 [workspace_profiles.twinpet-ui-09-c-payment-modal-analysis]
 workspace_root = "C:/Users/Narachat/twinpet-pos"
-allowed_modes = ["read-only", "docs-only"]
-default_mode = "docs-only"
-max_mode = "docs-only"
+allowed_modes = ["read-only"]
+default_mode = "read-only"
+max_mode = "read-only"
+analysis_report_only = true
 require_git_repo = true
 expected_head = "752ed1317a5e0b83b872d563cda451c7621ed22e"
 default_read_paths = [
@@ -331,17 +332,6 @@ default_read_paths = [
   "Context.md",
   "docs/reports/latest-report.md",
 ]
-allowed_write_files = [
-  "Task.md",
-  "Context.md",
-  "docs/reports/latest-report.md",
-]
-default_write_files = [
-  "Task.md",
-  "Context.md",
-  "docs/reports/latest-report.md",
-]
-max_write_files = 3
 default_report_paths = [
   "C:/Users/Narachat/OneDrive/Ai-Report/claude/twinpet-ui-09-c-payment-modal-analysis-report.md",
 ]
@@ -361,13 +351,13 @@ default_forbidden_paths = [
 
 [workspace_presets.twinpet-ui-09-c-payment-modal-analysis]
 label = "Twinpet UI-09-C PaymentModal Read-Only Analysis"
-description = "Read-only Twinpet analysis with docs/report writes only. No src or test code modifications."
+description = "Strict read-only Twinpet analysis. No repo writes; report saved outside repo."
 template_id = "project-readonly-coordinator-loop"
 channel = "twinpet-ui-09-c-analysis"
 workspace_profile = "twinpet-ui-09-c-payment-modal-analysis"
 workspace_mode = "read-only-analysis"
 expected_head = "752ed1317a5e0b83b872d563cda451c7621ed22e"
-goal = "Read-only analysis of UI-09-C PaymentModal scope. Write Task.md, Context.md, and analysis report only."
+goal = "Read-only analysis of UI-09-C PaymentModal scope. No Twinpet repo writes; external report only."
 
 [workspace_presets.twinpet-ui-09-c-payment-modal-analysis.cast]
 coordinator = "codex_coordinator"
