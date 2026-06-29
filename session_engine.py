@@ -1589,6 +1589,10 @@ class SessionEngine:
                 safety_round=cls.safety_round,
                 allowed_tokens=allowed,
                 instruction=worker_prompt or phase.get("prompt", ""),
+                agent_base=agent_base,
+                project=channel,
+                phase=phase.get("name", f"phase-{phase_idx}"),
+                subject=session.get("goal", "")[:120] or "coordinator-routing",
             )
             if is_relay_eligible(agent_base):
                 relay_entry = self._make_relay_queue_entry(

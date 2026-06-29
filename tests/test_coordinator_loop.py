@@ -192,7 +192,8 @@ class CoordinatorLoopClassificationTests(unittest.TestCase):
         _classify_ui(state)
         action = _next(state, "developer", "Implement UI.")
         self.assertEqual(action.target_role, "developer")
-        self.assertEqual(action.routing_body, "Implement UI.")
+        self.assertIn("Implement UI.", action.routing_body)
+        self.assertIn("TO: Claude Developer", action.routing_body)
 
     def test_after_classify_non_ui_next_developer_accepted(self):
         state, _ = on_session_start("task")
@@ -400,7 +401,8 @@ class CoordinatorLoopRoutingParserTests(unittest.TestCase):
         state, _ = on_session_start("task")
         _classify_ui(state)
         action = _next(state, "developer", "Exact prompt body")
-        self.assertEqual(action.routing_body, "Exact prompt body")
+        self.assertIn("Exact prompt body", action.routing_body)
+        self.assertIn("TO: Claude Developer", action.routing_body)
         self.assertIn("Exact prompt body", action.prompt_context)
 
     def test_final_without_colon_rejected(self):

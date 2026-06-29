@@ -322,6 +322,20 @@ def _coordinator_action(state: CoordinatorLoopState, prompt: str) -> Coordinator
     )
 
 
+def _wrap_worker_handoff_prompt(role: str, prompt: str, body: str = "") -> tuple[str, str]:
+    """Ensure coordinator worker handoffs include explicit TO: routing headers."""
+    from session_relay import ensure_explicit_routing_headers
+
+    text = (body or prompt or f"Coordinator prompt for {role}").strip()
+    wrapped = ensure_explicit_routing_headers(
+        text,
+        role=role,
+        from_source="agentchattr-coordinator-loop",
+        subject="coordinator-worker-handoff",
+    )
+    return wrapped, wrapped
+
+
 def _worker_action(state: CoordinatorLoopState, role: str, prompt: str,
                    body: str = "") -> CoordinatorAction:
     phase_map = {
@@ -332,10 +346,11 @@ def _worker_action(state: CoordinatorLoopState, role: str, prompt: str,
     }
     state.phase = phase_map[role]
     state.awaiting_role = role
+    wrapped_prompt, wrapped_body = _wrap_worker_handoff_prompt(role, prompt, body)
     return CoordinatorAction(
         target_role=role,
-        prompt_context=prompt,
-        routing_body=body,
+        prompt_context=wrapped_prompt,
+        routing_body=wrapped_body,
     )
 
 
@@ -750,11 +765,14 @@ def _on_reviewer_output(state: CoordinatorLoopState, text: str) -> CoordinatorAc
         state.agy_approved = False
         return _coordinator_action(
             state,
-            "Reviewer requested changes with UI impact. Re-enter AGY before reviewer.",
+            "Reviewer returned REQUEST CHANGES with UI impact (normal verdict). "
+            "Route ui_lead (AGY) with explicit TO: header for UX re-review before reviewer.",
         )
     return _coordinator_action(
         state,
-        "Reviewer requested engineering changes. Route developer correction.",
+        "Reviewer returned REQUEST CHANGES (normal verdict, not a tooling failure). "
+        "Route developer with explicit TO: header and a revised read-only analysis/blueprint "
+        "addressing reviewer findings. Preserve read-only boundaries.",
     )
 
 

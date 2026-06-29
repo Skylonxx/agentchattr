@@ -12,6 +12,105 @@ from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Explicit TO: routing headers (repository routing contract)
+# ---------------------------------------------------------------------------
+
+ROLE_ROUTING_TO_TARGETS: dict[str, str] = {
+    "coordinator": "Codex Coordinator",
+    "developer": "Claude Developer",
+    "ui_lead": "AGY UI Lead",
+    "reviewer": "Codex Reviewer",
+    "safety_gate": "CodexSafe Safety Gate",
+}
+
+AGENT_BASE_ROUTING_TO_TARGETS: dict[str, str] = {
+    "codex_coordinator": "Codex Coordinator",
+    "codex_reviewer": "Codex Reviewer",
+    "codex": "Codex",
+    "codexsafe": "CodexSafe Safety Gate",
+    "claude": "Claude Developer",
+    "agy": "AGY UI Lead",
+}
+
+
+def has_explicit_to_header(text: str) -> bool:
+    """True when the first substantive line is an explicit TO: routing header."""
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        return stripped.upper().startswith("TO:")
+    return False
+
+
+def resolve_routing_to_target(*, role: str = "", agent_base: str = "") -> str:
+    """Resolve the TO: target label for a session role or agent identity."""
+    base = (agent_base or "").strip().lower()
+    if base in AGENT_BASE_ROUTING_TO_TARGETS:
+        return AGENT_BASE_ROUTING_TO_TARGETS[base]
+    role_key = (role or "").strip().lower()
+    return ROLE_ROUTING_TO_TARGETS.get(role_key, role_key.title() or "Agent")
+
+
+def build_routing_header_block(
+    *,
+    to_target: str,
+    role: str,
+    project: str = "agentchattr",
+    phase: str = "coordinator-loop",
+    subject: str = "session-handoff",
+    from_source: str = "agentchattr-session-engine",
+    mode: str = "session-handoff",
+) -> str:
+    """Build mandatory multi-agent routing header block."""
+    return "\n".join([
+        f"TO: {to_target}",
+        f"FROM: {from_source}",
+        f"ROLE: {role}",
+        f"MODE: {mode}",
+        f"PROJECT: {project}",
+        f"PHASE: {phase}",
+        f"SUBJECT: {subject}",
+    ])
+
+
+def ensure_explicit_routing_headers(
+    text: str,
+    *,
+    role: str,
+    agent_base: str = "",
+    project: str = "agentchattr",
+    phase: str = "coordinator-loop",
+    subject: str = "session-handoff",
+    mode: str = "session-handoff",
+    from_source: str = "agentchattr-session-engine",
+) -> str:
+    """Prepend routing headers when the prompt lacks an explicit TO: line."""
+    body = (text or "").strip()
+    if has_explicit_to_header(body):
+        return body
+    to_target = resolve_routing_to_target(role=role, agent_base=agent_base)
+    headers = build_routing_header_block(
+        to_target=to_target,
+        role=role or agent_base or "agent",
+        project=project,
+        phase=phase,
+        subject=subject,
+        from_source=from_source,
+        mode=mode,
+    )
+    return f"{headers}\n\n{body}" if body else headers
+
+
+_ROUTING_HANDOFF_INSTRUCTION = (
+    "HANDOFF ROUTING (required for every NEXT: dispatch): "
+    "After your first-line NEXT: <role> token, the prompt body you emit for that worker "
+    "MUST begin with explicit routing headers including TO:, FROM:, ROLE:, MODE:, PROJECT:, "
+    "PHASE:, and SUBJECT: addressed to the target role/agent. "
+    "Never emit bare task instructions without a TO: header."
+)
+
 # Agents authorized for relay-mode session execution.
 #
 # codex_coordinator and codex_reviewer are the split Codex workflow identities
@@ -82,7 +181,15 @@ def build_relay_prompt(
         "Your response will be relayed by the server."
     )
 
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    return ensure_explicit_routing_headers(
+        body,
+        role=role,
+        agent_base=agent_base,
+        project=session_name,
+        phase=phase_name or f"phase-{phase_index + 1}",
+        subject=goal[:120] if goal else "relay-worker-turn",
+    )
 
 
 def session_workspace_policy(session: dict | None) -> dict | None:
@@ -269,7 +376,14 @@ def build_scoped_write_worker_prompt(
     if contract:
         lines.append("")
         lines.append(contract)
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    return ensure_explicit_routing_headers(
+        body,
+        role=role,
+        project=session_name,
+        phase=phase_name or f"phase-{phase_index + 1}",
+        subject=goal[:120] if goal else "scoped-worker-turn",
+    )
 
 
 def build_safety_gate_prompt(
@@ -332,7 +446,15 @@ def build_safety_gate_prompt(
         "Now return your verdict. First non-empty line must be PASS or BLOCK: <reason>.",
     ])
 
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    return ensure_explicit_routing_headers(
+        body,
+        role="safety_gate",
+        agent_base=agent_base,
+        project=session_name,
+        phase=phase_name,
+        subject=goal[:120] if goal else "safety-gate-review",
+    )
 
 
 def build_coordinator_loop_prompt(
@@ -349,11 +471,15 @@ def build_coordinator_loop_prompt(
     safety_round: int,
     allowed_tokens: list[str],
     instruction: str = "",
+    agent_base: str = "codex_coordinator",
+    project: str = "",
+    phase: str = "coordinator-routing",
+    subject: str = "coordinator-dispatch",
 ) -> str:
     """Build a coordinator routing prompt with strict first-line token contract."""
     lines = [
-        "OUTPUT CONTRACT (strict — first non-empty line is routing metadata):",
-        "Emit exactly ONE routing token on the first non-empty line, then your prompt body.",
+        "OUTPUT CONTRACT (strict — your REPLY's first non-empty line is routing metadata):",
+        "Emit exactly ONE routing token on the first non-empty line of your reply, then your prompt body.",
         "Allowed tokens for this turn:",
     ]
     for token in allowed_tokens:
@@ -362,6 +488,7 @@ def build_coordinator_loop_prompt(
         "",
         "Do not emit multiple routing tokens.",
         "Do not route worker-to-worker; you alone dispatch the next role.",
+        _ROUTING_HANDOFF_INSTRUCTION,
         "",
         f"SESSION: {session_name}",
     ])
@@ -381,9 +508,23 @@ def build_coordinator_loop_prompt(
         lines.append(f"INSTRUCTION: {instruction}")
     lines.extend([
         "",
+        "REQUEST CHANGES from reviewer is a normal verdict, not a tooling failure. "
+        "Route the next role with explicit TO: headers and revised read-only deliverables "
+        "when the session is analysis-only.",
+        "",
         "Respond with plain text only. Do not use MCP tools.",
     ])
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    return ensure_explicit_routing_headers(
+        body,
+        role="coordinator",
+        agent_base=agent_base,
+        project=project or session_name,
+        phase=phase,
+        subject=subject or (goal[:120] if goal else "coordinator-routing"),
+        mode="coordinator-routing",
+        from_source="agentchattr-coordinator-loop",
+    )
 
 
 def build_coordinator_loop_ui_lead_prompt(
@@ -424,7 +565,15 @@ def build_coordinator_loop_ui_lead_prompt(
         "PASS WITH NOTES is NOT valid in coordinator_loop.",
         "Do not use tools, shell, git, MCP, or file edits.",
     ])
-    return "\n\n".join(lines)
+    body = "\n\n".join(lines)
+    return ensure_explicit_routing_headers(
+        body,
+        role="ui_lead",
+        agent_base="agy",
+        project=session_name,
+        phase=phase_name,
+        subject=goal[:120] if goal else "ui-lead-review",
+    )
 
 
 def coordinator_loop_worker_output_contract(role: str, *, workspace_bound: bool = False) -> str:
