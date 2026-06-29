@@ -140,6 +140,22 @@ def is_workspace_bound_queue_item(item: dict[str, Any] | None) -> bool:
     return bool(root and str(root).strip())
 
 
+def is_trusted_direct_repo_cli_mode(
+    item: dict[str, Any] | None,
+    policy: dict[str, Any] | None,
+) -> bool:
+    """True when worker runs in trusted direct repo CLI mode (tools enabled, no snapshots)."""
+    from workspace_policy_runtime import is_trusted_direct_repo_cli_policy
+
+    if is_trusted_direct_repo_cli_policy(policy):
+        return True
+    if isinstance(item, dict):
+        wpc = item.get("workspace_policy_context")
+        if isinstance(wpc, dict) and wpc.get("trusted_direct_repo_cli"):
+            return True
+    return False
+
+
 def is_docs_only_snapshot_mode(
     item: dict[str, Any] | None,
     policy: dict[str, Any] | None,
@@ -149,6 +165,8 @@ def is_docs_only_snapshot_mode(
     """True when worker should receive automated precheck + full file snapshots."""
     from on_demand_snapshots import is_on_demand_snapshot_mode
 
+    if is_trusted_direct_repo_cli_mode(item, policy):
+        return False
     if is_on_demand_snapshot_mode(item, policy, config=config):
         return False
     if isinstance(item, dict):

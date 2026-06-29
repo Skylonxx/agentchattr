@@ -383,3 +383,72 @@ developer = "claude"
 ui_lead = "agy"
 reviewer = "codex_reviewer"
 safety_gate = "codexsafe"
+
+# UI-09-C PaymentModal trusted direct repo CLI (Phase 1, read-only).
+# Claude runs in the REAL Twinpet repo with tools enabled (no --tools "" sealing),
+# no source snapshots, driven by a full coordinator execution memo. Read-only:
+# no product modification; report saved outside the repo. Reuses report-orchestrated
+# loop (analysis_report_only) but skips snapshot injection (trusted_direct_repo_cli).
+[workspace_profiles.twinpet-ui-09-c-payment-modal-trusted-cli]
+workspace_root = "C:/Users/Narachat/twinpet-pos"
+allowed_modes = ["read-only"]
+default_mode = "read-only"
+max_mode = "read-only"
+analysis_report_only = true
+trusted_direct_repo_cli = true
+on_demand_snapshots = false
+require_git_repo = true
+expected_head = "752ed1317a5e0b83b872d563cda451c7621ed22e"
+default_read_paths = [
+  "src/components/PaymentModal.tsx",
+  "src/components/PaymentModal.css",
+  "src/pages/POSPage.tsx",
+  "src/hooks/pos/useCheckout.ts",
+  "src/lib/pos/asyncCheckout.ts",
+  "src/lib/pos/cartUtils.ts",
+]
+trusted_cli_primary_paths = [
+  "src/components/PaymentModal.tsx",
+  "src/components/PaymentModal.css",
+]
+default_report_paths = [
+  "C:/Users/Narachat/OneDrive/Ai-Report/claude/twinpet-ui-09-c-payment-modal-trusted-cli-report.md",
+]
+default_external_report_write_roots = [
+  "C:/Users/Narachat/OneDrive/Ai-Report",
+  "C:/Users/Narachat/OneDrive/Ai-Report/claude",
+  "C:/Users/Narachat/OneDrive/Ai-Report/agy",
+  "C:/Users/Narachat/OneDrive/Ai-Report/codex",
+]
+default_forbidden_paths = [
+  "src/pages/POSPage.tsx",
+  "src/hooks/pos/useCheckout.ts",
+  "src/lib/pos/asyncCheckout.ts",
+  "src/lib/pos/cartUtils.ts",
+  "functions/**",
+  "android/**",
+  "ios/**",
+  ".claude/**",
+  "firebase.json",
+  "firestore.rules",
+  "storage.rules",
+  "config.local.toml",
+  ".git/**",
+]
+
+[workspace_presets.twinpet-ui-09-c-payment-modal-trusted-cli]
+label = "Twinpet UI-09-C PaymentModal Trusted Direct Repo CLI"
+description = "Trusted read-only CLI: Claude works directly in the Twinpet repo with tools enabled, no snapshots, external report only."
+template_id = "project-readonly-coordinator-loop"
+channel = "twinpet-ui-09-c-trusted-cli"
+workspace_profile = "twinpet-ui-09-c-payment-modal-trusted-cli"
+workspace_mode = "trusted_direct_repo_cli"
+expected_head = "752ed1317a5e0b83b872d563cda451c7621ed22e"
+goal = "Trusted direct repo CLI read-only analysis of UI-09-C PaymentModal. Claude inspects the real repo with normal tools; no product writes; external report only."
+
+[workspace_presets.twinpet-ui-09-c-payment-modal-trusted-cli.cast]
+coordinator = "codex_coordinator"
+developer = "claude"
+ui_lead = "agy"
+reviewer = "codex_reviewer"
+safety_gate = "codexsafe"

@@ -40,6 +40,13 @@ MODE_RANK = {mode: idx for idx, mode in enumerate(VALID_MODES)}
 # Session API alias: scoped-write maps to implementation (narrow write_files allowlist).
 SCOPED_WRITE_MODE_ALIASES = frozenset({"scoped-write"})
 READ_ONLY_ANALYSIS_MODE_ALIASES = frozenset({"read-only-analysis"})
+# Trusted direct repo CLI (Phase 1) is a read-only session driven by a coordinator
+# execution memo with Claude tools enabled and no snapshots. The canonical mode is
+# read-only; trusted behaviour is carried by the profile flag trusted_direct_repo_cli.
+TRUSTED_DIRECT_REPO_CLI_MODE_ALIASES = frozenset({
+    "trusted_direct_repo_cli",
+    "trusted-direct-repo-cli",
+})
 
 
 def normalize_workspace_mode(mode: str | None) -> str | None:
@@ -49,6 +56,8 @@ def normalize_workspace_mode(mode: str | None) -> str | None:
     if mode in SCOPED_WRITE_MODE_ALIASES:
         return "implementation"
     if mode in READ_ONLY_ANALYSIS_MODE_ALIASES:
+        return "read-only"
+    if mode in TRUSTED_DIRECT_REPO_CLI_MODE_ALIASES:
         return "read-only"
     return mode
 
@@ -453,8 +462,12 @@ def _profile_to_policy(profile_id: str, profile: dict[str, Any]) -> dict[str, An
         "external_report_write_roots": report_roots,
         "analysis_report_only": bool(profile.get("analysis_report_only", False)),
         "on_demand_snapshots": bool(profile.get("on_demand_snapshots", False)),
+        "trusted_direct_repo_cli": bool(profile.get("trusted_direct_repo_cli", False)),
         "suggested_initial_snapshot_paths": list(
             profile.get("suggested_initial_snapshot_paths") or []
+        ),
+        "trusted_cli_primary_paths": list(
+            profile.get("trusted_cli_primary_paths") or []
         ),
         "role_permissions": dict(_default_role_permissions(default_mode)),
         "enforcement": {

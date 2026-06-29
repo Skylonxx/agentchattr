@@ -1612,10 +1612,26 @@ def _build_agy_store_command(command: str, prompt: str, print_timeout: int, *,
 
 
 def _build_claude_print_command(command: str, prompt: str, *, use_stdin: bool = True):
-    """Build a Claude ``--print`` invocation and optional stdin payload."""
+    """Build a Claude ``--print`` invocation and optional stdin payload.
+
+    Legacy/snapshot path: tools are SEALED (``--tools ""``). Source content reaches
+    Claude only via injected snapshots. Do not change this globally.
+    """
     if use_stdin:
         return [command, "--print", "--tools", ""], prompt.encode("utf-8")
     return [command, "--print", "--tools", "", prompt], None
+
+
+def _build_claude_trusted_command(command: str, prompt: str, *, use_stdin: bool = True):
+    """Build a Claude ``--print`` invocation with tools ENABLED (trusted_direct_repo_cli).
+
+    Intentionally omits ``--tools ""`` so Claude can read/search the real repo with
+    its normal CLI tools. Only used for explicitly configured trusted mode; the
+    legacy sealed path (``_build_claude_print_command``) is unchanged.
+    """
+    if use_stdin:
+        return [command, "--print"], prompt.encode("utf-8")
+    return [command, "--print", prompt], None
 
 
 def _format_report_save_notes(result) -> list[str]:
@@ -1682,9 +1698,17 @@ def _run_claude_workspace_print_turn(
 
     policy = load_canonical_policy_for_item(item, data_dir=data_dir)
     work_item = dict(item)
-    on_demand = is_on_demand_snapshot_mode(item, policy, config=config)
+    from worker_workspace import is_trusted_direct_repo_cli_mode
+    trusted_cli = is_trusted_direct_repo_cli_mode(item, policy)
+    on_demand = (not trusted_cli) and is_on_demand_snapshot_mode(item, policy, config=config)
 
-    if on_demand:
+    if trusted_cli:
+        print(
+            f"  > {agent} trusted_direct_repo_cli mode active "
+            f"source_snapshot_injected=false on_demand_snapshot_used=false "
+            f"cwd={effective_cwd or default_cwd} -> #{reply_channel}"
+        )
+    elif on_demand:
         augment, pre_blocker, snap_meta = build_on_demand_worker_augmentation(
             effective_cwd or default_cwd,
             item,
@@ -1783,6 +1807,12 @@ def _run_claude_workspace_print_turn(
         )
         return
 
+    if trusted_cli:
+        print(
+            f"  > {agent} claude trusted cli exec triggered "
+            f"({len(prompt)} chars) -> #{reply_channel}"
+        )
+
     _run_claude_direct_print_turn(
         command=command,
         cwd=effective_cwd,
@@ -1796,10 +1826,12 @@ def _run_claude_workspace_print_turn(
         queue_item=work_item,
         config=config,
         data_dir=data_dir,
+        command_builder=_build_claude_trusted_command if trusted_cli else None,
         on_success_save_report=lambda text: _format_report_save_notes(
             try_save_external_analysis_report(text, policy, effective_cwd or default_cwd)
             if isinstance(policy, dict) and (
-                is_docs_only_snapshot_mode(item, policy, config=config)
+                trusted_cli
+                or is_docs_only_snapshot_mode(item, policy, config=config)
                 or on_demand
             )
             else ReportSaveResult(),
@@ -2032,6 +2064,7 @@ def _run_claude_direct_print_turn(
     config=None,
     data_dir=None,
     on_success_save_report=None,
+    command_builder=None,
 ):
     """Run one direct ``claude --print`` turn and relay to the source channel."""
     import subprocess
@@ -2051,7 +2084,8 @@ def _run_claude_direct_print_turn(
         )
     subprocess_timeout = subprocess_timeout_for_print(timeout_secs, config=config)
 
-    cmd, stdin_payload = _build_claude_print_command(command, prompt, use_stdin=True)
+    build_cmd = command_builder or _build_claude_print_command
+    cmd, stdin_payload = build_cmd(command, prompt, use_stdin=True)
     print(
         f"  > {agent} direct print-exec triggered ({len(prompt)} chars, "
         f"timeout={timeout_secs}s) -> #{reply_channel}"

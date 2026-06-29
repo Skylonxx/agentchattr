@@ -1482,11 +1482,12 @@ def validate_initial_developer_preflight(
         return False, "BLOCKER: developer initial prompt missing prompt memo"
     if not isinstance(policy, dict):
         return False, "BLOCKER: developer initial prompt missing workspace policy"
+    trusted = bool(policy.get("trusted_direct_repo_cli"))
     read_paths = [
         p for p in (policy.get("read_paths") or [])
         if isinstance(p, str) and p.strip()
     ]
-    if not read_paths:
+    if not read_paths and not trusted:
         return False, "BLOCKER: developer initial prompt missing read path allowlist"
     roots = list(external_report_write_roots or resolve_external_report_write_roots(policy))
     if not roots:
@@ -1799,16 +1800,45 @@ def build_report_orchestrated_dispatch_prompt(
         if not ok:
             return ReportPromptResult(ok=False, blocker=blocker)
         workspace = (policy or {}).get("workspace") or {}
+        read_paths = [
+            p for p in ((policy or {}).get("read_paths") or [])
+            if isinstance(p, str) and p.strip()
+        ]
+        if (policy or {}).get("trusted_direct_repo_cli"):
+            from trusted_cli_memo import build_trusted_cli_execution_memo
+
+            memo = build_trusted_cli_execution_memo(
+                project=project,
+                phase=phase,
+                subject=subject,
+                workspace_root=str(workspace.get("root") or ""),
+                expected_head=str(workspace.get("expected_head") or ""),
+                prompt_memo_body=prompt_memo_body,
+                read_paths=read_paths,
+                primary_paths=[
+                    p for p in ((policy or {}).get("trusted_cli_primary_paths") or [])
+                    if isinstance(p, str) and p.strip()
+                ],
+                forbidden_paths=[
+                    p for p in ((policy or {}).get("forbidden_paths") or [])
+                    if isinstance(p, str) and p.strip()
+                ],
+                expected_output_path=expected_output_path,
+                external_report_write_roots=list(
+                    external_report_write_roots or resolve_external_report_write_roots(policy)
+                ),
+                instruction=instruction,
+            )
+            if not memo.ok:
+                return ReportPromptResult(ok=False, blocker=memo.blocker)
+            return ReportPromptResult(ok=True, prompt=memo.prompt)
         return build_initial_developer_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
             workspace_root=str(workspace.get("root") or ""),
             expected_head=str(workspace.get("expected_head") or ""),
-            read_paths=[
-                p for p in ((policy or {}).get("read_paths") or [])
-                if isinstance(p, str) and p.strip()
-            ],
+            read_paths=read_paths,
             prompt_memo_body=prompt_memo_body,
             instruction=instruction,
             expected_output_path=expected_output_path,

@@ -141,6 +141,8 @@ def is_on_demand_snapshot_mode(
     config: dict | None = None,
 ) -> bool:
     """True when worker should receive manifest + on-demand snapshot contract (no full auto-inject)."""
+    if isinstance(policy, dict) and policy.get("trusted_direct_repo_cli"):
+        return False
     if not is_on_demand_snapshot_enabled(policy, config):
         return False
     if isinstance(item, dict):

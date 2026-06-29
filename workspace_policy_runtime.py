@@ -160,6 +160,7 @@ def build_session_queue_workspace_context(
         "workspace_policy_version": session.get("workspace_policy_version"),
         "policy_mode": policy.get("mode"),
         "policy_id": policy.get("policy_id"),
+        "trusted_direct_repo_cli": bool(policy.get("trusted_direct_repo_cli")),
         "workspace_root": workspace.get("root"),
         "prompt_id": session.get("prompt_id"),
         "has_prompt_body": bool(str(session.get("prompt_body") or "").strip()),
@@ -797,6 +798,13 @@ def is_report_only_readonly_policy(policy: dict[str, Any] | None) -> bool:
     if policy.get("analysis_report_only"):
         return True
     return policy.get("policy_id") in REPORT_ONLY_ANALYSIS_PROFILE_IDS
+
+
+def is_trusted_direct_repo_cli_policy(policy: dict[str, Any] | None) -> bool:
+    """True for trusted_direct_repo_cli profiles (Claude tools enabled, no snapshots)."""
+    if not isinstance(policy, dict):
+        return False
+    return bool(policy.get("trusted_direct_repo_cli"))
 
 
 def _normalize_dirty_path(path: str) -> str:
