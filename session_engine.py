@@ -357,6 +357,16 @@ class SessionEngine:
             return None
         return self._get_expected_agent(session)
 
+    def _worker_context_from_session(self, session: dict) -> dict:
+        policy = session.get("workspace_policy") if isinstance(session.get("workspace_policy"), dict) else {}
+        return {
+            "workspace_policy": policy,
+            "policy_id": policy.get("policy_id"),
+            "policy_mode": policy.get("mode"),
+            "prompt_id": session.get("prompt_id"),
+            "has_prompt_body": bool(str(session.get("prompt_body") or "").strip()),
+        }
+
     def _session_workspace_policy_context(
         self, session: dict, role: str, phase_idx: int, turn_idx: int,
     ) -> dict:
@@ -802,9 +812,6 @@ class SessionEngine:
             context_messages=context_messages,
             prompt_body=self._session_prompt_body(session),
         )
-        contract = coordinator_loop_worker_output_contract(role)
-        if contract:
-            prompt = f"{prompt}\n\n{contract}"
         log.info(
             "Session %d: scoped-workspace trigger %s (%s) for phase '%s'",
             session["id"], agent, role, phase.get("name", "?"),
@@ -1369,7 +1376,10 @@ class SessionEngine:
         if role == COORDINATOR_ROLE:
             action = on_coordinator_output(cls, output)
         else:
-            action = on_worker_output(cls, role, output)
+            action = on_worker_output(
+                cls, role, output,
+                worker_context=self._worker_context_from_session(session),
+            )
 
         worker_prompt = None
         safety_artifact = None
@@ -1662,7 +1672,9 @@ class SessionEngine:
             agent_base=agent_base,
             prompt_body=self._session_prompt_body(session),
         )
-        contract = coordinator_loop_worker_output_contract(role)
+        policy = session.get("workspace_policy") or {}
+        workspace_bound = bool((policy.get("workspace") or {}).get("root"))
+        contract = coordinator_loop_worker_output_contract(role, workspace_bound=workspace_bound)
         if contract:
             prompt = f"{prompt}\n\n{contract}"
         relay_entry = self._make_relay_queue_entry(

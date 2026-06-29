@@ -38,6 +38,31 @@ _SAFETY_VERDICT_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+DEVELOPER_RECOGNIZED_TOKENS = frozenset({
+    "READY_FOR_COORDINATOR",
+    "BLOCKER",
+    "BLOCKED",
+    "WORKER_TIMEOUT",
+    "PROGRESS",
+    "PASS",
+    "PASS_WITH_NOTES",
+    "REQUEST_CHANGES",
+    "FAIL",
+})
+
+_PROGRESS_LEGACY_MARKERS = (
+    "starting precheck",
+    "running preflight",
+    "verifying workspace",
+    "verifying git",
+    "git head",
+    "working tree",
+    "reading ",
+    "inspecting ",
+    "analyzing ",
+    "preflight",
+)
+
 
 class CoordinatorPhase(Enum):
     INTAKE = "intake"
@@ -410,19 +435,80 @@ def on_coordinator_output(state: CoordinatorLoopState, text: str) -> Coordinator
     return _malformed_coordinator(state, "unhandled routing kind")
 
 
+def _looks_like_legacy_progress(first: str) -> bool:
+    """Heuristic for interim worker status lines during long Prompt Memo tasks."""
+    if not first:
+        return False
+    low = first.lower().strip()
+    if low in ("progress", "in progress"):
+        return True
+    if low.startswith("progress:") or low.startswith("progress "):
+        return True
+    return any(marker in low for marker in _PROGRESS_LEGACY_MARKERS)
+
+
+def _normalize_worker_token(first: str) -> str:
+    """Normalize spaced/human variants to canonical worker tokens."""
+    if first == "PASS WITH NOTES":
+        return "PASS_WITH_NOTES"
+    if first.startswith("BLOCKER:"):
+        return "BLOCKER"
+    if first == "BLOCKER":
+        return "BLOCKER"
+    return first
+
+
+def build_ambiguous_worker_diagnostic(
+    role: str,
+    first_line: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+    full_text: str = "",
+) -> str:
+    """Build diagnostic text when worker output must be classified ambiguous."""
+    ctx = worker_context if isinstance(worker_context, dict) else {}
+    policy = ctx.get("workspace_policy") if isinstance(ctx.get("workspace_policy"), dict) else {}
+    lines = [
+        "Ambiguous output diagnostics:",
+        f"- role: {role}",
+        f"- first line: {first_line[:200] if first_line else '(empty)'}",
+        f"- workspace_profile: {policy.get('policy_id') or ctx.get('policy_id') or '(none)'}",
+        f"- workspace_mode: {policy.get('mode') or ctx.get('policy_mode') or '(none)'}",
+        f"- prompt_id: {ctx.get('prompt_id') or '(none)'}",
+        f"- prompt_body present: {'yes' if ctx.get('has_prompt_body') else 'no'}",
+        f"- looked like progress: {'yes' if _looks_like_legacy_progress(first_line) else 'no'}",
+    ]
+    if full_text and len(full_text) > len(first_line):
+        lines.append(f"- output preview: {full_text[:300]}")
+    return "\n".join(lines)
+
+
 def _parse_developer_verdict(text: str) -> tuple[str, str]:
     first = _first_non_empty_line(text)
-    if first == "WORKER_TIMEOUT":
-        return first, _body_after_first_line(text)
-    if first == "READY_FOR_COORDINATOR":
-        return first, _body_after_first_line(text)
+    first_norm = _normalize_worker_token(first)
+
+    if first_norm in DEVELOPER_RECOGNIZED_TOKENS:
+        if first_norm == "BLOCKER":
+            reason = first[len("BLOCKER:"):].strip() if first.startswith("BLOCKER:") else _body_after_first_line(text)
+            return "BLOCKER", reason or first
+        return first_norm, _body_after_first_line(text)
+
+    if _looks_like_legacy_progress(first):
+        return "PROGRESS", first if first else _body_after_first_line(text)
+
     return "AMBIGUOUS", first or "empty developer output"
 
 
 def _parse_ui_lead_verdict(text: str) -> tuple[str, str]:
     first = _first_non_empty_line(text)
-    if first == "WORKER_TIMEOUT":
-        return first, _body_after_first_line(text)
+    first_norm = _normalize_worker_token(first)
+    if first_norm == "WORKER_TIMEOUT":
+        return first_norm, _body_after_first_line(text)
+    if first_norm == "PROGRESS" or _looks_like_legacy_progress(first):
+        return "PROGRESS", first if first else _body_after_first_line(text)
+    if first_norm == "BLOCKER":
+        reason = first[len("BLOCKER:"):].strip() if first.startswith("BLOCKER:") else _body_after_first_line(text)
+        return "BLOCKER", reason or first
     if first in ("UX_APPROVED", "REQUEST UX CHANGES", "BLOCKED"):
         return first, _body_after_first_line(text)
     if first == "PASS WITH NOTES":
@@ -481,7 +567,13 @@ def _detect_ui_changed(notes: str) -> bool:
     return any(k in low for k in keywords)
 
 
-def on_worker_output(state: CoordinatorLoopState, role: str, text: str) -> CoordinatorAction:
+def on_worker_output(
+    state: CoordinatorLoopState,
+    role: str,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
     """Handle worker verdict — always returns coordinator (or terminal blocker)."""
     if role not in WORKER_ROLES:
         return _terminal_blocker(state, f"unknown worker role: {role}")
@@ -496,20 +588,29 @@ def on_worker_output(state: CoordinatorLoopState, role: str, text: str) -> Coord
     state.last_output_summary = (text or "")[:500]
 
     if role == "developer":
-        return _on_developer_output(state, text)
+        return _on_developer_output(state, text, worker_context=worker_context)
     if role == "ui_lead":
-        return _on_ui_lead_output(state, text)
+        return _on_ui_lead_output(state, text, worker_context=worker_context)
     if role == "reviewer":
         return _on_reviewer_output(state, text)
     return _on_safety_output(state, text)
 
 
-def _on_developer_output(state: CoordinatorLoopState, text: str) -> CoordinatorAction:
+def _on_developer_output(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
     token, notes = _parse_developer_verdict(text)
     _append_verdict(state, "developer", token, notes)
 
     if token == "AMBIGUOUS":
-        return _terminal_blocker(state, f"ambiguous developer output: {notes}")
+        first = _first_non_empty_line(text)
+        diag = build_ambiguous_worker_diagnostic(
+            "developer", first, worker_context=worker_context, full_text=text or "",
+        )
+        return _terminal_blocker(state, f"ambiguous developer output: {notes}\n{diag}")
 
     if token == "WORKER_TIMEOUT":
         return _coordinator_action(
@@ -518,8 +619,15 @@ def _on_developer_output(state: CoordinatorLoopState, text: str) -> CoordinatorA
             f"Coordinator may retry or issue BLOCKER. Details: {notes[:400]}",
         )
 
-    if token == "BLOCKED":
+    if token in ("BLOCKER", "BLOCKED"):
         return _terminal_blocker(state, f"developer blocked: {notes}")
+
+    if token == "PROGRESS":
+        return _coordinator_action(
+            state,
+            "Developer reported PROGRESS (work in flight, not final). "
+            f"Status: {notes[:400]}. Coordinator may NEXT: developer to continue or wait.",
+        )
 
     state.developer_round += 1
     if state.developer_round > state.max_rounds:
@@ -531,21 +639,35 @@ def _on_developer_output(state: CoordinatorLoopState, text: str) -> CoordinatorA
     )
 
 
-def _on_ui_lead_output(state: CoordinatorLoopState, text: str) -> CoordinatorAction:
+def _on_ui_lead_output(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
     token, notes = _parse_ui_lead_verdict(text)
     _append_verdict(state, "ui_lead", token, notes)
 
     if token == "INVALID":
         return _terminal_blocker(state, notes)
     if token == "AMBIGUOUS":
-        return _terminal_blocker(state, f"ambiguous ui_lead output: {notes}")
+        first = _first_non_empty_line(text)
+        diag = build_ambiguous_worker_diagnostic(
+            "ui_lead", first, worker_context=worker_context, full_text=text or "",
+        )
+        return _terminal_blocker(state, f"ambiguous ui_lead output: {notes}\n{diag}")
     if token == "WORKER_TIMEOUT":
         return _coordinator_action(
             state,
             "UI lead worker timed out (WORKER_TIMEOUT). Coordinator may retry or BLOCKER.",
         )
-    if token == "BLOCKED":
+    if token in ("BLOCKER", "BLOCKED"):
         return _terminal_blocker(state, f"ui_lead blocked: {notes}")
+    if token == "PROGRESS":
+        return _coordinator_action(
+            state,
+            f"UI lead reported PROGRESS. Status: {notes[:400]}",
+        )
 
     if token == "UX_APPROVED":
         state.agy_approved = True

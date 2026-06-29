@@ -240,6 +240,10 @@ def build_scoped_write_worker_prompt(
     lines.append(
         "Respond with plain text only. Your response will be relayed by the server."
     )
+    contract = coordinator_loop_worker_output_contract(role, workspace_bound=bool(root))
+    if contract:
+        lines.append("")
+        lines.append(contract)
     return "\n\n".join(lines)
 
 
@@ -398,12 +402,31 @@ def build_coordinator_loop_ui_lead_prompt(
     return "\n\n".join(lines)
 
 
-def coordinator_loop_worker_output_contract(role: str) -> str:
+def coordinator_loop_worker_output_contract(role: str, *, workspace_bound: bool = False) -> str:
     """Return the strict first-line output contract for a coordinator_loop worker."""
     if role == "developer":
-        return (
-            "OUTPUT CONTRACT: First line MUST be READY_FOR_COORDINATOR, then your body."
-        )
+        lines = [
+            "OUTPUT CONTRACT (first non-empty line is authoritative):",
+            "  PROGRESS — still working / running prechecks (not final)",
+            "  BLOCKER: <reason> — hard stop (wrong cwd, HEAD mismatch, forbidden write, etc.)",
+            "  READY_FOR_COORDINATOR — work ready for coordinator routing",
+            "  PASS / PASS_WITH_NOTES / REQUEST_CHANGES / FAIL — developer verdict",
+            "  WORKER_TIMEOUT — infrastructure timeout only (do not use for normal work)",
+        ]
+        if workspace_bound:
+            lines.append(
+                "While running prechecks or reading files, prefix with PROGRESS on line 1."
+            )
+        return "\n".join(lines)
+    if role == "ui_lead":
+        lines = [
+            "OUTPUT CONTRACT (first non-empty line is authoritative):",
+            "  PROGRESS — inspection in progress",
+            "  UX_APPROVED / REQUEST UX CHANGES / BLOCKED",
+        ]
+        if workspace_bound:
+            lines.append("Use PROGRESS while still reviewing; final line uses UX_* tokens.")
+        return "\n".join(lines)
     if role == "reviewer":
         return (
             "OUTPUT CONTRACT: First line MUST be one of: "
