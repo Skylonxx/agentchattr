@@ -56,6 +56,12 @@ class RuntimeGuardResult:
     ok: bool
     blocker: str | None = None
     reason: str = ""
+    diagnostics: dict[str, Any] | None = None
+
+
+REPORT_ONLY_ANALYSIS_PROFILE_IDS = frozenset({
+    "twinpet-ui-09-c-payment-modal-analysis",
+})
 
 
 def normalize_session_role(role: str) -> str:
@@ -594,19 +600,62 @@ def _dirty_path_allowed(path: str, policy: dict[str, Any]) -> bool:
     return norm in write_files
 
 
+def enrich_policy_for_dirty_verification(
+    policy: dict[str, Any] | None,
+    *,
+    profiles: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Merge profile registry hints so stale session snapshots use report-only dirty rules."""
+    if not isinstance(policy, dict):
+        return None
+    out = dict(policy)
+    profile_id = out.get("policy_id")
+    if profile_id in REPORT_ONLY_ANALYSIS_PROFILE_IDS:
+        out["analysis_report_only"] = True
+    elif profiles and profile_id and profile_id in profiles:
+        prof = profiles[profile_id]
+        if prof.get("analysis_report_only"):
+            out["analysis_report_only"] = True
+    return out
+
+
+def git_head_at_cwd(cwd: str) -> str:
+    """Best-effort ``git rev-parse HEAD`` for dirty-tree diagnostics."""
+    import subprocess
+
+    if not cwd:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return ""
+        return (proc.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
 def verify_dirty_set(
     *,
     porcelain_output: str,
     policy: dict[str, Any],
+    profiles: dict[str, dict[str, Any]] | None = None,
 ) -> RuntimeGuardResult:
     """Compare porcelain dirty set against policy write_files allowlist."""
-    if is_report_only_readonly_policy(policy):
+    effective = enrich_policy_for_dirty_verification(policy, profiles=profiles) or policy
+    if is_report_only_readonly_policy(effective):
         return verify_dirty_set_report_only_analysis(
             porcelain_output=porcelain_output,
-            policy=policy,
+            policy=effective,
         )
-    mode = policy.get("mode")
-    write_files = policy.get("write_files") or []
+    mode = effective.get("mode")
+    write_files = effective.get("write_files") or []
     if mode in ("scratch-readonly", "read-only") or not write_files:
         entries = parse_git_porcelain(porcelain_output)
         if entries:
@@ -619,13 +668,110 @@ def verify_dirty_set(
 
     for entry in parse_git_porcelain(porcelain_output):
         path = entry["path"]
-        if not _dirty_path_allowed(path, policy):
+        if not _dirty_path_allowed(path, effective):
             return RuntimeGuardResult(
                 False,
                 blocker="BLOCKER:unauthorized_dirty_tree",
                 reason=f"path not in write_files allowlist: {path!r}",
             )
     return RuntimeGuardResult(True)
+
+
+def _dirty_set_diagnostics(
+    *,
+    policy: dict[str, Any],
+    porcelain_output: str,
+    git_commit: str,
+    guard_source: str,
+    policy_source: str,
+) -> dict[str, Any]:
+    docs_dirty: list[str] = []
+    blocking_dirty: list[str] = []
+    if is_report_only_readonly_policy(policy):
+        docs_dirty, blocking_dirty = classify_dirty_entries_report_only_analysis(
+            porcelain_output,
+            policy=policy,
+        )
+    dirty_paths = [
+        _normalize_dirty_path(entry["path"])
+        for entry in parse_git_porcelain(porcelain_output)
+    ]
+    if not is_report_only_readonly_policy(policy) and dirty_paths:
+        blocking_dirty = list(dirty_paths)
+    mode = policy.get("mode") or ""
+    return {
+        "workspace_profile": policy.get("policy_id") or "",
+        "workspace_mode": mode,
+        "canonical_mode": wp.normalize_workspace_mode(mode) or mode,
+        "analysis_report_only": is_report_only_readonly_policy(policy),
+        "dirty_paths": dirty_paths,
+        "allowed_docs_dirty": docs_dirty,
+        "blocking_dirty": blocking_dirty,
+        "git_commit": git_commit,
+        "policy_source": policy_source,
+        "guard_source": guard_source,
+    }
+
+
+def format_unauthorized_dirty_tree_blocker(
+    result: RuntimeGuardResult,
+    diagnostics: dict[str, Any],
+) -> str:
+    """Format relay-safe unauthorized_dirty_tree blocker with policy diagnostics."""
+    def _csv(paths: list[str] | tuple[str, ...] | None) -> str:
+        items = [p for p in (paths or []) if p]
+        return ",".join(items) if items else "(none)"
+
+    lines = [
+        "BLOCKER:unauthorized_dirty_tree",
+        f"workspace_profile={diagnostics.get('workspace_profile', '')}",
+        f"workspace_mode={diagnostics.get('workspace_mode', '')}",
+        f"canonical_mode={diagnostics.get('canonical_mode', '')}",
+        f"analysis_report_only={str(bool(diagnostics.get('analysis_report_only'))).lower()}",
+        f"dirty_paths={_csv(diagnostics.get('dirty_paths'))}",
+        f"allowed_docs_dirty={_csv(diagnostics.get('allowed_docs_dirty'))}",
+        f"blocking_dirty={_csv(diagnostics.get('blocking_dirty'))}",
+        f"git_commit={diagnostics.get('git_commit') or '(unknown)'}",
+        f"policy_source={diagnostics.get('policy_source', '')}",
+        f"guard_source={diagnostics.get('guard_source', '')}",
+    ]
+    if result.reason:
+        lines.append(f"reason={result.reason}")
+    return "\n".join(lines)
+
+
+def verify_dirty_set_with_diagnostics(
+    *,
+    porcelain_output: str,
+    policy: dict[str, Any],
+    profiles: dict[str, dict[str, Any]] | None = None,
+    git_commit: str = "",
+    guard_source: str = "verify_dirty_set",
+    policy_source: str = "canonical_session_policy",
+) -> RuntimeGuardResult:
+    """Verify dirty set and attach formatted blocker diagnostics when blocked."""
+    effective = enrich_policy_for_dirty_verification(policy, profiles=profiles) or policy
+    diagnostics = _dirty_set_diagnostics(
+        policy=effective,
+        porcelain_output=porcelain_output,
+        git_commit=git_commit,
+        guard_source=guard_source,
+        policy_source=policy_source,
+    )
+    result = verify_dirty_set(
+        porcelain_output=porcelain_output,
+        policy=effective,
+        profiles=profiles,
+    )
+    if result.ok:
+        return RuntimeGuardResult(True, diagnostics=diagnostics)
+    blocker = format_unauthorized_dirty_tree_blocker(result, diagnostics)
+    return RuntimeGuardResult(
+        False,
+        blocker=blocker,
+        reason=result.reason,
+        diagnostics=diagnostics,
+    )
 
 
 DOCS_TRACKER_PATHS = frozenset({
@@ -650,9 +796,7 @@ def is_report_only_readonly_policy(policy: dict[str, Any] | None) -> bool:
         return False
     if policy.get("analysis_report_only"):
         return True
-    if policy.get("policy_id") == "twinpet-ui-09-c-payment-modal-analysis":
-        return policy.get("mode") == "read-only"
-    return False
+    return policy.get("policy_id") in REPORT_ONLY_ANALYSIS_PROFILE_IDS
 
 
 def _normalize_dirty_path(path: str) -> str:

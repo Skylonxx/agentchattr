@@ -1010,10 +1010,13 @@ def _workspace_dirty_blocker(
     when: str,
 ) -> str | None:
     """Return blocker token when dirty-set verification fails; None when allowed."""
+    from config_loader import get_workspace_profiles
     from workspace_policy_runtime import (
         canonical_policy_from_queue_context,
+        enrich_policy_for_dirty_verification,
         external_cwd_enabled_for_mode,
-        verify_dirty_set,
+        git_head_at_cwd,
+        verify_dirty_set_with_diagnostics,
         verify_session_workspace_policy,
     )
 
@@ -1039,6 +1042,9 @@ def _workspace_dirty_blocker(
     if not policy:
         return None
 
+    profiles = get_workspace_profiles(config or {})
+    policy = enrich_policy_for_dirty_verification(policy, profiles=profiles) or policy
+
     mode = policy.get("mode")
     if not external_cwd_enabled_for_mode(config, mode):
         return None
@@ -1049,9 +1055,13 @@ def _workspace_dirty_blocker(
     if when == "post" and not enforcement.get("post_turn_diff_check"):
         return None
 
-    dirty = verify_dirty_set(
+    dirty = verify_dirty_set_with_diagnostics(
         porcelain_output=_git_porcelain_at_cwd(effective_cwd),
         policy=policy,
+        profiles=profiles,
+        git_commit=git_head_at_cwd(effective_cwd),
+        guard_source=f"wrapper.{when}_turn_dirty_guard",
+        policy_source="canonical_session_policy",
     )
     if dirty.ok:
         return None
