@@ -18,8 +18,17 @@ from coordinator_loop import (
 )
 from report_orchestration import (
     DEFAULT_MAX_REPORT_PROMPT_CHARS,
+    HANDOFF_FOR_AGY_BEGIN,
+    HANDOFF_FOR_AGY_END,
+    HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+    HANDOFF_FOR_CODEX_REVIEWER_END,
+    HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
+    HANDOFF_FOR_DEVELOPER_CORRECTION_END,
+    HANDOFF_FOR_FINAL_BEGIN,
+    HANDOFF_FOR_FINAL_END,
     build_report_orchestrated_dispatch_prompt,
     build_report_orchestrated_final_attachment,
+    extract_handoff_block,
     ingest_worker_report_output,
     is_report_orchestrated_policy,
     is_twinpet_repo_path,
@@ -55,6 +64,94 @@ def _report_ready(path: str, status: str = "PASS") -> str:
         "Next recommended role:\ncoordinator\n\n"
         "Notes:\nnotes\n"
     )
+
+
+def _agy_handoff(text: str | None = None) -> str:
+    default = (
+        "Current UI structure: PaymentModal header, line items, tender controls. "
+        "Visual hierarchy concerns: primary CTA competes with discount row. "
+        "Cashier workflow: confirm step may be skipped under load. "
+        "Questions for AGY: is split-tender layout clear on 1366px?"
+    )
+    return (
+        f"{HANDOFF_FOR_AGY_BEGIN}\n"
+        f"{text or default}\n"
+        f"{HANDOFF_FOR_AGY_END}"
+    )
+
+
+def _codex_handoff(text: str | None = None) -> str:
+    default = (
+        "Payment data flow: PaymentModal -> useCheckout -> asyncCheckout payload. "
+        "Risks: double-submit on slow network, underpayment not blocked in UI. "
+        "UNKNOWN FROM SNAPSHOT: Firestore receipt write timing. "
+        "Review questions: are off-repo UI edits bounded to PaymentModal.css only?"
+    )
+    return (
+        f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN}\n"
+        f"{text or default}\n"
+        f"{HANDOFF_FOR_CODEX_REVIEWER_END}"
+    )
+
+
+def _correction_handoff(text: str | None = None) -> str:
+    default = (
+        "Add missing split-payment analysis, document async checkout race, "
+        "and clarify which behavior changes need Product Owner approval."
+    )
+    return (
+        f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN}\n"
+        f"{text or default}\n"
+        f"{HANDOFF_FOR_DEVELOPER_CORRECTION_END}"
+    )
+
+
+def _final_handoff(text: str = "PASS_WITH_NOTES — proceed to safety gate.") -> str:
+    return (
+        f"{HANDOFF_FOR_FINAL_BEGIN}\n"
+        f"{text}\n"
+        f"{HANDOFF_FOR_FINAL_END}"
+    )
+
+
+def _developer_report_body(
+    *,
+    main: str = "# Developer\nPaymentModal analysis",
+    agy: str | None = None,
+    codex: str | None = None,
+) -> str:
+    parts = [main, _agy_handoff(agy)]
+    parts.append(_codex_handoff(codex))
+    return "\n\n".join(parts)
+
+
+def _agy_report_body(
+    *,
+    main: str = "# AGY\nUX notes",
+    codex: str | None = None,
+    correction: str | None = None,
+) -> str:
+    default_codex = (
+        "AGY UX verdict: PASS_WITH_NOTES. Cashier ergonomics concern on tender keypad spacing. "
+        "Concerns for Codex: confirm CSS-only edits do not change checkout payload behavior. "
+        "Approval notes: responsive layout risks on 1366px need explicit guardrails."
+    )
+    parts = [main, _codex_handoff(codex or default_codex)]
+    if correction is not None:
+        parts.append(_correction_handoff(correction))
+    return "\n\n".join(parts)
+
+
+def _reviewer_report_body(
+    *,
+    main: str = "# Reviewer\nREQUEST changes",
+    correction: str | None = None,
+    final: str | None = None,
+) -> str:
+    parts = [main]
+    parts.append(_correction_handoff(correction))
+    parts.append(_final_handoff(final or "REQUEST_CHANGES pending developer correction."))
+    return "\n\n".join(parts)
 
 
 class ReportReadyParsingTests(unittest.TestCase):
@@ -166,7 +263,7 @@ class ReportReadAndIngestTests(unittest.TestCase):
         self.assertFalse(ingest.ok)
         self.assertIn("external report write failed", ingest.blocker)
 
-    def test_report_too_large_ingests_then_rewrite_at_dispatch(self):
+    def test_report_too_large_ingests_then_handoff_repair_at_dispatch(self):
         huge = Path(self.tmp) / "huge.md"
         huge.write_text("x" * 5000, encoding="utf-8")
         ingest = ingest_worker_report_output(
@@ -186,7 +283,7 @@ class ReportReadAndIngestTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
-        self.assertIn("too large for next-agent handoff", result.prompt)
+        self.assertIn("missing required coordinator handoff block", result.prompt)
         self.assertIn("Do not chunk", result.prompt)
         self.assertNotIn("COMPRESSED", result.prompt)
 
@@ -226,9 +323,9 @@ class ReportPromptConstructionTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.roots = [self.tmp]
         self.dev_path = Path(self.tmp) / "dev.md"
-        self.dev_path.write_text("# Dev\nPaymentModal analysis", encoding="utf-8")
+        self.dev_path.write_text(_developer_report_body(), encoding="utf-8")
         self.agy_path = Path(self.tmp) / "agy.md"
-        self.agy_path.write_text("# AGY\nUX notes", encoding="utf-8")
+        self.agy_path.write_text(_agy_report_body(), encoding="utf-8")
         dev_ingest = ingest_worker_report_output(
             "developer",
             _report_ready(str(self.dev_path)),
@@ -241,7 +338,7 @@ class ReportPromptConstructionTests(unittest.TestCase):
         )
         self.records = [dev_ingest.record.to_dict(), agy_ingest.record.to_dict()]
 
-    def test_agy_prompt_contains_developer_report(self):
+    def test_agy_prompt_uses_handoff_not_full_developer_report(self):
         result = build_report_orchestrated_dispatch_prompt(
             role="ui_lead",
             report_records=self.records,
@@ -251,13 +348,15 @@ class ReportPromptConstructionTests(unittest.TestCase):
             expected_output_path=str(Path(self.tmp) / "agy-out.md"),
             external_report_write_roots=self.roots,
         )
-        self.assertTrue(result.ok)
-        self.assertIn("REPORT CONTENT:", result.prompt)
-        self.assertIn("PaymentModal analysis", result.prompt)
+        self.assertTrue(result.ok, result.blocker)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR AGY:", result.prompt)
+        self.assertIn("Questions for AGY", result.prompt)
+        self.assertNotIn("REPORT CONTENT:", result.prompt)
+        self.assertNotIn("# Developer\nPaymentModal analysis", result.prompt)
         self.assertIn("TO: AGY UI Lead", result.prompt)
         self.assertIn("EXPECTED REPORT OUTPUT PATH", result.prompt)
 
-    def test_reviewer_prompt_contains_developer_and_agy(self):
+    def test_reviewer_prompt_uses_handoffs_not_full_reports(self):
         result = build_report_orchestrated_dispatch_prompt(
             role="reviewer",
             report_records=self.records,
@@ -267,9 +366,13 @@ class ReportPromptConstructionTests(unittest.TestCase):
             expected_output_path=str(Path(self.tmp) / "codex-out.md"),
             external_report_write_roots=self.roots,
         )
-        self.assertTrue(result.ok)
-        self.assertIn("PaymentModal analysis", result.prompt)
-        self.assertIn("UX notes", result.prompt)
+        self.assertTrue(result.ok, result.blocker)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR CODEX REVIEWER:", result.prompt)
+        self.assertIn("AGY COORDINATOR HANDOFF FOR CODEX REVIEWER:", result.prompt)
+        self.assertIn("AGY UX verdict", result.prompt)
+        self.assertNotIn("REPORT CONTENT:", result.prompt)
+        self.assertNotIn("# Developer\nPaymentModal analysis", result.prompt)
+        self.assertNotIn("# AGY\nUX notes", result.prompt)
         self.assertIn("TO: Codex Reviewer", result.prompt)
         self.assertIn("do not inspect repository files", result.prompt.lower())
         self.assertIn("REPORT_WRITE_FAILED", result.prompt)
@@ -285,9 +388,32 @@ class ReportPromptConstructionTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("missing developer analysis", result.blocker)
 
-    def test_oversize_developer_routes_rewrite_prompt(self):
+    def test_report_missing_handoff_routes_developer_repair(self):
+        bare = Path(self.tmp) / "bare.md"
+        bare.write_text("# Dev\nNo handoff blocks", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(bare)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            max_chars=1000,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "developer")
+        self.assertIn("REQUEST_CHANGES: report missing required coordinator handoff block", result.prompt)
+        self.assertIn(HANDOFF_FOR_AGY_BEGIN, result.prompt)
+        self.assertNotIn("REPORT CONTENT:", result.prompt)
+
+    def test_oversized_handoff_routes_handoff_rewrite(self):
+        big_handoff = "x" * 5000
         big = Path(self.tmp) / "big.md"
-        big.write_text("y" * 8000, encoding="utf-8")
+        big.write_text(_developer_report_body(agy=big_handoff), encoding="utf-8")
         ingest = ingest_worker_report_output(
             "developer",
             _report_ready(str(big)),
@@ -303,7 +429,7 @@ class ReportPromptConstructionTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "developer")
-        self.assertIn("Rewrite the report at the same path", result.prompt)
+        self.assertIn("handoff block is too large", result.prompt)
         self.assertIn("Do not chunk", result.prompt)
 
 
@@ -430,6 +556,24 @@ class InitialDeveloperPromptTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertIn("REPORT_READY", result.prompt)
         self.assertIn("REPORT_WRITE_FAILED", result.prompt)
+        self.assertIn(HANDOFF_FOR_AGY_BEGIN, result.prompt)
+        self.assertIn(HANDOFF_FOR_CODEX_REVIEWER_BEGIN, result.prompt)
+
+    def test_initial_developer_requires_handoff_blocks(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("REQUIRED HANDOFF BLOCKS IN YOUR REPORT", result.prompt)
+        self.assertIn("UNKNOWN FROM SNAPSHOT", result.prompt)
 
     def test_missing_snapshots_blocks_with_clear_diagnostic(self):
         policy = dict(self.policy)
@@ -451,11 +595,11 @@ class InitialDeveloperPromptTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(blocker, "BLOCKER: developer initial prompt missing prompt memo")
 
-    def test_developer_correction_still_works(self):
+    def test_developer_correction_uses_handoff_not_full_reports(self):
         rev_path = Path(self.tmp) / "rev.md"
-        rev_path.write_text("# Reviewer\nREQUEST changes", encoding="utf-8")
+        rev_path.write_text(_reviewer_report_body(), encoding="utf-8")
         dev_path = Path(self.tmp) / "prior-dev.md"
-        dev_path.write_text("# Dev\nPrior analysis", encoding="utf-8")
+        dev_path.write_text(_developer_report_body(main="# Dev\nPrior analysis"), encoding="utf-8")
         correction_roots = [self.tmp]
         rev_ingest = ingest_worker_report_output(
             "reviewer",
@@ -482,8 +626,10 @@ class InitialDeveloperPromptTests(unittest.TestCase):
         )
         self.assertTrue(result.ok, result.blocker)
         self.assertIn("Report correction", result.prompt)
-        self.assertIn("REQUEST changes", result.prompt)
-        self.assertIn("Prior analysis", result.prompt)
+        self.assertIn("CODEX REVIEWER CORRECTION HANDOFF", result.prompt)
+        self.assertIn("split-payment analysis", result.prompt)
+        self.assertNotIn("REPORT CONTENT:", result.prompt)
+        self.assertNotIn("# Dev\nPrior analysis", result.prompt)
 
 
 class ReportOrchestrationCoordinatorLoopTests(unittest.TestCase):
@@ -491,7 +637,7 @@ class ReportOrchestrationCoordinatorLoopTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.roots = [self.tmp]
         self.dev_path = Path(self.tmp) / "dev.md"
-        self.dev_path.write_text("# Dev\nPaymentModal", encoding="utf-8")
+        self.dev_path.write_text(_developer_report_body(main="# Dev\nPaymentModal"), encoding="utf-8")
 
     def test_developer_report_ready_routes_coordinator(self):
         state, _ = on_session_start(
@@ -548,9 +694,9 @@ class ReportOrchestrationRoutingTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.roots = [self.tmp]
         self.dev = Path(self.tmp) / "dev.md"
-        self.dev.write_text("# Dev\nPaymentModal", encoding="utf-8")
+        self.dev.write_text(_developer_report_body(main="# Dev\nPaymentModal"), encoding="utf-8")
         self.rev = Path(self.tmp) / "rev.md"
-        self.rev.write_text("# Reviewer\nREQUEST changes to blueprint", encoding="utf-8")
+        self.rev.write_text(_reviewer_report_body(main="# Reviewer\nREQUEST changes to blueprint"), encoding="utf-8")
 
     def test_request_changes_routes_back_with_reviewer_report(self):
         state, _ = on_session_start(
@@ -567,7 +713,7 @@ class ReportOrchestrationRoutingTests(unittest.TestCase):
         on_worker_output(state, "developer", _report_ready(str(self.dev)), worker_context=ctx)
         on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
         agy = Path(self.tmp) / "agy.md"
-        agy.write_text("# AGY\nok", encoding="utf-8")
+        agy.write_text(_agy_report_body(main="# AGY\nok"), encoding="utf-8")
         on_worker_output(state, "ui_lead", _report_ready(str(agy)), worker_context=ctx)
         on_coordinator_output(state, "NEXT: reviewer\nReview.")
         on_worker_output(
@@ -599,9 +745,18 @@ class AgyOnlyCorrectionTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.roots = [self.tmp]
         self.dev_path = Path(self.tmp) / "dev.md"
-        self.dev_path.write_text("# Dev\nPrior analysis", encoding="utf-8")
+        self.dev_path.write_text(_developer_report_body(main="# Dev\nPrior analysis"), encoding="utf-8")
         self.agy_path = Path(self.tmp) / "agy.md"
-        self.agy_path.write_text("# AGY\nREQUEST UX changes", encoding="utf-8")
+        self.agy_path.write_text(
+            _agy_report_body(
+                main="# AGY\nREQUEST UX changes",
+                correction=(
+                    "Improve visual hierarchy on PaymentModal header and clarify "
+                    "keyboard focus order for cashier speed."
+                ),
+            ),
+            encoding="utf-8",
+        )
         self.policy = _analysis_policy()
         self.memo = "Prompt memo for AGY correction path."
 
@@ -638,8 +793,9 @@ class AgyOnlyCorrectionTests(unittest.TestCase):
         )
         self.assertTrue(result.ok, result.blocker)
         self.assertIn("Report correction from UI Lead review", result.prompt)
-        self.assertIn("REQUEST UX changes", result.prompt)
-        self.assertIn("Prior analysis", result.prompt)
+        self.assertIn("AGY CORRECTION HANDOFF", result.prompt)
+        self.assertIn("visual hierarchy", result.prompt)
+        self.assertNotIn("REPORT CONTENT:", result.prompt)
         self.assertNotIn("no report-orchestrated prompt available", result.blocker)
 
     def test_after_agy_correction_routes_ui_lead_recheck(self):
@@ -674,11 +830,14 @@ class OversizedReportRewriteTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.roots = [self.tmp]
 
-    def test_oversized_agy_routes_ui_lead_rewrite(self):
+    def test_oversized_agy_handoff_routes_ui_lead_rewrite(self):
         dev = Path(self.tmp) / "dev.md"
-        dev.write_text("d" * 200, encoding="utf-8")
+        dev.write_text(_developer_report_body(), encoding="utf-8")
         agy = Path(self.tmp) / "agy.md"
-        agy.write_text("a" * 5000, encoding="utf-8")
+        agy.write_text(
+            _agy_report_body(codex="a" * 5000),
+            encoding="utf-8",
+        )
         dev_ingest = ingest_worker_report_output(
             "developer", _report_ready(str(dev)), allowed_roots=self.roots,
         )
@@ -695,15 +854,18 @@ class OversizedReportRewriteTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "ui_lead")
-        self.assertIn("too large for next-agent handoff", result.prompt)
+        self.assertIn("handoff block is too large", result.prompt)
 
-    def test_oversized_reviewer_routes_reviewer_rewrite_on_correction(self):
+    def test_oversized_reviewer_correction_handoff_routes_reviewer_rewrite(self):
         rev = Path(self.tmp) / "rev.md"
-        rev.write_text("r" * 5000, encoding="utf-8")
+        rev.write_text(
+            _reviewer_report_body(correction="r" * 5000),
+            encoding="utf-8",
+        )
         dev = Path(self.tmp) / "dev.md"
-        dev.write_text("# dev", encoding="utf-8")
+        dev.write_text(_developer_report_body(), encoding="utf-8")
         rev_ingest = ingest_worker_report_output(
-            "reviewer", _report_ready(str(rev)), allowed_roots=self.roots,
+            "reviewer", _report_ready(str(rev), status="REQUEST_CHANGES"), allowed_roots=self.roots,
         )
         dev_ingest = ingest_worker_report_output(
             "developer", _report_ready(str(dev)), allowed_roots=self.roots,
@@ -720,7 +882,7 @@ class OversizedReportRewriteTests(unittest.TestCase):
         )
         self.assertTrue(result.ok)
         self.assertEqual(result.dispatch_role, "reviewer")
-        self.assertIn("Rewrite the report at the same path", result.prompt)
+        self.assertIn("handoff block is too large", result.prompt)
 
 
 class FinalReportAttachmentTests(unittest.TestCase):
@@ -754,6 +916,21 @@ class FinalReportAttachmentTests(unittest.TestCase):
         self.assertIn("NONE", body)
         self.assertIn("Twinpet source modified:", body)
         self.assertIn("NO", body)
+
+    def test_final_attachment_includes_final_handoff_not_full_report(self):
+        rev = Path(self.tmp) / "rev.md"
+        rev.write_text(_reviewer_report_body(final="PASS_WITH_NOTES for safety gate."), encoding="utf-8")
+        records = []
+        for role, path in (("developer", self.dev), ("reviewer", rev)):
+            ingest = ingest_worker_report_output(
+                role, _report_ready(str(path)), allowed_roots=self.roots,
+            )
+            records.append(ingest.record.to_dict())
+        attachment = build_report_orchestrated_final_attachment(records)
+        self.assertIn(str(self.dev), attachment)
+        self.assertIn("FINAL HANDOFF", attachment)
+        self.assertIn("PASS_WITH_NOTES for safety gate", attachment)
+        self.assertNotIn("# Reviewer", attachment)
 
     def test_final_attachment_without_channel_history(self):
         records = []
@@ -797,6 +974,39 @@ class ReportWriteBridgeCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(state.report_records), 1)
 
 
+class ReportHandoffExtractionTests(unittest.TestCase):
+    def test_extract_handoff_block(self):
+        body = _developer_report_body()
+        agy = extract_handoff_block(body, HANDOFF_FOR_AGY_BEGIN, HANDOFF_FOR_AGY_END)
+        self.assertIsNotNone(agy)
+        assert agy is not None
+        self.assertIn("Questions for AGY", agy)
+
+    def test_missing_codex_handoff_routes_developer_on_reviewer_dispatch(self):
+        tmp = tempfile.mkdtemp()
+        roots = [tmp]
+        dev = Path(tmp) / "dev.md"
+        dev.write_text(_developer_report_body(codex=""), encoding="utf-8")
+        # empty codex handoff between markers still present but insufficient
+        dev.write_text(
+            f"# Dev\n{_agy_handoff()}\n\n{HANDOFF_FOR_CODEX_REVIEWER_BEGIN}\nshort\n{HANDOFF_FOR_CODEX_REVIEWER_END}",
+            encoding="utf-8",
+        )
+        ingest = ingest_worker_report_output(
+            "developer", _report_ready(str(dev)), allowed_roots=roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="reviewer",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="review",
+            subject="review",
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "developer")
+        self.assertIn(HANDOFF_FOR_CODEX_REVIEWER_BEGIN, result.prompt)
+
+
 class ReportOrchestrationE2EFlowTests(unittest.TestCase):
     """End-to-end report-flow: dev → AGY → reviewer → correction → re-check → safety → FINAL."""
 
@@ -811,10 +1021,13 @@ class ReportOrchestrationE2EFlowTests(unittest.TestCase):
         self.rev2 = Path(self.tmp) / "rev-pass.md"
 
     def _write_reports(self):
-        self.dev.write_text("# Developer\nPaymentModal analysis", encoding="utf-8")
-        self.agy.write_text("# AGY\nUX review notes", encoding="utf-8")
-        self.rev.write_text("# Reviewer\nREQUEST changes to blueprint", encoding="utf-8")
-        self.rev2.write_text("# Reviewer\nPASS on re-check", encoding="utf-8")
+        self.dev.write_text(_developer_report_body(), encoding="utf-8")
+        self.agy.write_text(_agy_report_body(), encoding="utf-8")
+        self.rev.write_text(_reviewer_report_body(main="# Reviewer\nREQUEST changes to blueprint"), encoding="utf-8")
+        self.rev2.write_text(
+            _reviewer_report_body(main="# Reviewer\nPASS on re-check", final="PASS for safety gate."),
+            encoding="utf-8",
+        )
 
     def test_full_report_flow_role_path(self):
         self._write_reports()
@@ -860,7 +1073,10 @@ class ReportOrchestrationE2EFlowTests(unittest.TestCase):
             external_report_write_roots=self.roots,
         )
         self.assertTrue(ui_prompt.ok)
-        self.assertIn("PaymentModal analysis", ui_prompt.prompt)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR AGY:", ui_prompt.prompt)
+        self.assertIn("Questions for AGY", ui_prompt.prompt)
+        self.assertNotIn("REPORT CONTENT:", ui_prompt.prompt)
+        self.assertLess(len(ui_prompt.prompt), 20000)
 
         on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
         on_worker_output(
@@ -878,9 +1094,14 @@ class ReportOrchestrationE2EFlowTests(unittest.TestCase):
             external_report_write_roots=self.roots,
         )
         self.assertTrue(rev_prompt.ok)
-        self.assertIn("PaymentModal analysis", rev_prompt.prompt)
-        self.assertIn("UX review notes", rev_prompt.prompt)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR CODEX REVIEWER:", rev_prompt.prompt)
+        self.assertIn("AGY COORDINATOR HANDOFF FOR CODEX REVIEWER:", rev_prompt.prompt)
+        self.assertNotIn("REPORT CONTENT:", rev_prompt.prompt)
+        self.assertNotIn("# Developer", rev_prompt.prompt)
+        self.assertNotIn("# AGY", rev_prompt.prompt)
         self.assertIn("do not inspect repository files", rev_prompt.prompt.lower())
+        combined = ui_prompt.prompt + rev_prompt.prompt
+        self.assertLess(len(combined), 40000)
 
         on_coordinator_output(state, "NEXT: reviewer\nReview.")
         on_worker_output(
@@ -907,8 +1128,9 @@ class ReportOrchestrationE2EFlowTests(unittest.TestCase):
         )
         self.assertTrue(corr_prompt.ok, corr_prompt.blocker)
         self.assertIn("Report correction", corr_prompt.prompt)
-        self.assertIn("REQUEST changes", corr_prompt.prompt)
-        self.assertIn("PaymentModal analysis", corr_prompt.prompt)
+        self.assertIn("CODEX REVIEWER CORRECTION HANDOFF", corr_prompt.prompt)
+        self.assertNotIn("REPORT CONTENT:", corr_prompt.prompt)
+        self.assertNotIn("# Developer", corr_prompt.prompt)
 
         on_coordinator_output(state, "NEXT: developer\nCorrect.")
         on_worker_output(

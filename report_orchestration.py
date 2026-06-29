@@ -1,7 +1,8 @@
 """Report-orchestrated coordinator flow — reports as source of truth.
 
 Workers emit short REPORT_READY status + path (or REPORT_BEGIN/END for inline save).
-Coordinator reads allowed .md reports and builds next-agent prompts from file content.
+Coordinator reads full report files internally, then builds next-agent prompts from
+bounded COORDINATOR_HANDOFF_* blocks — not accumulated full report content.
 No chunking or silent truncation in this phase.
 """
 
@@ -26,6 +27,17 @@ DEFAULT_ALLOWED_REPORT_ROOTS: tuple[str, ...] = (
 )
 
 DEFAULT_MAX_REPORT_PROMPT_CHARS = 120_000
+DEFAULT_MAX_HANDOFF_CHARS = 12_000
+MIN_HANDOFF_CHARS = 80
+
+HANDOFF_FOR_AGY_BEGIN = "COORDINATOR_HANDOFF_FOR_AGY_BEGIN"
+HANDOFF_FOR_AGY_END = "COORDINATOR_HANDOFF_FOR_AGY_END"
+HANDOFF_FOR_CODEX_REVIEWER_BEGIN = "COORDINATOR_HANDOFF_FOR_CODEX_REVIEWER_BEGIN"
+HANDOFF_FOR_CODEX_REVIEWER_END = "COORDINATOR_HANDOFF_FOR_CODEX_REVIEWER_END"
+HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN = "COORDINATOR_HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN"
+HANDOFF_FOR_DEVELOPER_CORRECTION_END = "COORDINATOR_HANDOFF_FOR_DEVELOPER_CORRECTION_END"
+HANDOFF_FOR_FINAL_BEGIN = "COORDINATOR_HANDOFF_FOR_FINAL_BEGIN"
+HANDOFF_FOR_FINAL_END = "COORDINATOR_HANDOFF_FOR_FINAL_END"
 
 _TWINPET_REPO_MARKERS = (
     r"twinpet-pos\src",
@@ -324,6 +336,126 @@ def report_content_fits_prompt(content: str, max_chars: int) -> tuple[bool, int]
     return total <= max_chars, total
 
 
+def extract_handoff_block(content: str, begin_marker: str, end_marker: str) -> str | None:
+    """Extract bounded coordinator handoff section from a full report."""
+    if not content:
+        return None
+    pattern = re.compile(
+        rf"^\s*{re.escape(begin_marker)}\s*$\s*(.*?)^\s*{re.escape(end_marker)}\s*$",
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
+    )
+    match = pattern.search(content)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def is_handoff_sufficient(handoff: str | None, *, min_chars: int = MIN_HANDOFF_CHARS) -> bool:
+    """True when handoff block is present and bounded-complete for dispatch."""
+    if handoff is None:
+        return False
+    stripped = handoff.strip()
+    if not stripped:
+        return False
+    if stripped.upper() == "NONE":
+        return True
+    return len(stripped) >= min_chars
+
+
+def handoff_fits_prompt(handoff: str, max_chars: int) -> tuple[bool, int]:
+    total = len(handoff or "")
+    return total <= max_chars, total
+
+
+def build_handoff_repair_prompt(
+    *,
+    owner_role: str,
+    report_path: str,
+    missing_block: str,
+    reason: str = "",
+    expected_output_path: str = "",
+) -> str:
+    """Ask report owner to add or repair a required handoff block."""
+    role_label = _REPORT_OWNER_ROLE_LABELS.get(owner_role, owner_role)
+    target_path = expected_output_path or report_path
+    detail = reason.strip() or f"Required block missing or insufficient: {missing_block}"
+    return (
+        f"TO: {role_label}\n"
+        "FROM: agentchattr Coordinator\n"
+        f"ROLE: {role_label}\n"
+        "MODE: Report handoff repair\n\n"
+        "REQUEST_CHANGES: report missing required coordinator handoff block.\n"
+        f"{detail}\n"
+        f"Report path: {report_path}\n\n"
+        "Update the report at the same path.\n"
+        "Add or expand the required handoff block; keep the full report as source of truth.\n"
+        "Do not omit required findings in the main report body.\n"
+        "Do not chunk.\n"
+        "Do not rely on prior chat context.\n"
+        "Return REPORT_READY after writing the revised report.\n\n"
+        f"REQUIRED HANDOFF BLOCK:\n{missing_block}\n\n"
+        f"EXPECTED REPORT OUTPUT PATH:\n{target_path}\n"
+    )
+
+
+def build_handoff_repair_result(
+    *,
+    owner_role: str,
+    report_path: str,
+    missing_block: str,
+    reason: str = "",
+    expected_output_path: str = "",
+) -> ReportPromptResult:
+    """Route back to report owner to repair a missing/insufficient handoff block."""
+    path = expected_output_path or report_path
+    return ReportPromptResult(
+        ok=True,
+        prompt=build_handoff_repair_prompt(
+            owner_role=owner_role,
+            report_path=report_path,
+            missing_block=missing_block,
+            reason=reason,
+            expected_output_path=path,
+        ),
+        dispatch_role=owner_role,
+    )
+
+
+def build_oversized_handoff_rewrite_result(
+    *,
+    owner_role: str,
+    report_path: str,
+    handoff_block: str,
+    handoff_chars: int,
+    max_chars: int,
+    expected_output_path: str = "",
+) -> ReportPromptResult:
+    """Route report owner to shrink an oversized handoff block (not the full report)."""
+    role_label = _REPORT_OWNER_ROLE_LABELS.get(owner_role, owner_role)
+    target_path = expected_output_path or report_path
+    return ReportPromptResult(
+        ok=True,
+        prompt=(
+            f"TO: {role_label}\n"
+            "FROM: agentchattr Coordinator\n"
+            f"ROLE: {role_label}\n"
+            "MODE: Report handoff rewrite\n\n"
+            "Your coordinator handoff block is too large for next-agent dispatch.\n"
+            f"Handoff size: {handoff_chars} chars (max {max_chars}).\n"
+            f"Report path: {report_path}\n"
+            f"Oversized block: {handoff_block}\n\n"
+            "Rewrite only the handoff block at the same report path.\n"
+            "Keep it bounded but complete for the target role.\n"
+            "Include UNKNOWN FROM SNAPSHOT items where applicable.\n"
+            "Do not chunk.\n"
+            "Do not rely on prior chat context.\n"
+            "Return REPORT_READY after writing the revised report.\n\n"
+            f"EXPECTED REPORT OUTPUT PATH:\n{target_path}\n"
+        ),
+        dispatch_role=owner_role,
+    )
+
+
 def ingest_worker_report_output(
     role: str,
     text: str,
@@ -476,7 +608,7 @@ def build_oversized_report_rewrite_result(
 def build_report_orchestrated_final_attachment(
     report_records: list[dict[str, Any]],
 ) -> str:
-    """Build FINAL footer with report paths and hashes from report_records."""
+    """Build FINAL footer with report paths, hashes, and reviewer final handoff."""
     dev = get_report_for_role(report_records, "developer")
     agy = get_report_for_role(report_records, "ui_lead")
     reviewer = get_report_for_role(report_records, "reviewer")
@@ -504,6 +636,20 @@ def build_report_orchestrated_final_attachment(
             lines.append(f"  {label}: {record.sha256}")
         else:
             lines.append(f"  {label}: NONE")
+    if reviewer:
+        ok, rev_content, _ = load_report_content(reviewer)
+        if ok:
+            final_handoff = extract_handoff_block(
+                rev_content, HANDOFF_FOR_FINAL_BEGIN, HANDOFF_FOR_FINAL_END,
+            )
+            if final_handoff:
+                lines.extend([
+                    "",
+                    "FINAL HANDOFF (from Codex reviewer report):",
+                    "---",
+                    final_handoff,
+                    "---",
+                ])
     lines.extend([
         "",
         "Files changed inside Twinpet repo:",
@@ -515,44 +661,38 @@ def build_report_orchestrated_final_attachment(
     return "\n".join(lines)
 
 
-def build_report_review_prompt(
-    *,
-    target_role: str,
-    role_label: str,
-    mode: str,
-    project: str,
-    phase: str,
-    subject: str,
-    task: str,
-    source_reports: list[tuple[ReportRecord, str]],
-    instruction: str = "",
-    from_source: str = "agentchattr Coordinator",
-    expected_output_path: str = "",
-    external_report_write_roots: list[str] | None = None,
-) -> ReportPromptResult:
-    """Build next-agent prompt from loaded report file content."""
+def _report_metadata_lines(record: ReportRecord) -> list[str]:
+    return [
+        "SOURCE REPORT METADATA:",
+        f"Path: {record.path}",
+        f"SHA256: {record.sha256}",
+        f"Size: {record.size_bytes} bytes",
+        f"Produced by: {record.role}",
+        f"Status: {record.status}",
+    ]
+
+
+def _handoff_section_lines(label: str, handoff: str) -> list[str]:
+    return [
+        "",
+        label,
+        "---",
+        handoff,
+        "---",
+    ]
+
+
+def _report_write_contract_lines(
+    expected_output_path: str,
+    external_report_write_roots: list[str] | None,
+) -> list[str]:
     lines = [
-        f"TO: {role_label}",
-        f"FROM: {from_source}",
-        f"ROLE: {role_label}",
-        f"MODE: {mode}",
-        f"PROJECT: {project}",
-        f"PHASE: {phase}",
-        f"SUBJECT: {subject}",
-        "",
-        "TASK:",
-        task,
-        "",
-        "RULES:",
-        "- Review the report content supplied below only.",
-        "- Do not inspect repository files.",
-        "- Do not run shell.",
-        "- Do not request direct file access.",
         "- You are allowed to write markdown report files only under the configured external Ai-Report report paths.",
         "- You are not allowed to write inside the Twinpet workspace.",
         "- Create the report folder if missing.",
         "- Write your report to the exact expected path.",
         "- Return REPORT_READY with Status, Report path, and Summary when complete.",
+        "- Include required COORDINATOR_HANDOFF_* blocks in your report (see OUTPUT CONTRACT).",
     ]
     roots = list(external_report_write_roots or [])
     if roots:
@@ -575,24 +715,52 @@ def build_report_review_prompt(
         "Status:",
         "FAIL",
     ])
+    return lines
+
+
+def build_handoff_dispatch_prompt(
+    *,
+    target_role: str,
+    role_label: str,
+    mode: str,
+    project: str,
+    phase: str,
+    subject: str,
+    task: str,
+    source_handoffs: list[tuple[ReportRecord, str, str]],
+    instruction: str = "",
+    from_source: str = "agentchattr Coordinator",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
+    output_handoff_instructions: str = "",
+) -> ReportPromptResult:
+    """Build next-agent prompt from report metadata + bounded handoff blocks only."""
+    lines = [
+        f"TO: {role_label}",
+        f"FROM: {from_source}",
+        f"ROLE: {role_label}",
+        f"MODE: {mode}",
+        f"PROJECT: {project}",
+        f"PHASE: {phase}",
+        f"SUBJECT: {subject}",
+        "",
+        "TASK:",
+        task,
+        "",
+        "RULES:",
+        "- Review only the coordinator handoff brief(s) supplied below.",
+        "- Full prior reports are on disk; paths and hashes are listed for reference.",
+        "- Do not inspect repository files.",
+        "- Do not run shell.",
+        "- Do not request direct file access.",
+    ]
+    lines.extend(_report_write_contract_lines(expected_output_path, external_report_write_roots))
     if instruction.strip():
         lines.extend(["", "COORDINATOR INSTRUCTION:", instruction.strip()[:2000]])
 
-    for record, content in source_reports:
-        lines.extend([
-            "",
-            "SOURCE REPORT:",
-            f"Path: {record.path}",
-            f"SHA256: {record.sha256}",
-            f"Size: {record.size_bytes} bytes",
-            f"Produced by: {record.role}",
-            f"Status: {record.status}",
-            "",
-            "REPORT CONTENT:",
-            "---",
-            content,
-            "---",
-        ])
+    for record, handoff_label, handoff in source_handoffs:
+        lines.extend(_report_metadata_lines(record))
+        lines.extend(_handoff_section_lines(handoff_label, handoff))
 
     lines.extend([
         "",
@@ -608,7 +776,49 @@ def build_report_review_prompt(
         "Summary:",
         "  <short summary>",
     ])
+    if output_handoff_instructions.strip():
+        lines.extend(["", "REQUIRED HANDOFF BLOCKS IN YOUR REPORT:", output_handoff_instructions.strip()])
     return ReportPromptResult(ok=True, prompt="\n".join(lines))
+
+
+def build_report_review_prompt(
+    *,
+    target_role: str,
+    role_label: str,
+    mode: str,
+    project: str,
+    phase: str,
+    subject: str,
+    task: str,
+    source_reports: list[tuple[ReportRecord, str]],
+    instruction: str = "",
+    from_source: str = "agentchattr Coordinator",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
+    handoff_labels: list[str] | None = None,
+    output_handoff_instructions: str = "",
+) -> ReportPromptResult:
+    """Build next-agent prompt from report metadata and handoff blocks (not full reports)."""
+    labels = handoff_labels or ["COORDINATOR HANDOFF BRIEF:"] * len(source_reports)
+    source_handoffs = [
+        (record, label, content)
+        for (record, content), label in zip(source_reports, labels, strict=False)
+    ]
+    return build_handoff_dispatch_prompt(
+        target_role=target_role,
+        role_label=role_label,
+        mode=mode,
+        project=project,
+        phase=phase,
+        subject=subject,
+        task=task,
+        source_handoffs=source_handoffs,
+        instruction=instruction,
+        from_source=from_source,
+        expected_output_path=expected_output_path,
+        external_report_write_roots=external_report_write_roots,
+        output_handoff_instructions=output_handoff_instructions,
+    )
 
 
 def build_reviewer_report_prompt(
@@ -617,16 +827,18 @@ def build_reviewer_report_prompt(
     phase: str,
     subject: str,
     developer_record: ReportRecord,
-    developer_content: str,
+    developer_handoff: str,
     agy_record: ReportRecord | None = None,
-    agy_content: str = "",
+    agy_handoff: str = "",
     instruction: str = "",
     expected_output_path: str = "",
     external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
-    sources: list[tuple[ReportRecord, str]] = [(developer_record, developer_content)]
-    if agy_record and agy_content:
-        sources.append((agy_record, agy_content))
+    sources: list[tuple[ReportRecord, str]] = [(developer_record, developer_handoff)]
+    labels = ["DEVELOPER COORDINATOR HANDOFF FOR CODEX REVIEWER:"]
+    if agy_record and agy_handoff:
+        sources.append((agy_record, agy_handoff))
+        labels.append("AGY COORDINATOR HANDOFF FOR CODEX REVIEWER:")
     return build_report_review_prompt(
         target_role="reviewer",
         role_label="Codex Reviewer",
@@ -635,14 +847,25 @@ def build_reviewer_report_prompt(
         phase=phase,
         subject=subject,
         task=(
-            "Review the developer report and AGY UX report (if supplied).\n"
+            "Review using the developer and AGY coordinator handoff briefs below.\n"
             "Return PASS, PASS_WITH_NOTES, REQUEST_CHANGES, or FAIL.\n"
-            "Save your review report to an allowed external .md path."
+            "Save your review report to an allowed external .md path.\n"
+            "Include COORDINATOR_HANDOFF_FOR_DEVELOPER_CORRECTION and "
+            "COORDINATOR_HANDOFF_FOR_FINAL blocks in your report."
         ),
         source_reports=sources,
+        handoff_labels=labels,
         instruction=instruction,
         expected_output_path=expected_output_path,
         external_report_write_roots=external_report_write_roots,
+        output_handoff_instructions=(
+            f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN}\n"
+            "<exact requested changes for developer if REQUEST_CHANGES; otherwise NONE>\n"
+            f"{HANDOFF_FOR_DEVELOPER_CORRECTION_END}\n\n"
+            f"{HANDOFF_FOR_FINAL_BEGIN}\n"
+            "<final verdict summary and next gate recommendation>\n"
+            f"{HANDOFF_FOR_FINAL_END}"
+        ),
     )
 
 
@@ -652,7 +875,7 @@ def build_ui_lead_report_prompt(
     phase: str,
     subject: str,
     developer_record: ReportRecord,
-    developer_content: str,
+    developer_handoff: str,
     instruction: str = "",
     expected_output_path: str = "",
     external_report_write_roots: list[str] | None = None,
@@ -665,15 +888,25 @@ def build_ui_lead_report_prompt(
         phase=phase,
         subject=subject,
         task=(
-            "Review the supplied developer report from a UI/UX and cashier workflow perspective.\n"
+            "Review the developer coordinator handoff brief from a UI/UX and cashier workflow perspective.\n"
             "Focus on UI/UX, cashier ergonomics, visual hierarchy, responsiveness, "
             "and implementation boundaries.\n"
             "Produce your own markdown UX review report."
         ),
-        source_reports=[(developer_record, developer_content)],
+        source_reports=[(developer_record, developer_handoff)],
+        handoff_labels=["DEVELOPER COORDINATOR HANDOFF FOR AGY:"],
         instruction=instruction,
         expected_output_path=expected_output_path,
         external_report_write_roots=external_report_write_roots,
+        output_handoff_instructions=(
+            f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN}\n"
+            "<AGY verdict, UX risks, concerns Codex should consider, approval notes>\n"
+            f"{HANDOFF_FOR_CODEX_REVIEWER_END}\n\n"
+            "If Status is REQUEST_CHANGES, also include:\n"
+            f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN}\n"
+            "<exact UX changes requested for developer>\n"
+            f"{HANDOFF_FOR_DEVELOPER_CORRECTION_END}"
+        ),
     )
 
 
@@ -815,6 +1048,26 @@ def build_initial_developer_report_prompt(
         "",
         "Return REPORT_READY only after the report exists on disk.",
         "",
+        "REQUIRED HANDOFF BLOCKS IN YOUR REPORT:",
+        f"{HANDOFF_FOR_AGY_BEGIN}",
+        "<UI/UX-relevant summary, cashier workflow risks, visual/layout concerns, exact questions for AGY>",
+        f"{HANDOFF_FOR_AGY_END}",
+        "",
+        f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN}",
+        "<technical evidence for Codex review: data flow, payment payload, risks, unknowns, boundaries, review questions>",
+        f"{HANDOFF_FOR_CODEX_REVIEWER_END}",
+        "",
+        "AGY handoff must include: current UI structure, visual hierarchy concerns, cashier workflow concerns,",
+        "responsive/layout risks, keyboard/focus concerns, UI-only vs behavior-change boundary, questions for AGY.",
+        "",
+        "Codex reviewer handoff must include: payment data flow summary, real function/prop/state names,",
+        "payload sent to checkout/parent, underpayment/overpayment behavior, split/non-cash behavior if present,",
+        "confirm/async/double-submit risks, Firestore/receipt/stock implications if known,",
+        "UNKNOWN FROM SNAPSHOT items, behavior changes requiring Product Owner approval,",
+        "exact files allowed/off-limits for future UI work.",
+        "",
+        "If a required item is unknown, state: UNKNOWN FROM SNAPSHOT: <exact missing item>",
+        "",
         "REPORT_FILE_WRITE_BEGIN/END FORMAT:",
         "  REPORT_FILE_WRITE_BEGIN",
         "  Path: <absolute .md under allowed Ai-Report roots>",
@@ -826,6 +1079,43 @@ def build_initial_developer_report_prompt(
         "  REPORT_FILE_WRITE_END",
     ])
     return ReportPromptResult(ok=True, prompt="\n".join(lines))
+
+
+def _handoff_max_chars(max_chars: int) -> int:
+    return min(max_chars, DEFAULT_MAX_HANDOFF_CHARS)
+
+
+def _validate_handoff_for_dispatch(
+    handoff: str | None,
+    *,
+    owner_role: str,
+    report_path: str,
+    block_name: str,
+    max_chars: int,
+    expected_output_path: str = "",
+) -> ReportPromptResult | str:
+    """Return repair/rewrite result, or handoff text when valid."""
+    if not is_handoff_sufficient(handoff):
+        return build_handoff_repair_result(
+            owner_role=owner_role,
+            report_path=report_path,
+            missing_block=block_name,
+            reason=f"REQUEST_CHANGES: report missing {block_name}",
+            expected_output_path=expected_output_path,
+        )
+    assert handoff is not None
+    limit = _handoff_max_chars(max_chars)
+    fits, total = handoff_fits_prompt(handoff, limit)
+    if not fits:
+        return build_oversized_handoff_rewrite_result(
+            owner_role=owner_role,
+            report_path=report_path,
+            handoff_block=block_name,
+            handoff_chars=total,
+            max_chars=limit,
+            expected_output_path=expected_output_path,
+        )
+    return handoff
 
 
 def build_report_orchestrated_dispatch_prompt(
@@ -882,24 +1172,28 @@ def build_report_orchestrated_dispatch_prompt(
                 ok=False,
                 blocker="BLOCKER: reviewer context missing developer analysis",
             )
-        ok, content, _ = load_report_content(dev)
+        ok, dev_content, _ = load_report_content(dev)
         if not ok:
-            return ReportPromptResult(ok=False, blocker=content)
-        fits, total = report_content_fits_prompt(content, max_chars)
-        if not fits:
-            return build_oversized_report_rewrite_result(
-                owner_role="developer",
-                report_path=dev.path,
-                report_chars=total,
-                max_chars=max_chars,
-                expected_output_path=dev.path,
-            )
+            return ReportPromptResult(ok=False, blocker=dev_content)
+        agy_handoff = extract_handoff_block(
+            dev_content, HANDOFF_FOR_AGY_BEGIN, HANDOFF_FOR_AGY_END,
+        )
+        validated = _validate_handoff_for_dispatch(
+            agy_handoff,
+            owner_role="developer",
+            report_path=dev.path,
+            block_name=f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}",
+            max_chars=max_chars,
+            expected_output_path=dev.path,
+        )
+        if isinstance(validated, ReportPromptResult):
+            return validated
         return build_ui_lead_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
             developer_record=dev,
-            developer_content=content,
+            developer_handoff=validated,
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
@@ -914,47 +1208,48 @@ def build_report_orchestrated_dispatch_prompt(
         ok, dev_content, _ = load_report_content(dev)
         if not ok:
             return ReportPromptResult(ok=False, blocker=dev_content)
-        agy_content = ""
+        dev_handoff = extract_handoff_block(
+            dev_content, HANDOFF_FOR_CODEX_REVIEWER_BEGIN, HANDOFF_FOR_CODEX_REVIEWER_END,
+        )
+        validated_dev = _validate_handoff_for_dispatch(
+            dev_handoff,
+            owner_role="developer",
+            report_path=dev.path,
+            block_name=f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN} / {HANDOFF_FOR_CODEX_REVIEWER_END}",
+            max_chars=max_chars,
+            expected_output_path=dev.path,
+        )
+        if isinstance(validated_dev, ReportPromptResult):
+            return validated_dev
+        agy_handoff = ""
         if agy:
             agy_ok, agy_content, _ = load_report_content(agy)
             if not agy_ok:
                 return ReportPromptResult(ok=False, blocker=agy_content)
-        dev_fits, dev_total = report_content_fits_prompt(dev_content, max_chars)
-        if not dev_fits:
-            return build_oversized_report_rewrite_result(
-                owner_role="developer",
-                report_path=dev.path,
-                report_chars=dev_total,
-                max_chars=max_chars,
-                expected_output_path=dev.path,
+            agy_handoff = extract_handoff_block(
+                agy_content,
+                HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+                HANDOFF_FOR_CODEX_REVIEWER_END,
             )
-        if agy and agy_content:
-            agy_fits, agy_total = report_content_fits_prompt(agy_content, max_chars)
-            if not agy_fits:
-                return build_oversized_report_rewrite_result(
-                    owner_role="ui_lead",
-                    report_path=agy.path,
-                    report_chars=agy_total,
-                    max_chars=max_chars,
-                    expected_output_path=agy.path,
-                )
-        combined_len = len(dev_content) + len(agy_content)
-        if combined_len > max_chars:
-            return build_oversized_report_rewrite_result(
-                owner_role="developer",
-                report_path=dev.path,
-                report_chars=combined_len,
+            validated_agy = _validate_handoff_for_dispatch(
+                agy_handoff,
+                owner_role="ui_lead",
+                report_path=agy.path,
+                block_name=f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN} / {HANDOFF_FOR_CODEX_REVIEWER_END}",
                 max_chars=max_chars,
-                expected_output_path=dev.path,
+                expected_output_path=agy.path,
             )
+            if isinstance(validated_agy, ReportPromptResult):
+                return validated_agy
+            agy_handoff = validated_agy
         return build_reviewer_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
             developer_record=dev,
-            developer_content=dev_content,
+            developer_handoff=validated_dev,
             agy_record=agy,
-            agy_content=agy_content,
+            agy_handoff=agy_handoff,
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
@@ -963,77 +1258,66 @@ def build_report_orchestrated_dispatch_prompt(
     if role == "developer" and awaiting_developer_correction:
         correction_source = (developer_correction_source or "").strip().lower()
         if correction_source == "ui_lead" and agy:
-            ok, agy_content, _ = load_report_content(agy)
-            if not ok:
+            agy_ok, agy_content, _ = load_report_content(agy)
+            if not agy_ok:
                 return ReportPromptResult(ok=False, blocker=agy_content)
-            prior_dev_record: ReportRecord | None = None
-            prior_dev_content = ""
-            if dev:
-                dev_ok, prior_dev_content, _ = load_report_content(dev)
-                if not dev_ok:
-                    return ReportPromptResult(ok=False, blocker=prior_dev_content)
-                prior_dev_record = dev
-            combined_len = len(agy_content) + len(prior_dev_content)
-            fits, total = report_content_fits_prompt("x" * combined_len, max_chars)
-            if not fits:
-                return build_oversized_report_rewrite_result(
-                    owner_role="developer",
-                    report_path=dev.path if dev else (prior_dev_record.path if prior_dev_record else ""),
-                    report_chars=total,
+            correction_handoff = extract_handoff_block(
+                agy_content,
+                HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
+                HANDOFF_FOR_DEVELOPER_CORRECTION_END,
+            )
+            if agy.status in ("REQUEST_CHANGES", "FAIL"):
+                validated = _validate_handoff_for_dispatch(
+                    correction_handoff,
+                    owner_role="ui_lead",
+                    report_path=agy.path,
+                    block_name=f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN} / {HANDOFF_FOR_DEVELOPER_CORRECTION_END}",
                     max_chars=max_chars,
-                    expected_output_path=expected_output_path or (dev.path if dev else ""),
+                    expected_output_path=agy.path,
                 )
+                if isinstance(validated, ReportPromptResult):
+                    return validated
+                correction_handoff = validated
             return build_developer_ui_lead_correction_report_prompt(
                 project=project,
                 phase=phase,
                 subject=subject,
                 agy_record=agy,
-                agy_content=agy_content,
-                developer_record=prior_dev_record,
-                developer_content=prior_dev_content,
+                correction_handoff=correction_handoff or "NONE",
+                developer_record=dev,
                 prompt_memo_body=prompt_memo_body,
                 instruction=instruction,
                 expected_output_path=expected_output_path,
                 external_report_write_roots=external_report_write_roots,
             )
         if reviewer:
-            ok, rev_content, _ = load_report_content(reviewer)
-            if not ok:
+            rev_ok, rev_content, _ = load_report_content(reviewer)
+            if not rev_ok:
                 return ReportPromptResult(ok=False, blocker=rev_content)
-            prior_dev_record = None
-            prior_dev_content = ""
-            if dev:
-                dev_ok, prior_dev_content, _ = load_report_content(dev)
-                if not dev_ok:
-                    return ReportPromptResult(ok=False, blocker=prior_dev_content)
-                prior_dev_record = dev
-            rev_fits, rev_total = report_content_fits_prompt(rev_content, max_chars)
-            if not rev_fits:
-                return build_oversized_report_rewrite_result(
+            correction_handoff = extract_handoff_block(
+                rev_content,
+                HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN,
+                HANDOFF_FOR_DEVELOPER_CORRECTION_END,
+            )
+            if reviewer.status in ("REQUEST_CHANGES", "FAIL"):
+                validated = _validate_handoff_for_dispatch(
+                    correction_handoff,
                     owner_role="reviewer",
                     report_path=reviewer.path,
-                    report_chars=rev_total,
+                    block_name=f"{HANDOFF_FOR_DEVELOPER_CORRECTION_BEGIN} / {HANDOFF_FOR_DEVELOPER_CORRECTION_END}",
                     max_chars=max_chars,
                     expected_output_path=reviewer.path,
                 )
-            combined_len = len(rev_content) + len(prior_dev_content)
-            fits, total = report_content_fits_prompt("x" * combined_len, max_chars)
-            if not fits:
-                return build_oversized_report_rewrite_result(
-                    owner_role="developer",
-                    report_path=dev.path if dev else "",
-                    report_chars=total,
-                    max_chars=max_chars,
-                    expected_output_path=expected_output_path or (dev.path if dev else ""),
-                )
+                if isinstance(validated, ReportPromptResult):
+                    return validated
+                correction_handoff = validated
             return build_developer_correction_report_prompt(
                 project=project,
                 phase=phase,
                 subject=subject,
                 reviewer_record=reviewer,
-                reviewer_content=rev_content,
-                developer_record=prior_dev_record,
-                developer_content=prior_dev_content,
+                correction_handoff=correction_handoff or "NONE",
+                developer_record=dev,
                 instruction=instruction,
                 expected_output_path=expected_output_path,
                 external_report_write_roots=external_report_write_roots,
@@ -1051,26 +1335,20 @@ def build_developer_ui_lead_correction_report_prompt(
     phase: str,
     subject: str,
     agy_record: ReportRecord,
-    agy_content: str,
+    correction_handoff: str,
     developer_record: ReportRecord | None = None,
-    developer_content: str = "",
     prompt_memo_body: str = "",
     instruction: str = "",
     expected_output_path: str = "",
     external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
-    sources: list[tuple[ReportRecord, str]] = []
-    if developer_record and developer_content:
-        sources.append((developer_record, developer_content))
-    sources.append((agy_record, agy_content))
-    task_lines = [
-        "Address AGY UX findings using the supplied AGY report",
+    sources: list[tuple[ReportRecord, str]] = [
+        (agy_record, correction_handoff),
     ]
+    labels = ["AGY CORRECTION HANDOFF FOR DEVELOPER:"]
     if developer_record:
-        task_lines.append("and prior developer report")
-    task_lines.append(
-        ".\nUpdate your analysis report; do not modify Twinpet product source files."
-    )
+        sources.append((developer_record, "(see prior developer report on disk; path listed below)"))
+        labels.append("PRIOR DEVELOPER REPORT METADATA:")
     result = build_report_review_prompt(
         target_role="developer",
         role_label="Claude Developer",
@@ -1078,16 +1356,29 @@ def build_developer_ui_lead_correction_report_prompt(
         project=project,
         phase=phase,
         subject=subject,
-        task="".join(task_lines),
+        task=(
+            "Address AGY UX findings using the correction handoff brief below.\n"
+            "Update your analysis report; do not modify Twinpet product source files.\n"
+            "Refresh COORDINATOR_HANDOFF_FOR_AGY and COORDINATOR_HANDOFF_FOR_CODEX_REVIEWER blocks."
+        ),
         source_reports=sources,
+        handoff_labels=labels,
         instruction=instruction,
         expected_output_path=expected_output_path,
         external_report_write_roots=external_report_write_roots,
+        output_handoff_instructions=(
+            f"{HANDOFF_FOR_AGY_BEGIN}\n"
+            "<updated UI/UX handoff for AGY>\n"
+            f"{HANDOFF_FOR_AGY_END}\n\n"
+            f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN}\n"
+            "<updated technical handoff for Codex reviewer>\n"
+            f"{HANDOFF_FOR_CODEX_REVIEWER_END}"
+        ),
     )
     if prompt_memo_body.strip():
         result = ReportPromptResult(
             ok=result.ok,
-            prompt=f"{result.prompt}\n\nORIGINAL PROMPT MEMO:\n{prompt_memo_body.strip()}",
+            prompt=f"{result.prompt}\n\nORIGINAL PROMPT MEMO (reference only):\n{prompt_memo_body.strip()[:2000]}",
             blocker=result.blocker,
             dispatch_role=result.dispatch_role,
         )
@@ -1100,17 +1391,19 @@ def build_developer_correction_report_prompt(
     phase: str,
     subject: str,
     reviewer_record: ReportRecord,
-    reviewer_content: str,
+    correction_handoff: str,
     developer_record: ReportRecord | None = None,
-    developer_content: str = "",
     instruction: str = "",
     expected_output_path: str = "",
     external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
-    sources: list[tuple[ReportRecord, str]] = []
-    if developer_record and developer_content:
-        sources.append((developer_record, developer_content))
-    sources.append((reviewer_record, reviewer_content))
+    sources: list[tuple[ReportRecord, str]] = [
+        (reviewer_record, correction_handoff),
+    ]
+    labels = ["CODEX REVIEWER CORRECTION HANDOFF FOR DEVELOPER:"]
+    if developer_record:
+        sources.append((developer_record, "(see prior developer report on disk; path listed below)"))
+        labels.append("PRIOR DEVELOPER REPORT METADATA:")
     return build_report_review_prompt(
         target_role="developer",
         role_label="Claude Developer",
@@ -1119,13 +1412,21 @@ def build_developer_correction_report_prompt(
         phase=phase,
         subject=subject,
         task=(
-            "Address reviewer findings using the supplied reviewer report"
-            + (" and prior developer report" if developer_record else "")
-            + ".\n"
-            "Update your analysis report; do not modify Twinpet product source files."
+            "Address reviewer findings using the correction handoff brief below.\n"
+            "Update your analysis report; do not modify Twinpet product source files.\n"
+            "Refresh COORDINATOR_HANDOFF_FOR_AGY and COORDINATOR_HANDOFF_FOR_CODEX_REVIEWER blocks."
         ),
         source_reports=sources,
+        handoff_labels=labels,
         instruction=instruction,
         expected_output_path=expected_output_path,
         external_report_write_roots=external_report_write_roots,
+        output_handoff_instructions=(
+            f"{HANDOFF_FOR_AGY_BEGIN}\n"
+            "<updated UI/UX handoff for AGY>\n"
+            f"{HANDOFF_FOR_AGY_END}\n\n"
+            f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN}\n"
+            "<updated technical handoff for Codex reviewer>\n"
+            f"{HANDOFF_FOR_CODEX_REVIEWER_END}"
+        ),
     )
