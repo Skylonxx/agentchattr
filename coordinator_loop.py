@@ -169,6 +169,8 @@ class CoordinatorLoopState:
     developer_has_substantial_output: bool = False
     last_developer_token: str = ""
     last_reviewer_verdict: str = ""
+    last_developer_analysis: str = ""
+    last_ui_lead_notes: str = ""
     session_prompt_id: str = ""
     session_workspace_profile: str = ""
     session_workspace_mode: str = ""
@@ -216,6 +218,8 @@ class CoordinatorLoopState:
             developer_has_substantial_output=bool(data.get("developer_has_substantial_output", False)),
             last_developer_token=str(data.get("last_developer_token", "")),
             last_reviewer_verdict=str(data.get("last_reviewer_verdict", "")),
+            last_developer_analysis=str(data.get("last_developer_analysis", "")),
+            last_ui_lead_notes=str(data.get("last_ui_lead_notes", "")),
             session_prompt_id=str(data.get("session_prompt_id", "")),
             session_workspace_profile=str(data.get("session_workspace_profile", "")),
             session_workspace_mode=str(data.get("session_workspace_mode", "")),
@@ -253,8 +257,10 @@ class CoordinatorLoopState:
             "developer_correction_complete": self.developer_correction_complete,
             "developer_has_substantial_output": self.developer_has_substantial_output,
             "last_developer_token": self.last_developer_token,
-            "last_reviewer_verdict": self.last_reviewer_verdict,
-            "session_prompt_id": self.session_prompt_id,
+        "last_reviewer_verdict": self.last_reviewer_verdict,
+        "last_developer_analysis": self.last_developer_analysis,
+        "last_ui_lead_notes": self.last_ui_lead_notes,
+        "session_prompt_id": self.session_prompt_id,
             "session_workspace_profile": self.session_workspace_profile,
             "session_workspace_mode": self.session_workspace_mode,
             "task_description": self.task_description,
@@ -786,6 +792,19 @@ def _has_substantial_developer_content(text: str, notes: str) -> bool:
     return any(marker in low for marker in markers) and len(body) >= 120
 
 
+def is_substantial_developer_ready(
+    text: str = "",
+    notes: str = "",
+    *,
+    token: str = "",
+) -> bool:
+    """True when developer output is READY_FOR_COORDINATOR with substantial analysis."""
+    tok = (token or _first_non_empty_line(text) or "").strip()
+    if tok != "READY_FOR_COORDINATOR":
+        return False
+    return _has_substantial_developer_content(text, notes)
+
+
 def _last_reviewer_verdict_from_log(state: CoordinatorLoopState) -> str:
     for entry in reversed(state.verdict_log):
         if entry.get("role") == "reviewer":
@@ -900,6 +919,7 @@ def _on_developer_output(
     substantial = token == "READY_FOR_COORDINATOR" and _has_substantial_developer_content(text, notes)
     if substantial:
         state.developer_has_substantial_output = True
+        state.last_developer_analysis = (text or "").strip() or f"{token}\n{notes}".strip()
 
     over_budget = state.developer_round > state.max_developer_rounds
     if over_budget:
@@ -927,6 +947,9 @@ def _on_ui_lead_output(
 ) -> CoordinatorAction:
     token, notes = _parse_ui_lead_verdict(text)
     _append_verdict(state, "ui_lead", token, notes)
+
+    if token not in ("INVALID", "AMBIGUOUS", "WORKER_TIMEOUT", "PROGRESS"):
+        state.last_ui_lead_notes = (text or "").strip() or f"{token}\n{notes}".strip()
 
     if token == "INVALID":
         return _terminal_blocker(state, notes)

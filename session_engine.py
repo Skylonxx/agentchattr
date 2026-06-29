@@ -7,6 +7,7 @@ import time
 from session_relay import (
     build_relay_prompt,
     build_readonly_context_reviewer_prompt,
+    build_readonly_reviewer_context_packet,
     build_safety_gate_prompt,
     build_coordinator_loop_prompt,
     build_coordinator_loop_ui_lead_prompt,
@@ -1681,7 +1682,7 @@ class SessionEngine:
         context_messages = self._get_recent_context(channel)
         policy = session.get("workspace_policy") or {}
         if role == "reviewer" and is_readonly_no_tool_reviewer_policy(policy):
-            prompt = build_readonly_context_reviewer_prompt(
+            packet = build_readonly_reviewer_context_packet(
                 session_name=tmpl.get("name", "?"),
                 goal=session.get("goal", ""),
                 phase_name=phase["name"],
@@ -1694,7 +1695,26 @@ class SessionEngine:
                 agent_base=agent_base,
                 project=channel,
                 subject=session.get("goal", "")[:120] or "read-only-analysis-review",
+                verdict_log=cls.verdict_log,
+                stored_developer_analysis=cls.last_developer_analysis,
+                stored_ui_lead_notes=cls.last_ui_lead_notes,
+                prompt_id=cls.session_prompt_id,
+                workspace_profile=cls.session_workspace_profile,
+                workspace_mode=cls.session_workspace_mode,
             )
+            if not packet.ok:
+                log.warning(
+                    "Session %d: read-only reviewer context packet incomplete: %s",
+                    session["id"],
+                    packet.diagnostics,
+                )
+                cls.phase = CoordinatorPhase.BLOCKER
+                cls.blocker_reason = packet.blocker
+                cls.awaiting_role = ""
+                self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+                self._store.interrupt(session["id"], packet.blocker)
+                return
+            prompt = packet.prompt
         else:
             prompt = build_relay_prompt(
                 session_name=tmpl.get("name", "?"),

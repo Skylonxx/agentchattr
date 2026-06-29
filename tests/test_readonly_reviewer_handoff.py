@@ -11,7 +11,10 @@ from coordinator_loop import on_coordinator_output, on_session_start, on_worker_
 from session_relay import (
     build_coordinator_loop_prompt,
     build_readonly_context_reviewer_prompt,
+    build_readonly_reviewer_context_packet,
     build_relay_prompt,
+    compress_developer_analysis_for_reviewer,
+    extract_reviewer_context_from_verdict_log,
     extract_worker_context_outputs,
     has_explicit_to_header,
     is_readonly_no_tool_reviewer_policy,
@@ -30,12 +33,23 @@ def _analysis_policy() -> dict:
     return result.policy
 
 
+def _substantial_developer_text(extra: str = "") -> str:
+    body = (
+        "# PaymentModal analysis\n\n"
+        "Current implementation uses monolithic props/state for payment data flow.\n"
+        "Blueprint constraints: split tender UI from inventory risk handling.\n"
+        "Critical risks: duplicate source-of-truth across Firestore transaction paths.\n"
+        f"{extra}"
+    )
+    return f"READY_FOR_COORDINATOR\n\n{body}"
+
+
 def _sample_messages() -> list[dict]:
     return [
         {
             "sender": "claude",
             "type": "chat",
-            "text": "READY_FOR_COORDINATOR\n\nREPORT_BEGIN\n\n# Developer Analysis\n\nPaymentModal is monolithic.\n\nREPORT_END",
+            "text": _substantial_developer_text("PaymentModal is monolithic."),
         },
         {
             "sender": "agy",
@@ -43,6 +57,23 @@ def _sample_messages() -> list[dict]:
             "text": "UX_APPROVED\n\n# UI Lead Report\n\nBlueprint approved with notes.",
         },
     ]
+
+
+def _packet_kwargs(**overrides):
+    policy = _analysis_policy()
+    base = dict(
+        session_name="Project Read-Only Coordinator Loop",
+        goal="PaymentModal analysis",
+        phase_name="Reviewer",
+        phase_index=3,
+        total_phases=5,
+        policy=policy,
+        context_messages=_sample_messages(),
+        cast={"developer": "claude", "ui_lead": "agy", "reviewer": "codex_reviewer"},
+        project="twinpet-ui-09-c-read",
+    )
+    base.update(overrides)
+    return base
 
 
 class ReadonlyReviewerPolicyTests(unittest.TestCase):
@@ -57,19 +88,15 @@ class ReadonlyReviewerPromptTests(unittest.TestCase):
         self.policy = _analysis_policy()
         self.messages = _sample_messages()
 
-    def _prompt(self, *, coordinator_instruction: str = "") -> str:
-        return build_readonly_context_reviewer_prompt(
-            session_name="Project Read-Only Coordinator Loop",
-            goal="PaymentModal analysis",
-            phase_name="Reviewer",
-            phase_index=3,
-            total_phases=5,
-            policy=self.policy,
-            context_messages=self.messages,
-            cast={"developer": "claude", "ui_lead": "agy", "reviewer": "codex_reviewer"},
-            coordinator_instruction=coordinator_instruction,
-            project="twinpet-ui-09-c-read",
+    def _prompt(self, *, coordinator_instruction: str = "", **kwargs) -> str:
+        packet = build_readonly_reviewer_context_packet(
+            **_packet_kwargs(
+                coordinator_instruction=coordinator_instruction,
+                **kwargs,
+            )
         )
+        self.assertTrue(packet.ok, msg=packet.blocker)
+        return packet.prompt
 
     def test_includes_to_codex_reviewer_header(self):
         prompt = self._prompt()
@@ -110,7 +137,7 @@ class ReadonlyReviewerPromptTests(unittest.TestCase):
         self.assertIn("PaymentModal is monolithic", prompt)
         self.assertIn("AGY UI/UX NOTES:", prompt)
         self.assertIn("Blueprint approved", prompt)
-        self.assertIn("SNAPSHOT FILE LIST", prompt)
+        self.assertIn("SNAPSHOT SUMMARY:", prompt)
         self.assertIn("src/components/PaymentModal.tsx", prompt)
 
     def test_coordinator_bad_instruction_sandboxed(self):
@@ -130,6 +157,126 @@ class ReadonlyReviewerPromptTests(unittest.TestCase):
         )
         self.assertIn("PaymentModal is monolithic", outputs["developer_output"])
         self.assertIn("Blueprint approved", outputs["ui_lead_output"])
+
+
+class ReadonlyReviewerContextPacketTests(unittest.TestCase):
+    def test_ready_developer_included_from_verdict_log(self):
+        dev = _substantial_developer_text("verdict log body")
+        verdict_log = [
+            {"role": "developer", "token": "READY_FOR_COORDINATOR", "notes": dev.split("\n", 1)[1]},
+            {"role": "ui_lead", "token": "UX_APPROVED", "notes": "AGY notes from log"},
+        ]
+        packet = build_readonly_reviewer_context_packet(
+            **_packet_kwargs(
+                context_messages=[],
+                verdict_log=verdict_log,
+            )
+        )
+        self.assertTrue(packet.ok)
+        self.assertIn("DEVELOPER ANALYSIS:", packet.prompt)
+        self.assertIn("verdict log body", packet.prompt)
+        self.assertIn("AGY UI/UX NOTES:", packet.prompt)
+        self.assertIn("AGY notes from log", packet.prompt)
+        self.assertTrue(packet.diagnostics["developer_analysis_found"])
+
+    def test_agy_does_not_replace_developer_analysis(self):
+        messages = [
+            {
+                "sender": "agy",
+                "type": "chat",
+                "text": "UX_APPROVED\n\nDeveloper addressed all concerns.",
+            },
+        ]
+        dev = _substantial_developer_text("underlying developer analysis")
+        packet = build_readonly_reviewer_context_packet(
+            **_packet_kwargs(
+                context_messages=messages,
+                stored_developer_analysis=dev,
+            )
+        )
+        self.assertTrue(packet.ok)
+        self.assertIn("underlying developer analysis", packet.prompt)
+        self.assertIn("Developer addressed all concerns", packet.prompt)
+
+    def test_blocks_when_developer_analysis_missing(self):
+        packet = build_readonly_reviewer_context_packet(
+            **_packet_kwargs(
+                context_messages=[
+                    {
+                        "sender": "agy",
+                        "type": "chat",
+                        "text": "UX_APPROVED\n\nDeveloper addressed issues.",
+                    },
+                ],
+                verdict_log=[],
+                stored_developer_analysis="",
+            )
+        )
+        self.assertFalse(packet.ok)
+        self.assertIn("BLOCKER: reviewer context missing developer analysis", packet.blocker)
+        self.assertFalse(packet.diagnostics["developer_analysis_found"])
+        self.assertTrue(packet.diagnostics["agy_notes_found"])
+
+    def test_long_developer_analysis_compressed_not_omitted(self):
+        long_body = _substantial_developer_text("x" * 30000)
+        compressed, truncated = compress_developer_analysis_for_reviewer(long_body, max_chars=4000)
+        self.assertTrue(truncated)
+        self.assertIn("[DEVELOPER ANALYSIS COMPRESSED FROM FULL OUTPUT]", compressed)
+        self.assertIn("PaymentModal", compressed)
+        packet = build_readonly_reviewer_context_packet(
+            **_packet_kwargs(
+                context_messages=[],
+                stored_developer_analysis=long_body,
+            )
+        )
+        self.assertTrue(packet.ok)
+        self.assertTrue(packet.diagnostics["truncated"])
+        self.assertIn("DEVELOPER ANALYSIS:", packet.prompt)
+        self.assertIn("COMPRESSED FROM FULL OUTPUT", packet.prompt)
+
+    def test_rereview_after_agy_includes_developer_from_log(self):
+        dev_notes = _substantial_developer_text("persistent analysis").split("\n", 1)[1]
+        verdict_log = [
+            {"role": "developer", "token": "READY_FOR_COORDINATOR", "notes": dev_notes},
+            {"role": "ui_lead", "token": "UX_APPROVED", "notes": "round 1 AGY"},
+            {"role": "reviewer", "token": "REQUEST CHANGES", "notes": "fix blueprint"},
+            {"role": "ui_lead", "token": "UX_APPROVED", "notes": "round 2 AGY after fixes"},
+        ]
+        packet = build_readonly_reviewer_context_packet(
+            **_packet_kwargs(
+                context_messages=[
+                    {
+                        "sender": "agy",
+                        "type": "chat",
+                        "text": "UX_APPROVED\n\nround 2 AGY after fixes",
+                    },
+                ],
+                verdict_log=verdict_log,
+            )
+        )
+        self.assertTrue(packet.ok)
+        self.assertIn("persistent analysis", packet.prompt)
+        self.assertIn("REVIEW HISTORY:", packet.prompt)
+        self.assertIn("REQUEST CHANGES", packet.prompt)
+
+    def test_extract_reviewer_context_from_verdict_log(self):
+        dev_notes = _substantial_developer_text().split("\n", 1)[1]
+        ctx = extract_reviewer_context_from_verdict_log([
+            {"role": "developer", "token": "READY_FOR_COORDINATOR", "notes": dev_notes},
+            {"role": "reviewer", "token": "REQUEST CHANGES", "notes": "more detail"},
+        ])
+        self.assertIn("PaymentModal", ctx["developer_analysis"])
+        self.assertEqual(len(ctx["review_history"]), 1)
+
+    def test_legacy_prompt_wrapper_returns_blocker_when_incomplete(self):
+        prompt = build_readonly_context_reviewer_prompt(
+            **_packet_kwargs(
+                context_messages=[],
+                stored_developer_analysis="",
+                verdict_log=[],
+            )
+        )
+        self.assertIn("BLOCKER: reviewer context missing developer analysis", prompt)
 
 
 class ReadonlyReviewerCoordinatorGuidanceTests(unittest.TestCase):
@@ -157,7 +304,7 @@ class ReadonlyReviewerRegressionTests(unittest.TestCase):
         state, _ = on_session_start("read-only analysis", max_rounds=5)
         on_coordinator_output(state, "CLASSIFY: UI\nui")
         on_coordinator_output(state, "NEXT: developer\nBegin.")
-        on_worker_output(state, "developer", "READY_FOR_COORDINATOR\nreport")
+        on_worker_output(state, "developer", _substantial_developer_text("report body"))
         on_coordinator_output(state, "NEXT: ui_lead\nReview.")
         on_worker_output(state, "ui_lead", "UX_APPROVED\nnotes")
         on_coordinator_output(
@@ -168,6 +315,7 @@ class ReadonlyReviewerRegressionTests(unittest.TestCase):
         self.assertEqual(action.target_role, "coordinator")
         self.assertIn("REQUEST CHANGES", action.prompt_context)
         self.assertIn("read-only", action.prompt_context.lower())
+        self.assertTrue(state.last_developer_analysis)
 
         dispatch = on_coordinator_output(
             state,

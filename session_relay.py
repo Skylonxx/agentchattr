@@ -8,7 +8,8 @@ and return plain text only.
 
 import re
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -118,12 +119,112 @@ def is_readonly_no_tool_reviewer_policy(policy: dict | None) -> bool:
     return bool((policy.get("workspace") or {}).get("root"))
 
 
+READONLY_REVIEWER_DEVELOPER_MAX_CHARS = 24000
+READONLY_REVIEWER_AGY_MAX_CHARS = 12000
+
+
+@dataclass
+class ReviewerContextPacket:
+    ok: bool
+    prompt: str = ""
+    blocker: str = ""
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+def _body_after_first_line(text: str) -> str:
+    lines = (text or "").strip().splitlines()
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines[1:]).strip()
+
+
+def _first_non_empty_line(text: str) -> str:
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def _is_developer_analysis_text(text: str) -> bool:
+    from coordinator_loop import is_substantial_developer_ready
+
+    if not (text or "").strip():
+        return False
+    token = _first_non_empty_line(text)
+    notes = _body_after_first_line(text)
+    return is_substantial_developer_ready(text, notes, token=token)
+
+
+def compress_developer_analysis_for_reviewer(
+    text: str,
+    max_chars: int = READONLY_REVIEWER_DEVELOPER_MAX_CHARS,
+) -> tuple[str, bool]:
+    """Compress long developer analysis without omitting it entirely."""
+    body = (text or "").strip()
+    if len(body) <= max_chars:
+        return body, False
+    lines = body.splitlines()
+    headers = [line for line in lines if line.strip().startswith("#")]
+    excerpt_budget = max_chars - 800
+    excerpt = body[:excerpt_budget]
+    compressed_parts = [
+        "[DEVELOPER ANALYSIS COMPRESSED FROM FULL OUTPUT]",
+        f"original_chars={len(body)}",
+        "",
+        "developer analysis summary (section headers):",
+        *headers[:48],
+        "",
+        "key data-flow findings / critical risks / blueprint constraints (excerpt):",
+        excerpt,
+    ]
+    compressed = "\n".join(compressed_parts)
+    if len(compressed) > max_chars:
+        compressed = compressed[:max_chars]
+    return compressed, True
+
+
+def extract_reviewer_context_from_verdict_log(
+    verdict_log: list[dict] | None,
+) -> dict[str, Any]:
+    """Extract developer, AGY, and reviewer history from coordinator verdict_log."""
+    from coordinator_loop import is_substantial_developer_ready
+
+    developer_analysis = ""
+    agy_notes = ""
+    review_history: list[str] = []
+    for entry in verdict_log or []:
+        role = str(entry.get("role") or "")
+        token = str(entry.get("token") or "")
+        notes = str(entry.get("notes") or "").strip()
+        if role == "reviewer" and token:
+            snippet = notes[:2000] if notes else ""
+            review_history.append(f"{token}: {snippet}".strip(": ").strip())
+    for entry in reversed(verdict_log or []):
+        role = str(entry.get("role") or "")
+        token = str(entry.get("token") or "")
+        notes = str(entry.get("notes") or "").strip()
+        if role == "developer" and not developer_analysis:
+            if is_substantial_developer_ready("", notes, token=token):
+                developer_analysis = f"{token}\n{notes}".strip() if notes else token
+        elif role == "ui_lead" and not agy_notes:
+            if token not in ("INVALID", "AMBIGUOUS", "WORKER_TIMEOUT", "PROGRESS"):
+                agy_notes = f"{token}\n{notes}".strip() if notes else token
+    return {
+        "developer_analysis": developer_analysis,
+        "agy_notes": agy_notes,
+        "review_history": review_history,
+    }
+
+
 def extract_worker_context_outputs(
     context_messages: list[dict] | None,
     *,
     cast: dict | None = None,
 ) -> dict[str, str]:
-    """Pull latest developer and ui_lead outputs from channel history."""
+    """Pull latest developer and ui_lead outputs from channel history (independent scans)."""
+    from coordinator_loop import is_substantial_developer_ready
+
     dev_senders = set(DEVELOPER_CONTEXT_SENDERS)
     ui_senders = set(UI_LEAD_CONTEXT_SENDERS)
     if isinstance(cast, dict):
@@ -134,8 +235,8 @@ def extract_worker_context_outputs(
         if ui_agent:
             ui_senders.add(ui_agent)
 
-    developer_output = ""
-    ui_lead_output = ""
+    dev_candidates: list[str] = []
+    ui_candidates: list[str] = []
     for msg in reversed(context_messages or []):
         if msg.get("type", "chat") != "chat":
             continue
@@ -144,19 +245,46 @@ def extract_worker_context_outputs(
         text = str(msg.get("text") or "").strip()
         if not text:
             continue
-        if not developer_output and (sender in dev_senders or base in dev_senders):
-            developer_output = text
-        elif not ui_lead_output and (sender in ui_senders or base in ui_senders):
-            ui_lead_output = text
-        if developer_output and ui_lead_output:
+        if sender in dev_senders or base in dev_senders:
+            dev_candidates.append(text)
+        if sender in ui_senders or base in ui_senders:
+            ui_candidates.append(text)
+
+    developer_output = ""
+    for candidate in dev_candidates:
+        if is_substantial_developer_ready(candidate):
+            developer_output = candidate
             break
+
+    ui_lead_output = ui_candidates[0] if ui_candidates else ""
     return {
         "developer_output": developer_output,
         "ui_lead_output": ui_lead_output,
     }
 
 
-def build_readonly_context_reviewer_prompt(
+def _format_reviewer_context_diagnostics(diagnostics: dict[str, Any]) -> str:
+    lines = []
+    for key in (
+        "developer_analysis_found",
+        "developer_analysis_chars",
+        "agy_notes_found",
+        "agy_notes_chars",
+        "review_history_found",
+        "prompt_id",
+        "workspace_profile",
+        "workspace_mode",
+        "context_packet_chars",
+        "truncated",
+        "developer_source",
+        "agy_source",
+    ):
+        if key in diagnostics:
+            lines.append(f"{key}: {diagnostics[key]}")
+    return "\n".join(lines)
+
+
+def build_readonly_reviewer_context_packet(
     *,
     session_name: str,
     goal: str,
@@ -170,9 +298,76 @@ def build_readonly_context_reviewer_prompt(
     agent_base: str = "codex_reviewer",
     project: str = "",
     subject: str = "",
-) -> str:
-    """Build a no-tool reviewer prompt from supplied developer/AGY context."""
-    outputs = extract_worker_context_outputs(context_messages, cast=cast)
+    verdict_log: list[dict] | None = None,
+    stored_developer_analysis: str = "",
+    stored_ui_lead_notes: str = "",
+    prompt_id: str = "",
+    workspace_profile: str = "",
+    workspace_mode: str = "",
+) -> ReviewerContextPacket:
+    """Build complete read-only reviewer context packet with validation."""
+    log_ctx = extract_reviewer_context_from_verdict_log(verdict_log)
+    channel_ctx = extract_worker_context_outputs(context_messages, cast=cast)
+
+    developer_analysis = (
+        log_ctx["developer_analysis"]
+        or (stored_developer_analysis or "").strip()
+        or channel_ctx["developer_output"]
+    )
+    agy_notes = (
+        log_ctx["agy_notes"]
+        or (stored_ui_lead_notes or "").strip()
+        or channel_ctx["ui_lead_output"]
+    )
+    review_history = log_ctx["review_history"]
+
+    dev_source = "none"
+    if log_ctx["developer_analysis"]:
+        dev_source = "verdict_log"
+    elif (stored_developer_analysis or "").strip() and _is_developer_analysis_text(
+        stored_developer_analysis
+    ):
+        dev_source = "state"
+    elif channel_ctx["developer_output"]:
+        dev_source = "channel"
+
+    agy_source = "none"
+    if log_ctx["agy_notes"]:
+        agy_source = "verdict_log"
+    elif (stored_ui_lead_notes or "").strip():
+        agy_source = "state"
+    elif channel_ctx["ui_lead_output"]:
+        agy_source = "channel"
+
+    developer_found = _is_developer_analysis_text(developer_analysis)
+    agy_found = bool((agy_notes or "").strip())
+    review_found = bool(review_history)
+
+    diagnostics: dict[str, Any] = {
+        "developer_analysis_found": developer_found,
+        "developer_analysis_chars": len(developer_analysis or ""),
+        "agy_notes_found": agy_found,
+        "agy_notes_chars": len(agy_notes or ""),
+        "review_history_found": review_found,
+        "prompt_id": prompt_id or "(none)",
+        "workspace_profile": workspace_profile or "(none)",
+        "workspace_mode": workspace_mode or "(none)",
+        "truncated": False,
+        "developer_source": dev_source,
+        "agy_source": agy_source,
+    }
+
+    if not developer_found:
+        diagnostics["context_packet_chars"] = 0
+        blocker = (
+            "BLOCKER: reviewer context missing developer analysis\n"
+            + _format_reviewer_context_diagnostics(diagnostics)
+        )
+        return ReviewerContextPacket(ok=False, blocker=blocker, diagnostics=diagnostics)
+
+    dev_body, truncated = compress_developer_analysis_for_reviewer(developer_analysis)
+    diagnostics["truncated"] = truncated
+
     workspace = policy.get("workspace") or {}
     read_paths = list(policy.get("read_paths") or [])
     forbidden = list(policy.get("forbidden_paths") or [])
@@ -206,39 +401,42 @@ def build_readonly_context_reviewer_prompt(
             f"REFERENCE HEAD (informational only — do not verify): {expected_head}"
         )
 
+    lines.extend(["", "CONTEXT PROVIDED:", "", "DEVELOPER ANALYSIS:", "---", dev_body, "---"])
+
     lines.append("")
-    lines.append("CONTEXT PROVIDED:")
-    if outputs["developer_output"]:
-        lines.extend([
-            "",
-            "DEVELOPER ANALYSIS:",
-            "---",
-            outputs["developer_output"][:12000],
-            "---",
-        ])
+    lines.append("AGY UI/UX NOTES:")
+    if agy_notes:
+        agy_body = agy_notes[:READONLY_REVIEWER_AGY_MAX_CHARS]
+        lines.extend(["---", agy_body, "---"])
     else:
-        lines.append("- developer analysis: (not found in channel history)")
-    if outputs["ui_lead_output"]:
-        lines.extend([
-            "",
-            "AGY UI/UX NOTES:",
-            "---",
-            outputs["ui_lead_output"][:8000],
-            "---",
-        ])
+        lines.append("NONE")
+
+    lines.append("")
+    lines.append("REVIEW HISTORY:")
+    if review_history:
+        for entry in review_history[-8:]:
+            lines.append(f"  - {entry}")
     else:
-        lines.append("- AGY UI/UX notes: (not available)")
+        lines.append("NONE")
+
+    lines.append("")
+    lines.append("SNAPSHOT SUMMARY:")
+    if expected_head:
+        lines.append(f"  HEAD (reference): {expected_head}")
     if read_paths:
-        lines.extend([
-            "",
-            "SNAPSHOT FILE LIST (already inspected by developer — do not re-read):",
-        ])
+        lines.append("  Files (developer-inspected snapshot list):")
         for path in read_paths:
-            lines.append(f"  - {path}")
+            lines.append(f"    - {path}")
+    else:
+        lines.append("  (no read_paths in policy)")
+
+    lines.append("")
+    lines.append("BOUNDARIES:")
+    lines.append("  - read-only analysis; no code changes")
+    lines.append("  - no behavior changes hidden as UI cleanup")
     if forbidden:
-        lines.extend(["", "BOUNDARIES / FORBIDDEN AREAS:"])
         for path in forbidden[:16]:
-            lines.append(f"  - {path}")
+            lines.append(f"  - forbidden: {path}")
 
     coord = (coordinator_instruction or "").strip()
     if coord:
@@ -262,7 +460,7 @@ def build_readonly_context_reviewer_prompt(
     ])
 
     body = "\n".join(lines)
-    return ensure_explicit_routing_headers(
+    prompt = ensure_explicit_routing_headers(
         body,
         role="reviewer",
         agent_base=agent_base,
@@ -272,6 +470,55 @@ def build_readonly_context_reviewer_prompt(
         mode="no-tool review from supplied context",
         from_source="agentchattr-coordinator-loop",
     )
+    diagnostics["context_packet_chars"] = len(prompt)
+    return ReviewerContextPacket(ok=True, prompt=prompt, diagnostics=diagnostics)
+
+
+def build_readonly_context_reviewer_prompt(
+    *,
+    session_name: str,
+    goal: str,
+    phase_name: str,
+    phase_index: int,
+    total_phases: int,
+    policy: dict,
+    context_messages: list[dict] | None = None,
+    cast: dict | None = None,
+    coordinator_instruction: str = "",
+    agent_base: str = "codex_reviewer",
+    project: str = "",
+    subject: str = "",
+    verdict_log: list[dict] | None = None,
+    stored_developer_analysis: str = "",
+    stored_ui_lead_notes: str = "",
+    prompt_id: str = "",
+    workspace_profile: str = "",
+    workspace_mode: str = "",
+) -> str:
+    """Build a no-tool reviewer prompt from supplied developer/AGY context."""
+    packet = build_readonly_reviewer_context_packet(
+        session_name=session_name,
+        goal=goal,
+        phase_name=phase_name,
+        phase_index=phase_index,
+        total_phases=total_phases,
+        policy=policy,
+        context_messages=context_messages,
+        cast=cast,
+        coordinator_instruction=coordinator_instruction,
+        agent_base=agent_base,
+        project=project,
+        subject=subject,
+        verdict_log=verdict_log,
+        stored_developer_analysis=stored_developer_analysis,
+        stored_ui_lead_notes=stored_ui_lead_notes,
+        prompt_id=prompt_id,
+        workspace_profile=workspace_profile,
+        workspace_mode=workspace_mode,
+    )
+    if not packet.ok:
+        return packet.blocker
+    return packet.prompt
 
 
 _ROUTING_HANDOFF_INSTRUCTION = (
