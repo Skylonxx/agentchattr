@@ -22,6 +22,7 @@ from report_orchestration import (
     read_report_file,
     report_content_fits_prompt,
     save_inline_report_to_path,
+    validate_initial_developer_preflight,
     validate_report_path,
     verify_report_write_permission,
 )
@@ -285,6 +286,184 @@ class ReportPromptConstructionTests(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertIn("too large", result.blocker)
+
+
+class InitialDeveloperPromptTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.policy = _analysis_policy()
+        self.roots = list(self.policy.get("external_report_write_roots") or [])
+        self.report_path = str((self.policy.get("report_paths") or [""])[0])
+        self.prompt_memo = (
+            "Analyze PaymentModal for UI-09-C scope. Map data flow and risks."
+        )
+
+    def test_initial_developer_prompt_without_prior_reports(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="Twinpet POS",
+            phase="UI-09-C PaymentModal analysis",
+            subject="Create initial technical analysis report",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertNotIn("no report-orchestrated prompt available", result.blocker)
+        self.assertIn("TO: Claude Developer", result.prompt)
+        self.assertIn("MODE: read-only analysis with external report output", result.prompt)
+
+    def test_initial_developer_includes_prompt_memo(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("PROMPT MEMO:", result.prompt)
+        self.assertIn("PaymentModal for UI-09-C", result.prompt)
+
+    def test_initial_developer_includes_snapshot_paths(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("READ-ONLY SNAPSHOTS:", result.prompt)
+        self.assertIn("PaymentModal.tsx", result.prompt)
+
+    def test_initial_developer_includes_expected_report_path(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("REPORT OUTPUT:", result.prompt)
+        self.assertIn(self.report_path, result.prompt)
+
+    def test_initial_developer_includes_external_write_permission(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("EXTERNAL REPORT WRITE ALLOWLIST:", result.prompt)
+        self.assertTrue(any(root in result.prompt for root in self.roots))
+
+    def test_initial_developer_forbids_twinpet_writes(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        low = result.prompt.lower()
+        self.assertIn("may not write inside the twinpet workspace", low)
+        self.assertIn("do not modify product source", low)
+
+    def test_initial_developer_includes_report_ready_contract(self):
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[],
+            project="twinpet",
+            phase="analysis",
+            subject="initial",
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+            expected_output_path=self.report_path,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertIn("REPORT_READY", result.prompt)
+        self.assertIn("REPORT_WRITE_FAILED", result.prompt)
+
+    def test_missing_snapshots_blocks_with_clear_diagnostic(self):
+        policy = dict(self.policy)
+        policy["read_paths"] = []
+        ok, blocker = validate_initial_developer_preflight(
+            policy,
+            prompt_memo_body=self.prompt_memo,
+            expected_output_path=self.report_path,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(blocker, "BLOCKER: developer initial prompt missing source snapshots")
+
+    def test_missing_prompt_memo_blocks_with_clear_diagnostic(self):
+        ok, blocker = validate_initial_developer_preflight(
+            self.policy,
+            prompt_memo_body="",
+            expected_output_path=self.report_path,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(blocker, "BLOCKER: developer initial prompt missing prompt memo")
+
+    def test_developer_correction_still_works(self):
+        rev_path = Path(self.tmp) / "rev.md"
+        rev_path.write_text("# Reviewer\nREQUEST changes", encoding="utf-8")
+        dev_path = Path(self.tmp) / "prior-dev.md"
+        dev_path.write_text("# Dev\nPrior analysis", encoding="utf-8")
+        correction_roots = [self.tmp]
+        rev_ingest = ingest_worker_report_output(
+            "reviewer",
+            _report_ready(str(rev_path), status="REQUEST_CHANGES"),
+            allowed_roots=correction_roots,
+        )
+        dev_ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=correction_roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="developer",
+            report_records=[dev_ingest.record.to_dict(), rev_ingest.record.to_dict()],
+            project="twinpet",
+            phase="correction",
+            subject="address reviewer",
+            awaiting_developer_correction=True,
+            expected_output_path=str(dev_path),
+            external_report_write_roots=correction_roots,
+            prompt_memo_body=self.prompt_memo,
+            policy=self.policy,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertIn("Report correction", result.prompt)
+        self.assertIn("REQUEST changes", result.prompt)
+        self.assertIn("Prior analysis", result.prompt)
 
 
 class ReportOrchestrationCoordinatorLoopTests(unittest.TestCase):

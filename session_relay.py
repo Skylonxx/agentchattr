@@ -629,9 +629,9 @@ def session_workspace_policy(session: dict | None) -> dict | None:
 
 
 def role_uses_scoped_workspace(session: dict | None, role: str) -> bool:
-    """True when role participates in an external workspace session (impl/docs-only)."""
+    """True when role participates in an external workspace session."""
     policy = session_workspace_policy(session)
-    if not policy or policy.get("mode") not in ("implementation", "docs-only"):
+    if not policy or policy.get("mode") not in ("implementation", "docs-only", "read-only"):
         return False
     import workspace_policy as wp
     perms = wp.role_permission_for(policy, role)

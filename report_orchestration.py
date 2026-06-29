@@ -602,6 +602,144 @@ def build_ui_lead_report_prompt(
     )
 
 
+def validate_initial_developer_preflight(
+    policy: dict | None,
+    *,
+    prompt_memo_body: str = "",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Preflight before initial developer dispatch in report-orchestrated sessions."""
+    if not (prompt_memo_body or "").strip():
+        return False, "BLOCKER: developer initial prompt missing prompt memo"
+    if not isinstance(policy, dict):
+        return False, "BLOCKER: developer initial prompt missing source snapshots"
+    read_paths = [
+        p for p in (policy.get("read_paths") or [])
+        if isinstance(p, str) and p.strip()
+    ]
+    if not read_paths:
+        return False, "BLOCKER: developer initial prompt missing source snapshots"
+    roots = list(external_report_write_roots or resolve_external_report_write_roots(policy))
+    if not roots:
+        return False, "BLOCKER: external report write permission not enabled"
+    if list(policy.get("write_files") or []):
+        return False, "BLOCKER: Twinpet workspace write allowlist must remain none"
+    expected_paths: list[str] = []
+    if (expected_output_path or "").strip():
+        expected_paths.append(expected_output_path.strip())
+    for path in policy.get("report_paths") or []:
+        if isinstance(path, str) and path.strip():
+            expected_paths.append(path.strip())
+    ok, blocker = verify_report_write_permission(
+        policy,
+        expected_report_paths=expected_paths,
+    )
+    if not ok:
+        return False, blocker
+    return True, ""
+
+
+def build_initial_developer_report_prompt(
+    *,
+    project: str,
+    phase: str,
+    subject: str,
+    workspace_root: str,
+    expected_head: str = "",
+    read_paths: list[str],
+    prompt_memo_body: str,
+    instruction: str = "",
+    expected_output_path: str = "",
+    external_report_write_roots: list[str] | None = None,
+) -> ReportPromptResult:
+    """Build first-turn developer prompt from Prompt Memo + snapshot paths (no prior report)."""
+    lines = [
+        "TO: Claude Developer",
+        "FROM: agentchattr Coordinator",
+        "ROLE: Developer / Technical Analyst",
+        "MODE: read-only analysis with external report output",
+        f"PROJECT: {project}",
+        f"PHASE: {phase}",
+        f"SUBJECT: {subject}",
+        "",
+        "WORKSPACE:",
+        workspace_root,
+    ]
+    if expected_head:
+        lines.extend(["", "EXPECTED HEAD:", expected_head])
+    lines.extend([
+        "",
+        "READ-ONLY SNAPSHOTS:",
+        "agentchattr injects AUTOMATED PRECHECK RESULTS and READ-ONLY FILE SNAPSHOT",
+        "before this turn. Use injected snapshot content only; do not inspect the repo directly.",
+        "",
+        "Configured snapshot source paths:",
+    ])
+    for path in read_paths:
+        lines.append(f"  - {path}")
+    lines.extend([
+        "",
+        "PROMPT MEMO:",
+        prompt_memo_body.strip(),
+        "",
+        "RULES:",
+        "- You may write only the external markdown report under allowed Ai-Report roots.",
+        "- You may not write inside the Twinpet workspace.",
+        "- Use injected snapshots only.",
+        "- Do not modify product source, tests, backend files, mobile files, tracker docs, or hidden agent folders.",
+        "- Create the report folder if missing.",
+        "- Return REPORT_READY with path/status/summary.",
+        "- Do not use MCP tools. Do not call chat_read or chat_send.",
+        "- Channel carries short status only; the report file is the source of truth.",
+    ])
+    roots = list(external_report_write_roots or [])
+    if roots:
+        lines.extend(["", "EXTERNAL REPORT WRITE ALLOWLIST:"])
+        for root in roots:
+            lines.append(f"- {root}")
+    if expected_output_path:
+        lines.extend([
+            "",
+            "REPORT OUTPUT:",
+            "Write markdown report to:",
+            expected_output_path,
+        ])
+    lines.extend([
+        "",
+        "If you cannot write the report file despite permission being configured, return exactly:",
+        "REPORT_WRITE_FAILED",
+        "",
+        "Reason:",
+        "<short reason>",
+        "",
+        "Expected report:",
+        expected_output_path or "<path>",
+        "",
+        "Status:",
+        "FAIL",
+    ])
+    if instruction.strip():
+        lines.extend(["", "COORDINATOR INSTRUCTION:", instruction.strip()[:2000]])
+    lines.extend([
+        "",
+        "OUTPUT CONTRACT (first non-empty line is authoritative):",
+        "  REPORT_READY",
+        "",
+        "Status:",
+        "  <PASS / PASS_WITH_NOTES / REQUEST_CHANGES / FAIL>",
+        "",
+        "Report:",
+        "  <absolute .md path under allowed Ai-Report roots>",
+        "",
+        "Summary:",
+        "  <short summary>",
+        "",
+        "Return REPORT_READY only after the report exists on disk.",
+    ])
+    return ReportPromptResult(ok=True, prompt="\n".join(lines))
+
+
 def build_report_orchestrated_dispatch_prompt(
     *,
     role: str,
@@ -615,11 +753,39 @@ def build_report_orchestrated_dispatch_prompt(
     max_chars: int = DEFAULT_MAX_REPORT_PROMPT_CHARS,
     expected_output_path: str = "",
     external_report_write_roots: list[str] | None = None,
+    prompt_memo_body: str = "",
+    policy: dict[str, Any] | None = None,
 ) -> ReportPromptResult:
     """Build next-worker prompt from stored report records (not channel history)."""
     dev = get_report_for_role(report_records, "developer")
     agy = get_report_for_role(report_records, "ui_lead")
     reviewer = get_report_for_role(report_records, "reviewer")
+
+    if role == "developer" and not awaiting_developer_correction:
+        ok, blocker = validate_initial_developer_preflight(
+            policy,
+            prompt_memo_body=prompt_memo_body,
+            expected_output_path=expected_output_path,
+            external_report_write_roots=external_report_write_roots,
+        )
+        if not ok:
+            return ReportPromptResult(ok=False, blocker=blocker)
+        workspace = (policy or {}).get("workspace") or {}
+        return build_initial_developer_report_prompt(
+            project=project,
+            phase=phase,
+            subject=subject,
+            workspace_root=str(workspace.get("root") or ""),
+            expected_head=str(workspace.get("expected_head") or ""),
+            read_paths=[
+                p for p in ((policy or {}).get("read_paths") or [])
+                if isinstance(p, str) and p.strip()
+            ],
+            prompt_memo_body=prompt_memo_body,
+            instruction=instruction,
+            expected_output_path=expected_output_path,
+            external_report_write_roots=external_report_write_roots,
+        )
 
     if role == "ui_lead":
         if not dev:
@@ -690,7 +856,15 @@ def build_report_orchestrated_dispatch_prompt(
         ok, rev_content, _ = load_report_content(reviewer)
         if not ok:
             return ReportPromptResult(ok=False, blocker=rev_content)
-        fits, total = report_content_fits_prompt(rev_content, max_chars)
+        prior_dev_record: ReportRecord | None = None
+        prior_dev_content = ""
+        if dev:
+            dev_ok, prior_dev_content, _ = load_report_content(dev)
+            if not dev_ok:
+                return ReportPromptResult(ok=False, blocker=prior_dev_content)
+            prior_dev_record = dev
+        combined_len = len(rev_content) + len(prior_dev_content)
+        fits, total = report_content_fits_prompt("x" * combined_len, max_chars)
         if not fits:
             return ReportPromptResult(
                 ok=False,
@@ -705,6 +879,8 @@ def build_report_orchestrated_dispatch_prompt(
             subject=subject,
             reviewer_record=reviewer,
             reviewer_content=rev_content,
+            developer_record=prior_dev_record,
+            developer_content=prior_dev_content,
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
@@ -723,10 +899,16 @@ def build_developer_correction_report_prompt(
     subject: str,
     reviewer_record: ReportRecord,
     reviewer_content: str,
+    developer_record: ReportRecord | None = None,
+    developer_content: str = "",
     instruction: str = "",
     expected_output_path: str = "",
     external_report_write_roots: list[str] | None = None,
 ) -> ReportPromptResult:
+    sources: list[tuple[ReportRecord, str]] = []
+    if developer_record and developer_content:
+        sources.append((developer_record, developer_content))
+    sources.append((reviewer_record, reviewer_content))
     return build_report_review_prompt(
         target_role="developer",
         role_label="Claude Developer",
@@ -735,10 +917,12 @@ def build_developer_correction_report_prompt(
         phase=phase,
         subject=subject,
         task=(
-            "Address reviewer findings using the supplied reviewer report.\n"
+            "Address reviewer findings using the supplied reviewer report"
+            + (" and prior developer report" if developer_record else "")
+            + ".\n"
             "Update your analysis report; do not modify Twinpet product source files."
         ),
-        source_reports=[(reviewer_record, reviewer_content)],
+        source_reports=sources,
         instruction=instruction,
         expected_output_path=expected_output_path,
         external_report_write_roots=external_report_write_roots,

@@ -1719,6 +1719,8 @@ class SessionEngine:
                 expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
                 external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
                 max_chars=int(worker_ctx.get("max_report_prompt_chars") or DEFAULT_MAX_REPORT_PROMPT_CHARS),
+                prompt_memo_body=self._session_prompt_body(session),
+                policy=policy,
             )
             if result.ok:
                 return result.prompt
@@ -1766,20 +1768,22 @@ class SessionEngine:
                 )
             return
 
-        if (
-            cls.report_orchestrated
-            and role == "developer"
-            and cls.awaiting_developer_correction
-        ):
+        if cls.report_orchestrated and role == "developer":
             prompt = _dispatch_report_orchestrated_prompt()
             if prompt is None:
                 return
-            if role_uses_headless_scoped_workspace(session, role):
-                self._trigger_scoped_workspace_worker(
-                    session, tmpl, phase, phase_idx, turn_idx, role, agent, channel,
-                    instruction=prompt,
-                )
-                return
+            if report_contract:
+                prompt = f"{prompt}\n\n{report_contract}"
+            relay_entry = self._make_relay_queue_entry(
+                prompt=prompt,
+                session=session,
+                phase_idx=phase_idx,
+                turn_idx=turn_idx,
+                role=role,
+                channel=channel,
+            )
+            self._trigger.trigger_sync(agent, channel=channel, relay_entry=relay_entry)
+            return
 
         if role_uses_headless_scoped_workspace(session, role):
             self._trigger_scoped_workspace_worker(
