@@ -222,10 +222,9 @@ class TrustedMemoTests(unittest.TestCase):
     def test_memo_requests_final_markdown_report(self):
         memo, _, _ = self._memo()
         self.assertIn("FINAL RESPONSE REQUIREMENT", memo.prompt)
-        self.assertIn("complete analysis report as your final response in Markdown", memo.prompt)
-        self.assertIn("Do not create or edit files for the report", memo.prompt)
-        self.assertNotIn("REPORT_FILE_WRITE_BEGIN", memo.prompt)
-        self.assertNotIn("REPORT_FILE_WRITE_END", memo.prompt)
+        self.assertIn("Return the full Markdown report in stdout OR write it only", memo.prompt)
+        self.assertIn("Do not use REPORT_FILE_WRITE_BEGIN/END", memo.prompt)
+        self.assertIn("Do not use REPORT_FILE_WRITE_BEGIN/END in trusted CLI mode", memo.prompt)
 
     def test_memo_has_final_response_requirement_section(self):
         memo, _, _ = self._memo()

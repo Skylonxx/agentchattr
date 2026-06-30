@@ -116,6 +116,8 @@ TRUSTED_CLI_UNEXPECTED_PATH_BLOCKER_PREFIX = (
 DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS = 1
 TRUSTED_CLI_REPORT_BRIDGE_REPAIR_EXCERPT_CHARS = 4000
 TRUSTED_CLI_MIN_REPORT_CHARS = 800
+TRUSTED_CLI_REPORT_FILE_REREAD_ATTEMPTS = 3
+TRUSTED_CLI_REPORT_FILE_REREAD_DELAY_SEC = 0.25
 
 _NATIVE_WRITE_PERMISSION_PROMPT_RES = (
     re.compile(r"explicit approval", re.IGNORECASE),
@@ -751,17 +753,49 @@ def _trusted_cli_salvage_diagnostics_lines(
     return "\n".join(lines)
 
 
-def attempt_salvage_trusted_cli_existing_report(
-    policy: dict[str, Any],
-    stdout_text: str = "",
-    *,
-    role: str = "developer",
+def resolve_trusted_cli_repair_rounds(
     queue_item: dict[str, Any] | None = None,
-    worker_context: dict[str, Any] | None = None,
-    cwd: str | Path | None = None,
-    native_write_warning: bool = False,
+    *,
+    repair_rounds_used: int | None = None,
+    max_repair_rounds: int | None = None,
+) -> tuple[int, int]:
+    """Read trusted CLI repair counters from explicit args or queue session context."""
+    used = repair_rounds_used
+    max_r = max_repair_rounds
+    if isinstance(queue_item, dict):
+        wpc = queue_item.get("workspace_policy_context")
+        if isinstance(wpc, dict):
+            if used is None:
+                try:
+                    used = int(wpc.get("trusted_cli_report_bridge_repair_rounds") or 0)
+                except (TypeError, ValueError):
+                    used = 0
+            if max_r is None:
+                try:
+                    max_r = int(
+                        wpc.get("max_trusted_cli_report_bridge_repair_rounds")
+                        or DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS
+                    )
+                except (TypeError, ValueError):
+                    max_r = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS
+    if used is None:
+        used = 0
+    if max_r is None:
+        max_r = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS
+    return int(used), int(max_r)
+
+
+def _attempt_salvage_trusted_cli_existing_report_once(
+    policy: dict[str, Any],
+    stdout_text: str,
+    *,
+    role: str,
+    queue_item: dict[str, Any] | None,
+    worker_context: dict[str, Any] | None,
+    cwd: str | Path | None,
+    native_write_warning: bool,
 ) -> TrustedCliSalvageResult:
-    """Try to accept an existing expected Ai-Report .md file before incomplete blocker."""
+    """Single read of the expected trusted CLI report path."""
     from report_orchestration import read_report_file, validate_report_path
 
     result = TrustedCliSalvageResult(stdout_chars=len((stdout_text or "").strip()))
@@ -822,6 +856,42 @@ def attempt_salvage_trusted_cli_existing_report(
         notes=f"{notes}\n\n{diag}",
     )
     return result
+
+
+def attempt_salvage_trusted_cli_existing_report(
+    policy: dict[str, Any],
+    stdout_text: str = "",
+    *,
+    role: str = "developer",
+    queue_item: dict[str, Any] | None = None,
+    worker_context: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
+    native_write_warning: bool = False,
+    reread_attempts: int = 1,
+    reread_delay_sec: float = 0.0,
+) -> TrustedCliSalvageResult:
+    """Try to accept an existing expected Ai-Report .md file before incomplete blocker."""
+    import time
+
+    attempts = max(1, int(reread_attempts or 1))
+    delay = max(0.0, float(reread_delay_sec or 0.0))
+    last: TrustedCliSalvageResult | None = None
+    for attempt_idx in range(attempts):
+        if attempt_idx > 0 and delay > 0:
+            time.sleep(delay)
+        last = _attempt_salvage_trusted_cli_existing_report_once(
+            policy,
+            stdout_text,
+            role=role,
+            queue_item=queue_item,
+            worker_context=worker_context,
+            cwd=cwd,
+            native_write_warning=native_write_warning,
+        )
+        if last.salvaged:
+            return last
+    assert last is not None
+    return last
 
 
 def is_docs_only_snapshot_mode(
@@ -1580,8 +1650,8 @@ def resolve_trusted_cli_report_outcome(
     queue_item: dict[str, Any] | None = None,
     worker_context: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
-    repair_rounds_used: int = 0,
-    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+    repair_rounds_used: int | None = None,
+    max_repair_rounds: int | None = None,
 ) -> TrustedCliReportOutcome:
     """Shared trusted CLI report-output resolver for wrapper and coordinator."""
     from report_orchestration import parse_report_ready
@@ -1592,6 +1662,12 @@ def resolve_trusted_cli_report_outcome(
     sample = (captured or "").strip()
     if not sample:
         return TrustedCliReportOutcome(kind="none")
+
+    repair_used, repair_max = resolve_trusted_cli_repair_rounds(
+        queue_item,
+        repair_rounds_used=repair_rounds_used,
+        max_repair_rounds=max_repair_rounds,
+    )
 
     profile = str(policy.get("policy_id") or "")
     mode = str(policy.get("mode") or "")
@@ -1606,10 +1682,26 @@ def resolve_trusted_cli_report_outcome(
         workspace_profile=profile,
         workspace_mode=mode,
         report_path=report_path,
-        repair_round=repair_rounds_used,
-        max_repair_rounds=max_repair_rounds,
+        repair_round=repair_used,
+        max_repair_rounds=repair_max,
+    )
+    salvage_kwargs = dict(
+        role=role,
+        queue_item=queue_item,
+        worker_context=worker_context,
+        cwd=cwd,
     )
 
+    def _salvage_outcome(
+        salvage: TrustedCliSalvageResult,
+    ) -> TrustedCliReportOutcome:
+        return TrustedCliReportOutcome(
+            kind="report_ready",
+            report_ready=salvage.report_ready,
+            salvage=salvage,
+        )
+
+    # Already synthesized REPORT_READY / legacy REPORT_BEGIN passthrough.
     if parse_report_ready(sample) is not None or sample.startswith("REPORT_READY"):
         parsed = parse_report_ready(sample)
         if parsed:
@@ -1635,6 +1727,44 @@ def resolve_trusted_cli_report_outcome(
     if REPORT_BEGIN_MARKER in sample:
         return TrustedCliReportOutcome(kind="report_ready", report_ready=sample)
 
+    native_write = detect_native_write_permission_prompt(sample)
+    salvage: TrustedCliSalvageResult | None = None
+
+    # 1) Refusal without a valid expected file -> terminal BLOCKER.
+    if detect_trusted_cli_prompt_injection_refusal(sample):
+        salvage = attempt_salvage_trusted_cli_existing_report(
+            policy,
+            sample,
+            native_write_warning=native_write,
+            reread_attempts=1,
+            **salvage_kwargs,
+        )
+        if salvage.salvaged:
+            return _salvage_outcome(salvage)
+        return TrustedCliReportOutcome(
+            kind="blocker",
+            repair_reason="refusal",
+            text=format_trusted_cli_refusal_blocker(**common_blocker),
+            salvage=salvage,
+        )
+
+    # 2) File-first: immediate read of expected policy/session report path.
+    salvage = attempt_salvage_trusted_cli_existing_report(
+        policy,
+        sample,
+        native_write_warning=native_write,
+        reread_attempts=1,
+        **salvage_kwargs,
+    )
+    if salvage.salvaged:
+        return _salvage_outcome(salvage)
+
+    # 3) Complete stdout Markdown -> runtime save -> REPORT_READY.
+    captured_report = try_capture_trusted_cli_stdout_report(captured, policy)
+    if captured_report is not None:
+        return TrustedCliReportOutcome(kind="report_ready", report_ready=captured_report)
+
+    # 4) Legacy REPORT_FILE_WRITE bridge at expected path (compatibility only).
     bridge = try_process_scoped_worker_report_output(
         captured,
         policy,
@@ -1653,28 +1783,17 @@ def resolve_trusted_cli_report_outcome(
             )
         return TrustedCliReportOutcome(kind="report_ready", report_ready=bridge)
 
-    captured_report = try_capture_trusted_cli_stdout_report(captured, policy)
-    if captured_report is not None:
-        return TrustedCliReportOutcome(kind="report_ready", report_ready=captured_report)
-
-    native_write = detect_native_write_permission_prompt(sample)
-    salvage: TrustedCliSalvageResult | None = None
-    if native_write or len(sample) >= 1:
-        salvage = attempt_salvage_trusted_cli_existing_report(
-            policy,
-            sample,
-            role=role,
-            queue_item=queue_item,
-            worker_context=worker_context,
-            cwd=cwd,
-            native_write_warning=native_write,
-        )
-        if salvage.salvaged:
-            return TrustedCliReportOutcome(
-                kind="report_ready",
-                report_ready=salvage.report_ready,
-                salvage=salvage,
-            )
+    # 5) Bounded expected-path re-read before repair/terminal.
+    salvage = attempt_salvage_trusted_cli_existing_report(
+        policy,
+        sample,
+        native_write_warning=native_write,
+        reread_attempts=TRUSTED_CLI_REPORT_FILE_REREAD_ATTEMPTS,
+        reread_delay_sec=TRUSTED_CLI_REPORT_FILE_REREAD_DELAY_SEC,
+        **salvage_kwargs,
+    )
+    if salvage.salvaged:
+        return _salvage_outcome(salvage)
 
     wrapper_blocker = _trusted_cli_wrapper_blocker_kind(sample)
     if wrapper_blocker == "refusal" or wrapper_blocker == "unexpected_path":
@@ -1686,29 +1805,32 @@ def resolve_trusted_cli_report_outcome(
         )
     if wrapper_blocker in ("native_write", "incomplete"):
         repair_reason = wrapper_blocker
-        if repair_rounds_used < max_repair_rounds:
+        if repair_used < repair_max:
             return TrustedCliReportOutcome(
                 kind="correction_prompt",
                 repair_reason=repair_reason,
                 salvage=salvage,
             )
+        if repair_reason == "native_write":
+            blocker = format_trusted_cli_native_write_blocker(
+                cwd=cwd,
+                queue_item=queue_item,
+                **common_blocker,
+            )
+        else:
+            blocker = format_trusted_cli_incomplete_report_blocker(
+                **common_blocker,
+                salvage=salvage,
+            )
         return TrustedCliReportOutcome(
             kind="blocker",
             repair_reason=repair_reason,
-            text=sample,
-            salvage=salvage,
-        )
-
-    if detect_trusted_cli_prompt_injection_refusal(sample):
-        return TrustedCliReportOutcome(
-            kind="blocker",
-            repair_reason="refusal",
-            text=format_trusted_cli_refusal_blocker(**common_blocker),
+            text=blocker,
             salvage=salvage,
         )
 
     repair_reason = "native_write" if native_write else "incomplete"
-    if repair_rounds_used < max_repair_rounds:
+    if repair_used < repair_max:
         return TrustedCliReportOutcome(
             kind="correction_prompt",
             repair_reason=repair_reason,
@@ -1738,8 +1860,8 @@ def process_trusted_cli_worker_report_output(
     queue_item: dict[str, Any] | None = None,
     worker_context: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
-    repair_rounds_used: int = 0,
-    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+    repair_rounds_used: int | None = None,
+    max_repair_rounds: int | None = None,
 ) -> str | None:
     """Trusted CLI wrapper adapter — delegates to shared resolver."""
     ctx = worker_context
@@ -1749,14 +1871,19 @@ def process_trusted_cli_worker_report_output(
             "policy_id": policy.get("policy_id"),
             "report_paths": list(policy.get("report_paths") or []),
         }
+    used, max_r = resolve_trusted_cli_repair_rounds(
+        queue_item,
+        repair_rounds_used=repair_rounds_used,
+        max_repair_rounds=max_repair_rounds,
+    )
     outcome = resolve_trusted_cli_report_outcome(
         captured,
         policy,
         queue_item=queue_item,
         worker_context=ctx,
         cwd=cwd,
-        repair_rounds_used=repair_rounds_used,
-        max_repair_rounds=max_repair_rounds,
+        repair_rounds_used=used,
+        max_repair_rounds=max_r,
     )
     if outcome.kind == "report_ready":
         return outcome.report_ready
@@ -1772,6 +1899,8 @@ def process_claude_worker_report_output(
     queue_item: dict[str, Any] | None = None,
     worker_context: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
+    repair_rounds_used: int | None = None,
+    max_repair_rounds: int | None = None,
 ) -> str | None:
     """Return transformed worker output when report-write bridge handles it."""
     if isinstance(policy, dict) and is_trusted_direct_repo_cli_policy(policy):
@@ -1781,6 +1910,8 @@ def process_claude_worker_report_output(
             queue_item=queue_item,
             worker_context=worker_context,
             cwd=cwd,
+            repair_rounds_used=repair_rounds_used,
+            max_repair_rounds=max_repair_rounds,
         )
         if handled is not None:
             return handled

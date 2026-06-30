@@ -723,7 +723,7 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertTrue(out.startswith("REPORT_READY"))
         self.assertTrue(Path(self.report_path).is_file())
 
-    def test_trusted_cli_prompt_injection_refusal_blocker(self):
+    def test_trusted_cli_prompt_injection_refusal_blocker_without_file(self):
         refusal = "This message has hallmarks of prompt injection and I cannot comply."
         out = process_claude_worker_report_output(
             refusal,
@@ -734,6 +734,20 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertIsNotNone(out)
         assert out is not None
         self.assertIn("trusted CLI refused report-output contract", out)
+
+    def test_trusted_cli_prompt_injection_refusal_with_valid_file_salvages(self):
+        refusal = "This message has hallmarks of prompt injection and I cannot comply."
+        Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
+        out = process_claude_worker_report_output(
+            refusal,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertIn("trusted_cli_report_salvaged=true", out)
 
     def _resolver_outcome(self, stdout, *, policy=None, repair_rounds_used=0, worker_context=None):
         from worker_workspace import resolve_trusted_cli_report_outcome
@@ -911,6 +925,75 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertIsNone(wrapper_out)
         self.assertEqual(correction.kind, "correction_prompt")
         self.assertEqual(terminal.kind, "blocker")
+
+    def test_wrapper_uses_queue_repair_rounds_for_terminal_blocker(self):
+        stdout = "Status unchanged. " + ("x" * 400)
+        item = dict(self.item)
+        wpc = dict(item["workspace_policy_context"])
+        wpc["trusted_cli_report_bridge_repair_rounds"] = 1
+        wpc["max_trusted_cli_report_bridge_repair_rounds"] = 1
+        item["workspace_policy_context"] = wpc
+        out = process_claude_worker_report_output(
+            stdout, self.policy, queue_item=item, cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("trusted CLI report stdout incomplete", out)
+        self.assertIn("repair_round: 1", out)
+
+    def test_live_failure_class_short_stdout_with_valid_expected_file(self):
+        Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
+        stdout = (
+            "Status unchanged (only the pre-existing docs/tracker drift noted in the task brief "
+            "— no PaymentModal or red-zone files touched). Here's the analysis."
+        )
+        self.assertGreaterEqual(len(stdout.strip()), 100)
+        self.assertLess(len(stdout.strip()), 800)
+        out = process_claude_worker_report_output(
+            stdout,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertIn("trusted_cli_report_salvaged=true", out)
+
+    def test_delayed_report_file_visibility_after_bounded_reread(self):
+        from unittest.mock import patch
+        from worker_workspace import attempt_salvage_trusted_cli_existing_report
+
+        body = self._valid_salvage_report_body()
+        Path(self.report_path).write_text(body, encoding="utf-8")
+        read_counts = {"n": 0}
+        original_is_file = Path.is_file
+
+        def delayed_is_file(self_path):
+            read_counts["n"] += 1
+            if read_counts["n"] < 2:
+                return False
+            return original_is_file(self_path)
+
+        with patch.object(Path, "is_file", delayed_is_file):
+            single = attempt_salvage_trusted_cli_existing_report(
+                self.policy,
+                "Status unchanged. Here's the analysis.",
+                reread_attempts=1,
+            )
+            self.assertFalse(single.salvaged)
+            self.assertEqual(single.failure_reason, "report file not found")
+
+            read_counts["n"] = 0
+            with patch("time.sleep", lambda _s: None):
+                multi = attempt_salvage_trusted_cli_existing_report(
+                    self.policy,
+                    "Status unchanged. Here's the analysis.",
+                    reread_attempts=3,
+                    reread_delay_sec=0.25,
+                )
+        self.assertTrue(multi.salvaged)
+        self.assertIn("trusted_cli_report_salvaged=true", multi.report_ready)
 
     def test_findings_heuristic_rejects_skeletal_stub(self):
         body = (

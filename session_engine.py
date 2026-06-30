@@ -417,8 +417,16 @@ class SessionEngine:
         wpc = self._session_workspace_policy_context(
             session, role, phase_idx, turn_idx,
         )
+        wpc = dict(wpc)
+        cls = self._load_coordinator_loop_state(session)
+        if cls is not None:
+            wpc["trusted_cli_report_bridge_repair_rounds"] = (
+                cls.trusted_cli_report_bridge_repair_rounds
+            )
+            wpc["max_trusted_cli_report_bridge_repair_rounds"] = (
+                cls.max_trusted_cli_report_bridge_repair_rounds
+            )
         if handoff_repair or trusted_cli_report_bridge_repair:
-            wpc = dict(wpc)
             wpc["skip_snapshot_injection"] = True
         if handoff_repair:
             wpc["handoff_repair"] = True
@@ -1929,12 +1937,15 @@ class SessionEngine:
         wpc = self._session_workspace_policy_context(
             session, effective_role, phase_idx, turn_idx,
         )
+        wpc = dict(wpc)
+        wpc["trusted_cli_report_bridge_repair_rounds"] = cls.trusted_cli_report_bridge_repair_rounds
+        wpc["max_trusted_cli_report_bridge_repair_rounds"] = (
+            cls.max_trusted_cli_report_bridge_repair_rounds
+        )
         if handoff_repair:
-            wpc = dict(wpc)
             wpc["handoff_repair"] = True
             wpc["skip_snapshot_injection"] = True
         if trusted_bridge_repair:
-            wpc = dict(wpc)
             wpc["trusted_cli_report_bridge_repair"] = True
             wpc["skip_snapshot_injection"] = True
         try:

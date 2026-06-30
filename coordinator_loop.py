@@ -1113,12 +1113,34 @@ def _terminal_trusted_cli_output_blocker(
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction:
     from worker_workspace import (
+        attempt_salvage_trusted_cli_existing_report,
         format_trusted_cli_incomplete_report_blocker,
         format_trusted_cli_native_write_blocker,
         format_trusted_cli_refusal_blocker,
+        TRUSTED_CLI_REPORT_FILE_REREAD_ATTEMPTS,
+        TRUSTED_CLI_REPORT_FILE_REREAD_DELAY_SEC,
     )
 
     policy = (worker_context or {}).get("workspace_policy") or {}
+    workspace = policy.get("workspace") or {}
+    salvage = attempt_salvage_trusted_cli_existing_report(
+        policy,
+        text,
+        role="developer",
+        worker_context=worker_context,
+        cwd=str(workspace.get("root") or ""),
+        native_write_warning=False,
+        reread_attempts=TRUSTED_CLI_REPORT_FILE_REREAD_ATTEMPTS,
+        reread_delay_sec=TRUSTED_CLI_REPORT_FILE_REREAD_DELAY_SEC,
+    )
+    if salvage.salvaged:
+        return _try_report_orchestrated_worker(
+            state,
+            "developer",
+            salvage.report_ready,
+            worker_context=worker_context,
+        )
+
     by_role = (worker_context or {}).get("report_paths_by_role") or {}
     report_path = str(by_role.get("developer") or "")
     if not report_path:
@@ -1145,7 +1167,7 @@ def _terminal_trusted_cli_output_blocker(
             **common,
         )
     else:
-        blocker = format_trusted_cli_incomplete_report_blocker(**common)
+        blocker = format_trusted_cli_incomplete_report_blocker(**common, salvage=salvage)
     return _terminal_blocker(state, blocker)
 
 
