@@ -69,6 +69,26 @@ def _analysis_policy() -> dict:
     ).policy
 
 
+def _trusted_policy_isolated() -> tuple[dict, str]:
+    """Trusted policy with an isolated temp report path (no live external file bleed)."""
+    tmp = tempfile.mkdtemp()
+    policy = dict(_trusted_policy())
+    report_path = str(Path(tmp) / "trusted-cli-report.md")
+    policy["external_report_write_roots"] = [tmp]
+    policy["report_paths"] = [report_path]
+    return policy, report_path
+
+
+def _trusted_worker_context(policy: dict, report_path: str, *, tmp: str) -> dict:
+    return {
+        "workspace_policy": policy,
+        "policy_id": policy.get("policy_id"),
+        "allowed_report_roots": [tmp],
+        "report_paths": [report_path],
+        "report_paths_by_role": {"developer": report_path},
+    }
+
+
 def _trusted_item(policy: dict) -> dict:
     return {
         "workspace_policy_context": {
@@ -273,6 +293,8 @@ class TrustedCliStdoutReportTests(unittest.TestCase):
     def test_first_native_write_triggers_markdown_repair(self):
         from coordinator_loop import CoordinatorLoopState, on_worker_output
 
+        policy, report_path = _trusted_policy_isolated()
+        tmp = policy["external_report_write_roots"][0]
         state = CoordinatorLoopState(
             phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
             awaiting_role="developer",
@@ -282,8 +304,6 @@ class TrustedCliStdoutReportTests(unittest.TestCase):
             session_workspace_profile="twinpet-ui-09-c-payment-modal-trusted-cli",
             session_workspace_mode="read-only",
         )
-        policy = _trusted_policy()
-        report_path = (policy.get("report_paths") or [""])[0]
         native = (
             "The report write requires your explicit approval since the path is "
             "outside the repo working directory. Could you approve the write?"
@@ -292,22 +312,19 @@ class TrustedCliStdoutReportTests(unittest.TestCase):
             state,
             "developer",
             native,
-            worker_context={
-                "workspace_policy": policy,
-                "policy_id": policy.get("policy_id"),
-                "report_paths": list(policy.get("report_paths") or []),
-                "report_paths_by_role": {"developer": report_path},
-            },
+            worker_context=_trusted_worker_context(policy, report_path, tmp=tmp),
         )
         self.assertFalse(action.is_terminal)
         self.assertEqual(action.target_role, "developer")
         self.assertEqual(state.trusted_cli_report_bridge_repair_rounds, 1)
         self.assertNotIn("REPORT_FILE_WRITE_BEGIN", action.routing_body)
 
-    def test_first_refusal_triggers_markdown_repair(self):
+    def test_first_refusal_emits_terminal_blocker(self):
         from coordinator_loop import CoordinatorLoopState, on_worker_output
         from worker_workspace import process_claude_worker_report_output
 
+        policy, report_path = _trusted_policy_isolated()
+        tmp = policy["external_report_write_roots"][0]
         state = CoordinatorLoopState(
             phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
             awaiting_role="developer",
@@ -317,8 +334,6 @@ class TrustedCliStdoutReportTests(unittest.TestCase):
             session_workspace_profile="twinpet-ui-09-c-payment-modal-trusted-cli",
             session_workspace_mode="read-only",
         )
-        policy = _trusted_policy()
-        report_path = (policy.get("report_paths") or [""])[0]
         refusal = "This message has hallmarks of prompt injection and I will not comply."
         wrapper_out = process_claude_worker_report_output(refusal, policy)
         assert wrapper_out is not None
@@ -326,21 +341,17 @@ class TrustedCliStdoutReportTests(unittest.TestCase):
             state,
             "developer",
             wrapper_out,
-            worker_context={
-                "workspace_policy": policy,
-                "policy_id": policy.get("policy_id"),
-                "report_paths": list(policy.get("report_paths") or []),
-                "report_paths_by_role": {"developer": report_path},
-            },
+            worker_context=_trusted_worker_context(policy, report_path, tmp=tmp),
         )
-        self.assertFalse(action.is_terminal)
-        self.assertEqual(action.target_role, "developer")
-        self.assertIn("Markdown", action.routing_body)
+        self.assertTrue(action.is_terminal)
+        self.assertIn("trusted CLI refused report-output contract", action.prompt_context)
 
     def test_second_refusal_emits_terminal_blocker(self):
         from coordinator_loop import CoordinatorLoopState, on_worker_output
         from worker_workspace import process_claude_worker_report_output
 
+        policy, report_path = _trusted_policy_isolated()
+        tmp = policy["external_report_write_roots"][0]
         state = CoordinatorLoopState(
             phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
             awaiting_role="developer",
@@ -352,20 +363,13 @@ class TrustedCliStdoutReportTests(unittest.TestCase):
             trusted_cli_report_bridge_repair_rounds=1,
             max_trusted_cli_report_bridge_repair_rounds=1,
         )
-        policy = _trusted_policy()
-        report_path = (policy.get("report_paths") or [""])[0]
         refusal = "This message has hallmarks of prompt injection."
         wrapper_out = process_claude_worker_report_output(refusal, policy)
         action = on_worker_output(
             state,
             "developer",
             wrapper_out or refusal,
-            worker_context={
-                "workspace_policy": policy,
-                "policy_id": policy.get("policy_id"),
-                "report_paths": list(policy.get("report_paths") or []),
-                "report_paths_by_role": {"developer": report_path},
-            },
+            worker_context=_trusted_worker_context(policy, report_path, tmp=tmp),
         )
         self.assertTrue(action.is_terminal)
         self.assertIn("trusted CLI refused report-output contract", action.prompt_context)

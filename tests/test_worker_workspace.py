@@ -1078,6 +1078,207 @@ class TrustedCliCoordinatorSalvageTests(unittest.TestCase):
         self.assertTrue(action.is_terminal)
         self.assertIn("trusted CLI report stdout incomplete", action.prompt_context or "")
 
+    def test_coordinator_salvaged_blocker_status_is_terminal(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        body = self._valid_report_body().replace("Status: PASS", "Status: BLOCKER")
+        Path(self.report_path).write_text(body, encoding="utf-8")
+        stdout = "Status unchanged. " + ("x" * 400)
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+        )
+        action = on_worker_output(
+            state, "developer", stdout, worker_context=self.worker_context,
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("BLOCKER", action.prompt_context or "")
+
+
+class TrustedCliReportPathMembershipTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.report_path = str(Path(self.tmp) / "trusted-cli-report.md")
+        self.arbitrary_path = str(Path(self.tmp) / "arbitrary.md")
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "trusted_direct_repo_cli": True,
+            "policy_id": "twinpet-ui-09-c-payment-modal-trusted-cli",
+            "write_files": [],
+            "external_report_write_roots": [self.tmp],
+            "report_paths": [self.report_path],
+        }
+        self.worker_context = {
+            "workspace_policy": self.policy,
+            "allowed_report_roots": [self.tmp],
+            "report_paths": [self.report_path],
+            "report_paths_by_role": {"developer": self.report_path},
+        }
+        self.item = {
+            "workspace_policy_context": {
+                "relay_kind": "session_turn",
+                "session_id": 99,
+                "session_role": "developer",
+                "policy_id": self.policy["policy_id"],
+                "policy_mode": "read-only",
+                "workspace_root": TWINPET,
+                "trusted_direct_repo_cli": True,
+            },
+        }
+
+    def test_report_ready_arbitrary_path_blocked(self):
+        from tests.test_report_orchestration import _report_ready
+        from worker_workspace import resolve_trusted_cli_report_outcome
+
+        Path(self.arbitrary_path).write_text("# Arbitrary\n", encoding="utf-8")
+        ready = _report_ready(self.arbitrary_path)
+        outcome = resolve_trusted_cli_report_outcome(
+            ready,
+            self.policy,
+            worker_context=self.worker_context,
+        )
+        self.assertEqual(outcome.kind, "blocker")
+        self.assertIn("not an expected report path", outcome.text)
+
+    def test_report_ready_expected_path_accepted(self):
+        from tests.test_report_orchestration import _report_ready
+        from worker_workspace import resolve_trusted_cli_report_outcome
+
+        Path(self.report_path).write_text(
+            "# Report\n\nStatus: PASS\n\n" + ("x" * 900),
+            encoding="utf-8",
+        )
+        ready = _report_ready(self.report_path)
+        outcome = resolve_trusted_cli_report_outcome(
+            ready,
+            self.policy,
+            worker_context=self.worker_context,
+        )
+        self.assertEqual(outcome.kind, "report_ready")
+
+    def test_bridge_arbitrary_path_blocked(self):
+        arbitrary = self.arbitrary_path
+        body = (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {arbitrary}\n"
+            "Status: PASS\n"
+            "Summary: test\n"
+            "Next recommended role: coordinator\n"
+            "---\n"
+            "# Report\n\nDone.\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+        out = process_claude_worker_report_output(
+            body,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+            worker_context=self.worker_context,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("not an expected report path", out)
+        self.assertFalse(Path(arbitrary).is_file())
+
+    def test_bridge_expected_path_accepted(self):
+        body = (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {self.report_path}\n"
+            "Status: PASS\n"
+            "Summary: test\n"
+            "Next recommended role: coordinator\n"
+            "---\n"
+            "# Report\n\nDone.\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+        out = process_claude_worker_report_output(
+            body,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+            worker_context=self.worker_context,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertTrue(Path(self.report_path).is_file())
+
+    def test_wrapper_formatted_refusal_blocker_is_terminal(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+        from worker_workspace import format_trusted_cli_refusal_blocker
+
+        blocker = format_trusted_cli_refusal_blocker(
+            text="refusal",
+            policy=self.policy,
+            workspace_profile=self.policy["policy_id"],
+            workspace_mode="read-only",
+            report_path=self.report_path,
+        )
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+        )
+        action = on_worker_output(
+            state,
+            "developer",
+            blocker,
+            worker_context=self.worker_context,
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("trusted CLI refused report-output contract", action.prompt_context or "")
+
+    def test_wrapper_formatted_incomplete_with_valid_report_salvages(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+        from worker_workspace import format_trusted_cli_incomplete_report_blocker
+
+        body = (
+            "# Twinpet Analysis\n\nStatus: PASS\n\n## Summary\nDone.\n\n"
+            "## Files inspected\n- a.tsx\n\n## Findings\n"
+            + ("Review notes. " * 80)
+            + "\n\n## Red-zone confirmation\nNo modifications.\n\n"
+            "## Recommended next step\nRoute coordinator.\n"
+        )
+        Path(self.report_path).write_text(body, encoding="utf-8")
+        blocker = format_trusted_cli_incomplete_report_blocker(
+            text="short stdout",
+            policy=self.policy,
+            workspace_profile=self.policy["policy_id"],
+            workspace_mode="read-only",
+            report_path=self.report_path,
+            repair_round=1,
+            max_repair_rounds=1,
+        )
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+            trusted_cli_report_bridge_repair_rounds=1,
+            max_trusted_cli_report_bridge_repair_rounds=1,
+        )
+        action = on_worker_output(
+            state,
+            "developer",
+            blocker,
+            worker_context=self.worker_context,
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "coordinator")
+
 
 if __name__ == "__main__":
     unittest.main()

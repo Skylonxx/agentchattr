@@ -1296,13 +1296,14 @@ def _on_developer_output(
     *,
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction:
+    if _trusted_cli_context(state, worker_context):
+        if handled := _try_trusted_cli_shared_report_outcome(
+            state, text, worker_context=worker_context,
+        ):
+            return handled
+
     if handled := _try_report_orchestrated_worker(
         state, "developer", text, worker_context=worker_context,
-    ):
-        return handled
-
-    if handled := _try_trusted_cli_shared_report_outcome(
-        state, text, worker_context=worker_context,
     ):
         return handled
 

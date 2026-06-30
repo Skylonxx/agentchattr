@@ -110,6 +110,9 @@ TRUSTED_CLI_REFUSED_BLOCKER_PREFIX = (
 TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX = (
     "BLOCKER: trusted CLI report stdout incomplete"
 )
+TRUSTED_CLI_UNEXPECTED_PATH_BLOCKER_PREFIX = (
+    "BLOCKER: trusted CLI report path is not an expected report path"
+)
 DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS = 1
 TRUSTED_CLI_REPORT_BRIDGE_REPAIR_EXCERPT_CHARS = 4000
 TRUSTED_CLI_MIN_REPORT_CHARS = 800
@@ -649,6 +652,67 @@ def resolve_expected_trusted_cli_report_path(
         if policy_paths:
             return str(policy_paths[0])
     return ""
+
+
+def _normalize_trusted_cli_report_path_key(path: str | Path) -> str:
+    try:
+        return str(Path(path).resolve()).lower()
+    except OSError:
+        return str(path).strip().lower()
+
+
+def trusted_cli_report_path_is_expected(
+    raw_path: str,
+    policy: dict[str, Any] | None,
+    *,
+    role: str = "developer",
+    worker_context: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
+    """True when raw_path canonicalizes to the trusted session expected report path."""
+    expected = resolve_expected_trusted_cli_report_path(
+        policy,
+        role=role,
+        worker_context=worker_context,
+    )
+    if not expected:
+        return False, "expected report path not configured"
+    if _normalize_trusted_cli_report_path_key(raw_path) != _normalize_trusted_cli_report_path_key(expected):
+        return False, expected
+    return True, expected
+
+
+def format_trusted_cli_unexpected_report_path_blocker(
+    *,
+    actual_path: str,
+    expected_path: str,
+    policy: dict[str, Any] | None = None,
+    workspace_profile: str = "",
+    workspace_mode: str = "",
+) -> str:
+    lines = [
+        TRUSTED_CLI_UNEXPECTED_PATH_BLOCKER_PREFIX,
+        "",
+        f"workspace_profile: {workspace_profile or (policy or {}).get('policy_id', '')}",
+        f"workspace_mode: {workspace_mode or (policy or {}).get('mode', '')}",
+        "trusted_direct_repo_cli: true",
+        f"report_path: {expected_path}",
+        f"actual_path: {actual_path}",
+        f"expected_path: {expected_path}",
+    ]
+    return "\n".join(lines)
+
+
+def _trusted_cli_wrapper_blocker_kind(sample: str) -> str | None:
+    """Classify trusted CLI wrapper-formatted blocker text."""
+    if TRUSTED_CLI_REFUSED_BLOCKER_PREFIX in sample:
+        return "refusal"
+    if TRUSTED_CLI_UNEXPECTED_PATH_BLOCKER_PREFIX in sample:
+        return "unexpected_path"
+    if is_trusted_cli_native_write_blocker(sample):
+        return "native_write"
+    if TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX in sample:
+        return "incomplete"
+    return None
 
 
 def _trusted_cli_salvage_diagnostics_lines(
@@ -1389,25 +1453,64 @@ def extract_write_tool_call_intent(text: str) -> dict[str, str] | None:
 def try_process_scoped_worker_report_output(
     text: str,
     policy: dict[str, Any] | None,
+    *,
+    role: str = "developer",
+    worker_context: dict[str, Any] | None = None,
 ) -> str | None:
     """Handle REPORT_FILE_WRITE bridge / legacy REPORT_BEGIN for report-only sessions."""
     if not isinstance(policy, dict) or not policy_uses_report_write_bridge(policy):
         return None
     from report_orchestration import parse_report_ready, read_report_file, validate_report_path
 
+    trusted_cli = is_trusted_direct_repo_cli_policy(policy)
+    expected_path = ""
+    if trusted_cli:
+        expected_path = resolve_expected_trusted_cli_report_path(
+            policy,
+            role=role,
+            worker_context=worker_context,
+        )
+
     parsed = parse_report_ready(text)
     if parsed:
         roots = _external_report_roots(policy)
         ok, _reason, resolved = validate_report_path(parsed.report_path, allowed_roots=roots)
         if ok and resolved:
+            if trusted_cli:
+                matches, _expected = trusted_cli_report_path_is_expected(
+                    parsed.report_path,
+                    policy,
+                    role=role,
+                    worker_context=worker_context,
+                )
+                if not matches:
+                    return format_trusted_cli_unexpected_report_path_blocker(
+                        actual_path=parsed.report_path,
+                        expected_path=expected_path,
+                        policy=policy,
+                    )
             read_ok, _, _, _ = read_report_file(resolved)
             if read_ok:
                 return text.strip()
 
     bridge = extract_report_file_write_block(text)
     if bridge:
+        bridge_path = bridge["path"]
+        if trusted_cli:
+            matches, _expected = trusted_cli_report_path_is_expected(
+                bridge_path,
+                policy,
+                role=role,
+                worker_context=worker_context,
+            )
+            if not matches:
+                return format_trusted_cli_unexpected_report_path_blocker(
+                    actual_path=bridge_path,
+                    expected_path=expected_path,
+                    policy=policy,
+                )
         ok, saved_path, err = write_validated_external_report(
-            bridge["path"], bridge["content"], policy,
+            bridge_path, bridge["content"], policy,
         )
         if ok:
             return format_report_ready_after_worker_write(
@@ -1415,7 +1518,7 @@ def try_process_scoped_worker_report_output(
                 status=bridge.get("status") or "PASS",
                 summary=bridge.get("summary") or "",
             )
-        return format_report_write_failed_reply(path=bridge["path"], reason=err)
+        return format_report_write_failed_reply(path=bridge_path, reason=err)
 
     legacy = extract_report_block(text)
     if legacy:
@@ -1508,12 +1611,46 @@ def resolve_trusted_cli_report_outcome(
     )
 
     if parse_report_ready(sample) is not None or sample.startswith("REPORT_READY"):
+        parsed = parse_report_ready(sample)
+        if parsed:
+            matches, expected_or_reason = trusted_cli_report_path_is_expected(
+                parsed.report_path,
+                policy,
+                role=role,
+                worker_context=worker_context,
+            )
+            if not matches:
+                return TrustedCliReportOutcome(
+                    kind="blocker",
+                    repair_reason="unexpected_path",
+                    text=format_trusted_cli_unexpected_report_path_blocker(
+                        actual_path=parsed.report_path,
+                        expected_path=report_path or expected_or_reason,
+                        policy=policy,
+                        workspace_profile=profile,
+                        workspace_mode=mode,
+                    ),
+                )
         return TrustedCliReportOutcome(kind="report_ready", report_ready=sample)
     if REPORT_BEGIN_MARKER in sample:
         return TrustedCliReportOutcome(kind="report_ready", report_ready=sample)
 
-    bridge = try_process_scoped_worker_report_output(captured, policy)
+    bridge = try_process_scoped_worker_report_output(
+        captured,
+        policy,
+        role=role,
+        worker_context=worker_context,
+    )
     if bridge is not None:
+        if bridge.lstrip().startswith("BLOCKER:"):
+            repair_reason = "unexpected_path"
+            if TRUSTED_CLI_UNEXPECTED_PATH_BLOCKER_PREFIX in bridge:
+                repair_reason = "unexpected_path"
+            return TrustedCliReportOutcome(
+                kind="blocker",
+                repair_reason=repair_reason,
+                text=bridge,
+            )
         return TrustedCliReportOutcome(kind="report_ready", report_ready=bridge)
 
     captured_report = try_capture_trusted_cli_stdout_report(captured, policy)
@@ -1538,6 +1675,29 @@ def resolve_trusted_cli_report_outcome(
                 report_ready=salvage.report_ready,
                 salvage=salvage,
             )
+
+    wrapper_blocker = _trusted_cli_wrapper_blocker_kind(sample)
+    if wrapper_blocker == "refusal" or wrapper_blocker == "unexpected_path":
+        return TrustedCliReportOutcome(
+            kind="blocker",
+            repair_reason=wrapper_blocker,
+            text=sample,
+            salvage=salvage,
+        )
+    if wrapper_blocker in ("native_write", "incomplete"):
+        repair_reason = wrapper_blocker
+        if repair_rounds_used < max_repair_rounds:
+            return TrustedCliReportOutcome(
+                kind="correction_prompt",
+                repair_reason=repair_reason,
+                salvage=salvage,
+            )
+        return TrustedCliReportOutcome(
+            kind="blocker",
+            repair_reason=repair_reason,
+            text=sample,
+            salvage=salvage,
+        )
 
     if detect_trusted_cli_prompt_injection_refusal(sample):
         return TrustedCliReportOutcome(
@@ -1576,15 +1736,24 @@ def process_trusted_cli_worker_report_output(
     policy: dict[str, Any] | None,
     *,
     queue_item: dict[str, Any] | None = None,
+    worker_context: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
     repair_rounds_used: int = 0,
     max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
 ) -> str | None:
     """Trusted CLI wrapper adapter — delegates to shared resolver."""
+    ctx = worker_context
+    if ctx is None and isinstance(queue_item, dict) and isinstance(policy, dict):
+        ctx = {
+            "workspace_policy": policy,
+            "policy_id": policy.get("policy_id"),
+            "report_paths": list(policy.get("report_paths") or []),
+        }
     outcome = resolve_trusted_cli_report_outcome(
         captured,
         policy,
         queue_item=queue_item,
+        worker_context=ctx,
         cwd=cwd,
         repair_rounds_used=repair_rounds_used,
         max_repair_rounds=max_repair_rounds,
@@ -1601,6 +1770,7 @@ def process_claude_worker_report_output(
     policy: dict[str, Any] | None,
     *,
     queue_item: dict[str, Any] | None = None,
+    worker_context: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
 ) -> str | None:
     """Return transformed worker output when report-write bridge handles it."""
@@ -1609,12 +1779,17 @@ def process_claude_worker_report_output(
             captured,
             policy,
             queue_item=queue_item,
+            worker_context=worker_context,
             cwd=cwd,
         )
         if handled is not None:
             return handled
         return None
-    handled = try_process_scoped_worker_report_output(captured, policy)
+    handled = try_process_scoped_worker_report_output(
+        captured,
+        policy,
+        worker_context=worker_context,
+    )
     if handled is not None:
         return handled
     leakage = detect_tool_call_leakage(captured)
