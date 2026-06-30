@@ -1100,7 +1100,12 @@ def _process_claude_worker_output(
     if isinstance(queue_item, dict):
         policy = load_canonical_policy_for_item(queue_item, data_dir=data_dir)
 
-    bridge_reply = process_claude_worker_report_output(captured, policy=policy)
+    bridge_reply = process_claude_worker_report_output(
+        captured,
+        policy=policy,
+        queue_item=queue_item if isinstance(queue_item, dict) else None,
+        cwd=cwd,
+    )
     if bridge_reply is not None:
         return bridge_reply
 

@@ -174,6 +174,19 @@ class TrustedMemoTests(unittest.TestCase):
         self.assertNotIn("READ-ONLY SNAPSHOTS:", memo.prompt)
         self.assertNotIn("```", memo.prompt)
 
+    def test_memo_forbids_native_write_for_report(self):
+        memo, _, _ = self._memo()
+        self.assertIn("REPORT OUTPUT METHOD", memo.prompt)
+        self.assertIn("Do NOT use Claude Code Write/Edit tools", memo.prompt)
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", memo.prompt)
+        self.assertIn("REPORT_FILE_WRITE_END", memo.prompt)
+        self.assertIn("BLOCKER: trusted CLI report bridge output failed", memo.prompt)
+
+    def test_memo_requires_report_bridge_section(self):
+        memo, _, _ = self._memo()
+        lines = memo.prompt.splitlines()
+        self.assertTrue(any(ln.startswith("REPORT OUTPUT METHOD") for ln in lines))
+
 
 class TrustedDispatchTests(unittest.TestCase):
     def test_developer_dispatch_uses_memo_not_manifest(self):

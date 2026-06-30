@@ -610,5 +610,86 @@ class WorkerReportWriteBridgeTests(unittest.TestCase):
         self.assertIn("Do not emit <tool_call>", augment)
 
 
+class TrustedCliReportBridgeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.report_path = str(Path(self.tmp) / "trusted-cli-report.md")
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "trusted_direct_repo_cli": True,
+            "policy_id": "twinpet-ui-09-c-payment-modal-trusted-cli",
+            "write_files": [],
+            "external_report_write_roots": [self.tmp],
+            "report_paths": [self.report_path],
+        }
+        self.item = {
+            "workspace_policy_context": {
+                "relay_kind": "session_turn",
+                "session_id": 99,
+                "session_role": "developer",
+                "policy_id": self.policy["policy_id"],
+                "policy_mode": "read-only",
+                "workspace_root": TWINPET,
+                "trusted_direct_repo_cli": True,
+            },
+        }
+
+    def _bridge_body(self, path: str | None = None) -> str:
+        target = path or self.report_path
+        return (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {target}\n"
+            "Status: PASS_WITH_NOTES\n"
+            "Summary: Trusted CLI analysis complete.\n"
+            "Next recommended role: coordinator\n"
+            "---\n"
+            "# Trusted CLI PaymentModal Analysis\n\nDone.\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+
+    def test_trusted_cli_bridge_saves_and_returns_report_ready(self):
+        out = process_claude_worker_report_output(
+            self._bridge_body(),
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertTrue(Path(self.report_path).is_file())
+
+    def test_trusted_cli_native_write_permission_becomes_blocker(self):
+        prompt_text = (
+            "The report write requires your explicit approval since the path is "
+            "outside the repo working directory. Could you approve the write?"
+        )
+        out = process_claude_worker_report_output(
+            prompt_text,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("BLOCKER: trusted CLI used native write"))
+        self.assertIn("contains_native_write_permission_prompt: true", out)
+        self.assertIn("contains_report_bridge: False", out)
+
+    def test_trusted_cli_recovers_complete_markdown_without_bridge(self):
+        body = "# Trusted CLI PaymentModal Analysis\n\n" + ("x" * 220)
+        out = process_claude_worker_report_output(
+            body,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertTrue(Path(self.report_path).is_file())
+
+
 if __name__ == "__main__":
     unittest.main()

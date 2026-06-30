@@ -14,6 +14,7 @@ from workspace_policy_runtime import (
     classify_dirty_entries_report_only_analysis,
     external_cwd_enabled_for_mode,
     is_report_only_readonly_policy,
+    is_trusted_direct_repo_cli_policy,
     normalize_workspace_root,
     resolve_exec_cwd_for_item,
     verify_dirty_set,
@@ -81,6 +82,34 @@ REPORT_WRITE_BRIDGE_INSTRUCTION = (
     "- Twinpet workspace writes are forbidden."
 )
 
+TRUSTED_CLI_REPORT_BRIDGE_INSTRUCTION = (
+    "REPORT OUTPUT METHOD (trusted_direct_repo_cli):\n"
+    "- Tools are enabled for reading/searching the repo only.\n"
+    "- Do NOT use Claude Code Write/Edit tools for the external report.\n"
+    "- Do NOT ask for permission to write the report file.\n"
+    "- The runtime saves your report from stdout.\n"
+    "- Output exactly one REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END block:\n"
+    "  REPORT_FILE_WRITE_BEGIN\n"
+    "  Path: <absolute .md path under allowed Ai-Report roots>\n"
+    "  Status: PASS\n"
+    "  Summary: <short summary>\n"
+    "  Next recommended role: coordinator\n"
+    "  ---\n"
+    "  <markdown report body>\n"
+    "  REPORT_FILE_WRITE_END\n"
+    "- The runtime validates the path, writes the file, and emits REPORT_READY.\n"
+    "- If you cannot output the bridge, return: BLOCKER: trusted CLI report bridge output failed"
+)
+
+_NATIVE_WRITE_PERMISSION_PROMPT_RES = (
+    re.compile(r"explicit approval", re.IGNORECASE),
+    re.compile(r"write permission", re.IGNORECASE),
+    re.compile(r"approve the write", re.IGNORECASE),
+    re.compile(r"outside the repo working directory", re.IGNORECASE),
+    re.compile(r"permission prompt should have appeared", re.IGNORECASE),
+    re.compile(r"could you approve", re.IGNORECASE),
+)
+
 DEFAULT_SNAPSHOT_MAX_CHARS_PER_FILE = 48_000
 SNAPSHOT_HEAD_CHARS = 24_000
 SNAPSHOT_TAIL_CHARS = 12_000
@@ -145,8 +174,6 @@ def is_trusted_direct_repo_cli_mode(
     policy: dict[str, Any] | None,
 ) -> bool:
     """True when worker runs in trusted direct repo CLI mode (tools enabled, no snapshots)."""
-    from workspace_policy_runtime import is_trusted_direct_repo_cli_policy
-
     if is_trusted_direct_repo_cli_policy(policy):
         return True
     if isinstance(item, dict):
@@ -154,6 +181,94 @@ def is_trusted_direct_repo_cli_mode(
         if isinstance(wpc, dict) and wpc.get("trusted_direct_repo_cli"):
             return True
     return False
+
+
+def policy_uses_report_write_bridge(policy: dict[str, Any] | None) -> bool:
+    """True when worker output may use REPORT_FILE_WRITE bridge handling."""
+    if not isinstance(policy, dict):
+        return False
+    if is_report_only_readonly_policy(policy):
+        return True
+    return is_trusted_direct_repo_cli_policy(policy)
+
+
+def detect_native_write_permission_prompt(text: str) -> bool:
+    """True when Claude stdout asks for interactive external file write approval."""
+    sample = (text or "").strip()
+    if not sample:
+        return False
+    if REPORT_FILE_WRITE_BEGIN_MARKER in sample and REPORT_FILE_WRITE_END_MARKER in sample:
+        return False
+    if sample.startswith("REPORT_READY"):
+        return False
+    return any(pattern.search(sample) for pattern in _NATIVE_WRITE_PERMISSION_PROMPT_RES)
+
+
+def format_trusted_cli_native_write_blocker(
+    *,
+    text: str,
+    policy: dict[str, Any] | None,
+    cwd: str | Path | None,
+    queue_item: dict[str, Any] | None,
+) -> str:
+    """Structured blocker when trusted CLI used native Write instead of report bridge."""
+    ctx = worker_context_from_queue_item(queue_item)
+    report_paths = list((policy or {}).get("report_paths") or [])
+    report_path = report_paths[0] if report_paths else ""
+    wpc = queue_item.get("workspace_policy_context") if isinstance(queue_item, dict) else {}
+    channel = ""
+    session_id = ""
+    if isinstance(wpc, dict):
+        channel = str(wpc.get("channel") or "")
+        session_id = str(wpc.get("session_id") or "")
+    lines = [
+        "BLOCKER: trusted CLI used native write instead of report bridge",
+        "",
+        f"workspace_profile: {ctx.get('policy_id') or (policy or {}).get('policy_id') or ''}",
+        f"workspace_mode: {ctx.get('policy_mode') or (policy or {}).get('mode') or ''}",
+        "trusted_direct_repo_cli: true",
+        f"report_path: {report_path}",
+        f"contains_report_bridge: {'REPORT_FILE_WRITE_BEGIN' in (text or '') and 'REPORT_FILE_WRITE_END' in (text or '')}",
+        f"contains_report_ready: {str(text or '').lstrip().startswith('REPORT_READY')}",
+        "contains_native_write_permission_prompt: true",
+        f"cwd: {cwd or ctx.get('workspace_root') or ''}",
+        f"session_id: {session_id}",
+        f"channel: {channel}",
+        "",
+        "Action: re-emit the report using exactly one REPORT_FILE_WRITE_BEGIN / "
+        "REPORT_FILE_WRITE_END block in stdout. Do not use Claude Code Write/Edit tools.",
+    ]
+    return "\n".join(lines)
+
+
+def try_recover_trusted_cli_stdout_report(
+    text: str,
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Save a complete markdown report from stdout when bridge markers are absent."""
+    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
+        return None
+    if detect_native_write_permission_prompt(text):
+        return None
+    if REPORT_FILE_WRITE_BEGIN_MARKER in (text or "") or (text or "").lstrip().startswith("REPORT_READY"):
+        return None
+    targets = [p for p in (policy.get("report_paths") or []) if isinstance(p, str) and p.strip()]
+    if not targets:
+        return None
+    body = (text or "").strip()
+    if not body.startswith("#") and "\n# " not in body and "\n## " not in body:
+        return None
+    if len(body) < 200:
+        return None
+    ok, saved_path, err = write_validated_external_report(targets[0], body, policy)
+    if ok:
+        return format_report_ready_after_worker_write(
+            path=saved_path,
+            status="PASS_WITH_NOTES",
+            summary="Recovered markdown report from trusted CLI stdout.",
+            notes="Recovered complete markdown from stdout without REPORT_FILE_WRITE bridge.",
+        )
+    return format_report_write_failed_reply(path=targets[0], reason=err)
 
 
 def is_docs_only_snapshot_mode(
@@ -783,7 +898,7 @@ def try_process_scoped_worker_report_output(
     policy: dict[str, Any] | None,
 ) -> str | None:
     """Handle REPORT_FILE_WRITE bridge / legacy REPORT_BEGIN for report-only sessions."""
-    if not isinstance(policy, dict) or not is_report_only_readonly_policy(policy):
+    if not isinstance(policy, dict) or not policy_uses_report_write_bridge(policy):
         return None
     from report_orchestration import parse_report_ready, read_report_file, validate_report_path
 
@@ -830,7 +945,7 @@ def try_recover_write_tool_call_leakage(
     policy: dict[str, Any] | None,
 ) -> str | None:
     """Translate allowed Write tool-call leaks into scoped report writes when safe."""
-    if not isinstance(policy, dict) or not is_report_only_readonly_policy(policy):
+    if not isinstance(policy, dict) or not policy_uses_report_write_bridge(policy):
         return None
     from report_orchestration import is_twinpet_repo_path, validate_report_path
 
@@ -863,13 +978,26 @@ def try_recover_write_tool_call_leakage(
 
 def process_claude_worker_report_output(
     captured: str,
-    *,
     policy: dict[str, Any] | None,
+    *,
+    queue_item: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
 ) -> str | None:
     """Return transformed worker output when report-write bridge handles it."""
     handled = try_process_scoped_worker_report_output(captured, policy)
     if handled is not None:
         return handled
+    if isinstance(policy, dict) and is_trusted_direct_repo_cli_policy(policy):
+        recovered = try_recover_trusted_cli_stdout_report(captured, policy)
+        if recovered is not None:
+            return recovered
+        if detect_native_write_permission_prompt(captured):
+            return format_trusted_cli_native_write_blocker(
+                text=captured,
+                policy=policy,
+                cwd=cwd,
+                queue_item=queue_item,
+            )
     leakage = detect_tool_call_leakage(captured)
     if leakage and str(leakage.get("tool_name", "")).lower() == "write":
         return try_recover_write_tool_call_leakage(captured, policy)
