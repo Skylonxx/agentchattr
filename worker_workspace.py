@@ -1533,20 +1533,18 @@ def try_process_scoped_worker_report_output(
     from report_orchestration import parse_report_ready, read_report_file, validate_report_path
 
     trusted_cli = is_trusted_direct_repo_cli_policy(policy)
-    expected_path = ""
-    if trusted_cli:
-        expected_path = resolve_expected_trusted_cli_report_path(
-            policy,
-            role=role,
-            worker_context=worker_context,
-        )
+    expected_path = resolve_expected_trusted_cli_report_path(
+        policy,
+        role=role,
+        worker_context=worker_context,
+    )
 
     parsed = parse_report_ready(text)
     if parsed:
         roots = _external_report_roots(policy)
         ok, _reason, resolved = validate_report_path(parsed.report_path, allowed_roots=roots)
         if ok and resolved:
-            if trusted_cli:
+            if expected_path:
                 matches, _expected = trusted_cli_report_path_is_expected(
                     parsed.report_path,
                     policy,
@@ -1554,10 +1552,15 @@ def try_process_scoped_worker_report_output(
                     worker_context=worker_context,
                 )
                 if not matches:
-                    return format_trusted_cli_unexpected_report_path_blocker(
-                        actual_path=parsed.report_path,
-                        expected_path=expected_path,
-                        policy=policy,
+                    if trusted_cli:
+                        return format_trusted_cli_unexpected_report_path_blocker(
+                            actual_path=parsed.report_path,
+                            expected_path=expected_path,
+                            policy=policy,
+                        )
+                    return format_report_write_failed_reply(
+                        path=parsed.report_path,
+                        reason=f"path must be {expected_path}",
                     )
             read_ok, _, _, _ = read_report_file(resolved)
             if read_ok:
@@ -1566,7 +1569,7 @@ def try_process_scoped_worker_report_output(
     bridge = extract_report_file_write_block(text)
     if bridge:
         bridge_path = bridge["path"]
-        if trusted_cli:
+        if expected_path:
             matches, _expected = trusted_cli_report_path_is_expected(
                 bridge_path,
                 policy,
@@ -1574,10 +1577,15 @@ def try_process_scoped_worker_report_output(
                 worker_context=worker_context,
             )
             if not matches:
-                return format_trusted_cli_unexpected_report_path_blocker(
-                    actual_path=bridge_path,
-                    expected_path=expected_path,
-                    policy=policy,
+                if trusted_cli:
+                    return format_trusted_cli_unexpected_report_path_blocker(
+                        actual_path=bridge_path,
+                        expected_path=expected_path,
+                        policy=policy,
+                    )
+                return format_report_write_failed_reply(
+                    path=bridge_path,
+                    reason=f"path must be {expected_path}",
                 )
         ok, saved_path, err = write_validated_external_report(
             bridge_path, bridge["content"], policy,
@@ -1604,6 +1612,135 @@ def try_process_scoped_worker_report_output(
                 return format_report_ready_after_worker_write(path=saved_path)
             return format_report_write_failed_reply(path=targets[0], reason=err)
     return None
+
+
+def build_report_orchestrated_worker_context(
+    policy: dict[str, Any] | None,
+    *,
+    channel: str = "general",
+    worker_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge session report paths/roots for report-orchestrated normalization."""
+    ctx = dict(worker_context or {})
+    if not isinstance(policy, dict):
+        return ctx
+    report_paths = list(ctx.get("report_paths") or policy.get("report_paths") or [])
+    report_roots = list(
+        ctx.get("allowed_report_roots")
+        or policy.get("external_report_write_roots")
+        or [],
+    )
+    ai_base = next(
+        (
+            root for root in report_roots
+            if str(root).replace("\\", "/").lower().endswith("/ai-report")
+        ),
+        r"C:\Users\Narachat\OneDrive\Ai-Report",
+    )
+    agy_root = next(
+        (
+            root for root in report_roots
+            if str(root).replace("\\", "/").lower().endswith("/ai-report/agy")
+        ),
+        f"{ai_base}\\agy",
+    )
+    codex_root = next(
+        (
+            root for root in report_roots
+            if str(root).replace("\\", "/").lower().endswith("/ai-report/codex")
+        ),
+        f"{ai_base}\\codex",
+    )
+    by_role = dict(ctx.get("report_paths_by_role") or {})
+    if not by_role.get("developer") and report_paths:
+        by_role.setdefault("developer", str(report_paths[0]))
+    by_role.setdefault("ui_lead", f"{agy_root}\\{channel}-ux-review.md")
+    by_role.setdefault("reviewer", f"{codex_root}\\{channel}-codex-review.md")
+    ctx.update({
+        "workspace_policy": policy,
+        "policy_id": policy.get("policy_id"),
+        "policy_mode": policy.get("mode"),
+        "report_paths": report_paths,
+        "allowed_report_roots": report_roots,
+        "report_paths_by_role": by_role,
+    })
+    return ctx
+
+
+def normalize_report_orchestrated_worker_output(
+    text: str,
+    policy: dict[str, Any] | None,
+    *,
+    role: str = "developer",
+    worker_context: dict[str, Any] | None = None,
+    channel: str = "general",
+) -> str | None:
+    """Normalize REPORT_FILE_WRITE / REPORT_READY output for report-orchestrated roles."""
+    if not isinstance(policy, dict) or not policy_uses_report_write_bridge(policy):
+        return None
+    sample = (text or "").strip()
+    if not sample:
+        return None
+    if sample.startswith("REPORT_WRITE_FAILED") or sample.startswith("BLOCKER:"):
+        return sample
+
+    ctx = build_report_orchestrated_worker_context(
+        policy,
+        channel=channel,
+        worker_context=worker_context,
+    )
+    expected_path = resolve_expected_trusted_cli_report_path(
+        policy,
+        role=role,
+        worker_context=ctx,
+    )
+
+    if (
+        REPORT_FILE_WRITE_BEGIN_MARKER in sample
+        and REPORT_FILE_WRITE_END_MARKER not in sample
+    ):
+        return format_report_write_failed_reply(
+            path=expected_path or "(unknown)",
+            reason="incomplete REPORT_FILE_WRITE block (missing REPORT_FILE_WRITE_END)",
+        )
+
+    if (
+        REPORT_FILE_WRITE_BEGIN_MARKER in sample
+        or sample.startswith("REPORT_READY")
+        or REPORT_BEGIN_MARKER in sample
+    ):
+        normalized = try_process_scoped_worker_report_output(
+            sample,
+            policy,
+            role=role,
+            worker_context=ctx,
+        )
+        if normalized is not None:
+            return normalized
+        if REPORT_FILE_WRITE_BEGIN_MARKER in sample:
+            return format_report_write_failed_reply(
+                path=expected_path or "(unknown)",
+                reason="invalid or unparsable REPORT_FILE_WRITE block",
+            )
+    return None
+
+
+def process_relay_worker_report_output(
+    text: str,
+    policy: dict[str, Any] | None,
+    *,
+    role: str = "developer",
+    worker_context: dict[str, Any] | None = None,
+    channel: str = "general",
+) -> str | None:
+    """Codex relay alias for report-orchestrated output normalization."""
+    return normalize_report_orchestrated_worker_output(
+        text,
+        policy,
+        role=role,
+        worker_context=worker_context,
+        channel=channel,
+    )
 
 
 def try_recover_write_tool_call_leakage(

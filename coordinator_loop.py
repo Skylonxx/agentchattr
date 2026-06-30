@@ -1195,9 +1195,50 @@ def _try_report_orchestrated_worker(
         get_report_for_role,
         ingest_worker_report_output,
         parse_report_ready,
+        parse_report_write_failed,
         upsert_report_record,
     )
-    from worker_workspace import REPORT_BEGIN_MARKER
+    from worker_workspace import (
+        REPORT_BEGIN_MARKER,
+        REPORT_FILE_WRITE_BEGIN_MARKER,
+        normalize_report_orchestrated_worker_output,
+    )
+
+    ctx = worker_context or {}
+    policy = ctx.get("workspace_policy") if isinstance(ctx.get("workspace_policy"), dict) else None
+
+    if REPORT_FILE_WRITE_BEGIN_MARKER in (text or ""):
+        normalized = normalize_report_orchestrated_worker_output(
+            text,
+            policy,
+            role=role,
+            worker_context=ctx,
+        )
+        if normalized is not None:
+            failed_norm = parse_report_write_failed(normalized)
+            if failed_norm is not None:
+                return _terminal_blocker(
+                    state,
+                    (
+                        "BLOCKER: external report write failed\n"
+                        f"reason={failed_norm.reason or 'worker could not write report'}\n"
+                        f"expected_report={failed_norm.expected_report_path or '(missing)'}\n"
+                        f"status={failed_norm.status or 'FAIL'}"
+                    ),
+                )
+            text = normalized
+
+    failed = parse_report_write_failed(text)
+    if failed is not None:
+        return _terminal_blocker(
+            state,
+            (
+                "BLOCKER: external report write failed\n"
+                f"reason={failed.reason or 'worker could not write report'}\n"
+                f"expected_report={failed.expected_report_path or '(missing)'}\n"
+                f"status={failed.status or 'FAIL'}"
+            ),
+        )
 
     first = _first_non_empty_line(text)
     if first == "PROGRESS":
@@ -1205,7 +1246,6 @@ def _try_report_orchestrated_worker(
     if parse_report_ready(text) is None and REPORT_BEGIN_MARKER not in (text or ""):
         return None
 
-    ctx = worker_context or {}
     expected_paths = list(ctx.get("report_paths") or [])
     by_role = ctx.get("report_paths_by_role") or {}
     if isinstance(by_role, dict) and by_role.get(role):

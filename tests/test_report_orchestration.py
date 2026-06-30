@@ -44,12 +44,15 @@ from report_orchestration import (
     upsert_report_record,
     verify_report_write_permission,
 )
-from session_relay import is_relay_eligible
+from session_relay import coordinator_loop_worker_output_contract, is_relay_eligible
 from tests.test_trusted_cli_memo import (
     _sample_trusted_cli_markdown_report,
     _trusted_policy_isolated,
 )
-from session_relay import coordinator_loop_worker_output_contract
+from worker_workspace import (
+    REPORT_FILE_WRITE_BEGIN_MARKER,
+    REPORT_FILE_WRITE_END_MARKER,
+)
 
 
 def _analysis_policy() -> dict:
@@ -1582,6 +1585,97 @@ class TrustedCliHandoffParityTests(unittest.TestCase):
 
     def test_agy_remains_relay_ineligible_after_ui_lead_prompt(self):
         self.assertFalse(is_relay_eligible("agy"))
+
+
+class ReviewerReportBridgeCoordinatorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        codex_dir = Path(self.tmp) / "codex"
+        codex_dir.mkdir()
+        self.channel = "twinpet-ui-09-c-read"
+        self.reviewer_path = str(codex_dir / f"{self.channel}-codex-review.md")
+        self.dev_path = Path(self.tmp) / "dev.md"
+        self.dev_path.write_text(_developer_report_body(), encoding="utf-8")
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "trusted_direct_repo_cli": True,
+            "policy_id": "twinpet-ui-09-c-payment-modal-trusted-cli",
+            "write_files": [],
+            "external_report_write_roots": [self.tmp, str(codex_dir)],
+            "report_paths": [str(self.dev_path)],
+        }
+        self.ctx = {
+            "workspace_policy": self.policy,
+            "allowed_report_roots": [self.tmp, str(codex_dir)],
+            "report_paths": [str(self.dev_path)],
+            "report_paths_by_role": {
+                "developer": str(self.dev_path),
+                "reviewer": self.reviewer_path,
+            },
+            "max_report_prompt_chars": DEFAULT_MAX_REPORT_PROMPT_CHARS,
+        }
+
+    def _reviewer_bridge(self) -> str:
+        return (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {self.reviewer_path}\n"
+            "Status: PASS\n"
+            "Summary: Codex review complete.\n"
+            "Next recommended role: safety_gate\n"
+            "---\n"
+            "# Codex Reviewer Report\n"
+            "Status: PASS\n\n"
+            "## Summary\nReview ok.\n\n"
+            f"{HANDOFF_FOR_FINAL_BEGIN}\nPASS for safety gate.\n{HANDOFF_FOR_FINAL_END}\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+
+    def test_reviewer_bridge_ingested_without_ambiguous_blocker(self):
+        state, _ = on_session_start(
+            "analysis",
+            session_meta={"report_orchestrated": True, "workspace_mode": "read-only"},
+        )
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(self.dev_path)),
+            allowed_roots=[self.tmp, str(codex_dir := Path(self.reviewer_path).parent)],
+        )
+        state.report_records = [ingest.record.to_dict()]
+        state.awaiting_role = "reviewer"
+        action = on_worker_output(
+            state,
+            "reviewer",
+            self._reviewer_bridge(),
+            worker_context=self.ctx,
+        )
+        self.assertFalse(action.is_terminal, action.prompt_context)
+        self.assertEqual(action.target_role, "coordinator")
+        self.assertTrue(Path(self.reviewer_path).is_file())
+        self.assertEqual(state.last_reviewer_verdict, "PASS")
+
+    def test_incomplete_reviewer_bridge_is_terminal_not_ambiguous(self):
+        state, _ = on_session_start(
+            "analysis",
+            session_meta={"report_orchestrated": True},
+        )
+        state.awaiting_role = "reviewer"
+        action = on_worker_output(
+            state,
+            "reviewer",
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\nPath: {self.reviewer_path}\n",
+            worker_context=self.ctx,
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("external report write failed", action.prompt_context.lower())
+        self.assertNotIn("ambiguous reviewer output", action.prompt_context.lower())
+
+    def test_legacy_reviewer_pass_verdict_unchanged_when_not_report_orchestrated(self):
+        state, _ = on_session_start("analysis", session_meta={"report_orchestrated": False})
+        state.awaiting_role = "reviewer"
+        action = on_worker_output(state, "reviewer", "PASS\nLGTM.")
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "coordinator")
 
 
 if __name__ == "__main__":

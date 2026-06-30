@@ -1079,6 +1079,61 @@ EXEC_TIMEOUT_SECS = 120
 RELAY_NO_REPLY_MARKER = "[no reply]"
 
 
+def _normalize_codex_relay_report_output(
+    captured: str,
+    item: dict | None,
+    *,
+    data_dir,
+    config,
+) -> str | None:
+    """Normalize report-orchestrated Codex relay output before chat relay."""
+    if not isinstance(item, dict) or not (captured or "").strip():
+        return None
+    relay_meta = item.get("relay_meta")
+    if not isinstance(relay_meta, dict):
+        return None
+    if relay_meta.get("kind") != "session_turn":
+        return None
+    wpc = item.get("workspace_policy_context")
+    if not isinstance(wpc, dict):
+        return None
+    from workspace_policy_runtime import (
+        canonical_policy_from_queue_context,
+        load_persisted_session_record,
+    )
+    from worker_workspace import (
+        build_report_orchestrated_worker_context,
+        normalize_report_orchestrated_worker_output,
+    )
+
+    policy = canonical_policy_from_queue_context(queue_context=wpc, data_dir=data_dir)
+    if not policy:
+        return None
+    role = str(relay_meta.get("role") or wpc.get("session_role") or "")
+    channel = str(
+        relay_meta.get("channel")
+        or wpc.get("channel")
+        or item.get("channel")
+        or "general"
+    )
+    session_id = wpc.get("session_id")
+    if session_id is not None and data_dir is not None:
+        session = load_persisted_session_record(data_dir, int(session_id))
+        if isinstance(session, dict):
+            channel = str(session.get("channel") or channel)
+    worker_context = build_report_orchestrated_worker_context(
+        policy,
+        channel=channel,
+    )
+    return normalize_report_orchestrated_worker_output(
+        captured,
+        policy,
+        role=role,
+        worker_context=worker_context,
+        channel=channel,
+    )
+
+
 def _process_claude_worker_output(
     captured: str,
     *,
@@ -1391,6 +1446,14 @@ def run_agent_exec(command, mcp_args, cwd, env, agent, start_watcher, *,
         # never silently nothing, and never #general in relay mode. This closes
         # the zero-exit empty-output stall where no message was ever posted.
         if get_token_fn:
+            normalized = _normalize_codex_relay_report_output(
+                captured,
+                item if isinstance(item, dict) else None,
+                data_dir=data_dir,
+                config=config,
+            )
+            if normalized:
+                captured = normalized
             reply = _resolve_relay_reply(
                 timed_out=timed_out, errored=errored,
                 returncode=returncode, captured=captured,

@@ -34,6 +34,7 @@ from worker_workspace import (
     try_process_scoped_worker_report_output,
     try_recover_write_tool_call_leakage,
     try_save_external_analysis_report,
+    normalize_report_orchestrated_worker_output,
     write_validated_external_report,
     REPORT_FILE_WRITE_BEGIN_MARKER,
     REPORT_FILE_WRITE_END_MARKER,
@@ -1361,6 +1362,68 @@ class TrustedCliReportPathMembershipTests(unittest.TestCase):
         )
         self.assertFalse(action.is_terminal)
         self.assertEqual(action.target_role, "coordinator")
+
+
+class ReviewerReportBridgeNormalizationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        codex_root = Path(self.tmp) / "codex"
+        codex_root.mkdir()
+        self.channel = "twinpet-ui-09-c-read"
+        self.reviewer_path = str(codex_root / f"{self.channel}-codex-review.md")
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "trusted_direct_repo_cli": True,
+            "write_files": [],
+            "external_report_write_roots": [self.tmp, str(codex_root)],
+            "report_paths": ["C:/Users/Narachat/OneDrive/Ai-Report/claude/dev.md"],
+        }
+        self.worker_context = {
+            "allowed_report_roots": [self.tmp, str(codex_root)],
+            "report_paths_by_role": {
+                "developer": "C:/Users/Narachat/OneDrive/Ai-Report/claude/dev.md",
+                "reviewer": self.reviewer_path,
+            },
+        }
+
+    def _reviewer_bridge(self, content: str = "# Codex Reviewer Report\nStatus: PASS\n") -> str:
+        return (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {self.reviewer_path}\n"
+            "Status: PASS\n"
+            "Summary: Codex review complete.\n"
+            "Next recommended role: safety_gate\n"
+            "---\n"
+            f"{content}\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+
+    def test_reviewer_bridge_normalizes_to_report_ready(self):
+        out = normalize_report_orchestrated_worker_output(
+            self._reviewer_bridge(),
+            self.policy,
+            role="reviewer",
+            worker_context=self.worker_context,
+            channel=self.channel,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertTrue(Path(self.reviewer_path).is_file())
+        self.assertIn(self.reviewer_path.replace("\\", "/"), out.replace("\\", "/"))
+
+    def test_incomplete_reviewer_bridge_returns_write_failed(self):
+        body = f"{REPORT_FILE_WRITE_BEGIN_MARKER}\nPath: {self.reviewer_path}\n"
+        out = normalize_report_orchestrated_worker_output(
+            body,
+            self.policy,
+            role="reviewer",
+            worker_context=self.worker_context,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_WRITE_FAILED"))
 
 
 if __name__ == "__main__":
