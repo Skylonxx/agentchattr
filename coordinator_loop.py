@@ -1011,32 +1011,83 @@ def _trusted_cli_output_needs_repair(text: str) -> bool:
     return len(sample) >= 80 and not sample.startswith("BLOCKER:")
 
 
-def _try_trusted_cli_report_bridge_repair(
+def _try_trusted_cli_shared_report_outcome(
     state: CoordinatorLoopState,
     text: str,
     *,
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction | None:
+    """Resolve trusted CLI developer output via shared resolver (wrapper/coordinator parity)."""
+    if not state.report_orchestrated or not _trusted_cli_context(state, worker_context):
+        return None
+
+    from worker_workspace import resolve_trusted_cli_report_outcome
+
+    policy = (worker_context or {}).get("workspace_policy") or {}
+    workspace = policy.get("workspace") or {}
+    outcome = resolve_trusted_cli_report_outcome(
+        text,
+        policy,
+        role="developer",
+        worker_context=worker_context,
+        cwd=str(workspace.get("root") or ""),
+        repair_rounds_used=state.trusted_cli_report_bridge_repair_rounds,
+        max_repair_rounds=state.max_trusted_cli_report_bridge_repair_rounds,
+    )
+
+    if outcome.kind == "report_ready" and outcome.report_ready:
+        return _try_report_orchestrated_worker(
+            state,
+            "developer",
+            outcome.report_ready,
+            worker_context=worker_context,
+        )
+
+    if outcome.kind == "correction_prompt":
+        return _try_trusted_cli_report_bridge_repair(
+            state,
+            text,
+            worker_context=worker_context,
+            repair_reason=outcome.repair_reason,
+        )
+
+    if outcome.kind == "blocker" and outcome.text:
+        return _terminal_blocker(state, outcome.text)
+
+    return None
+
+
+def _try_trusted_cli_report_bridge_repair(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+    repair_reason: str | None = None,
+) -> CoordinatorAction | None:
     """One-shot developer correction when trusted CLI output is not capturable markdown."""
     if not state.report_orchestrated or not _trusted_cli_context(state, worker_context):
         return None
-    if not _trusted_cli_output_needs_repair(text):
+    if repair_reason is None and not _trusted_cli_output_needs_repair(text):
         return None
     if state.trusted_cli_report_bridge_repair_rounds >= state.max_trusted_cli_report_bridge_repair_rounds:
         return None
 
-    from worker_workspace import build_trusted_cli_markdown_report_repair_prompt
+    from worker_workspace import (
+        build_trusted_cli_markdown_report_repair_prompt,
+        resolve_expected_trusted_cli_report_path,
+    )
 
     state.trusted_cli_report_bridge_repair_rounds += 1
     state.last_trusted_cli_developer_output = (text or "")[:12_000]
 
-    by_role = (worker_context or {}).get("report_paths_by_role") or {}
-    report_path = str(by_role.get("developer") or "")
-    if not report_path:
-        paths = list((worker_context or {}).get("report_paths") or [])
-        report_path = str(paths[0]) if paths else ""
+    policy = (worker_context or {}).get("workspace_policy") or {}
+    report_path = resolve_expected_trusted_cli_report_path(
+        policy,
+        role="developer",
+        worker_context=worker_context,
+    )
 
-    reason = _trusted_cli_repair_reason(text)
+    reason = repair_reason or _trusted_cli_repair_reason(text)
     repair_prompt = build_trusted_cli_markdown_report_repair_prompt(
         previous_output=state.last_trusted_cli_developer_output,
         report_path=report_path,
@@ -1250,15 +1301,10 @@ def _on_developer_output(
     ):
         return handled
 
-    if repair := _try_trusted_cli_report_bridge_repair(
+    if handled := _try_trusted_cli_shared_report_outcome(
         state, text, worker_context=worker_context,
     ):
-        return repair
-
-    if _trusted_cli_context(state, worker_context) and _trusted_cli_output_needs_repair(text):
-        return _terminal_trusted_cli_output_blocker(
-            state, text, worker_context=worker_context,
-        )
+        return handled
 
     token, notes = _parse_developer_verdict(text)
     _append_verdict(state, "developer", token, notes)

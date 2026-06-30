@@ -735,6 +735,19 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         assert out is not None
         self.assertIn("trusted CLI refused report-output contract", out)
 
+    def _resolver_outcome(self, stdout, *, policy=None, repair_rounds_used=0, worker_context=None):
+        from worker_workspace import resolve_trusted_cli_report_outcome
+
+        return resolve_trusted_cli_report_outcome(
+            stdout,
+            policy or self.policy,
+            queue_item=self.item,
+            worker_context=worker_context,
+            cwd=TWINPET,
+            repair_rounds_used=repair_rounds_used,
+            max_repair_rounds=1,
+        )
+
     def test_trusted_cli_incomplete_stdout_blocker(self):
         out = process_claude_worker_report_output(
             "Short non-report developer reply without enough structure.",
@@ -742,11 +755,15 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
             queue_item=self.item,
             cwd=TWINPET,
         )
-        self.assertIsNotNone(out)
-        assert out is not None
-        self.assertIn("trusted CLI report stdout incomplete", out)
-        self.assertIn("trusted_cli_report_salvage_attempted: true", out)
-        self.assertIn("file_exists: False", out)
+        self.assertIsNone(out)
+        outcome = self._resolver_outcome(
+            "Short non-report developer reply without enough structure.",
+            repair_rounds_used=1,
+        )
+        self.assertEqual(outcome.kind, "blocker")
+        self.assertIn("trusted CLI report stdout incomplete", outcome.text)
+        self.assertIn("trusted_cli_report_salvage_attempted: true", outcome.text)
+        self.assertIn("file_exists: False", outcome.text)
 
     def _valid_salvage_report_body(self) -> str:
         return (
@@ -790,10 +807,14 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
             queue_item=self.item,
             cwd=TWINPET,
         )
-        self.assertIsNotNone(out)
-        assert out is not None
-        self.assertIn("trusted CLI report stdout incomplete", out)
-        self.assertIn("salvage_failure_reason: report file not found", out)
+        self.assertIsNone(out)
+        outcome = self._resolver_outcome(
+            "Status unchanged. Here's the analysis.",
+            repair_rounds_used=1,
+        )
+        self.assertEqual(outcome.kind, "blocker")
+        self.assertIn("trusted CLI report stdout incomplete", outcome.text)
+        self.assertIn("salvage_failure_reason: report file not found", outcome.text)
 
     def test_trusted_cli_salvage_rejects_disallowed_path(self):
         policy = dict(self.policy)
@@ -805,22 +826,24 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
             queue_item=self.item,
             cwd=TWINPET,
         )
-        self.assertIsNotNone(out)
-        assert out is not None
-        self.assertIn("trusted CLI report stdout incomplete", out)
-        self.assertIn("outside allowed roots", out)
+        self.assertIsNone(out)
+        outcome = self._resolver_outcome(
+            "Status unchanged. Here's the analysis.",
+            policy=policy,
+            repair_rounds_used=1,
+        )
+        self.assertEqual(outcome.kind, "blocker")
+        self.assertIn("trusted CLI report stdout incomplete", outcome.text)
+        self.assertIn("outside allowed roots", outcome.text)
 
     def test_trusted_cli_salvage_rejects_too_short_report_file(self):
         Path(self.report_path).write_text("# Too short\nStatus: PASS\n", encoding="utf-8")
-        out = process_claude_worker_report_output(
+        outcome = self._resolver_outcome(
             "Status unchanged. Here's the analysis.",
-            self.policy,
-            queue_item=self.item,
-            cwd=TWINPET,
+            repair_rounds_used=1,
         )
-        self.assertIsNotNone(out)
-        assert out is not None
-        self.assertIn("report too short", out)
+        self.assertEqual(outcome.kind, "blocker")
+        self.assertIn("report too short", outcome.text)
 
     def test_trusted_cli_salvage_rejects_report_missing_sections(self):
         body = (
@@ -829,15 +852,12 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
             + "\n"
         )
         Path(self.report_path).write_text(body, encoding="utf-8")
-        out = process_claude_worker_report_output(
+        outcome = self._resolver_outcome(
             "Status unchanged. Here's the analysis.",
-            self.policy,
-            queue_item=self.item,
-            cwd=TWINPET,
+            repair_rounds_used=1,
         )
-        self.assertIsNotNone(out)
-        assert out is not None
-        self.assertIn("missing files inspected or evidence section", out)
+        self.assertEqual(outcome.kind, "blocker")
+        self.assertIn("missing files inspected or evidence section", outcome.text)
 
     def test_trusted_cli_native_write_with_valid_report_salvages(self):
         Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
@@ -869,6 +889,194 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertTrue(result.salvaged)
         self.assertIn("Status:\nPASS", result.report_ready)
         self.assertIn("PaymentModal analysis complete", result.report_ready)
+
+    def test_wrapper_coordinator_parity_short_stdout_with_valid_file(self):
+        Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
+        stdout = "Status unchanged. " + ("x" * 400)
+        wrapper_out = process_claude_worker_report_output(
+            stdout, self.policy, queue_item=self.item, cwd=TWINPET,
+        )
+        resolver = self._resolver_outcome(stdout)
+        self.assertTrue((wrapper_out or "").startswith("REPORT_READY"))
+        self.assertEqual(resolver.kind, "report_ready")
+        self.assertTrue(resolver.report_ready.startswith("REPORT_READY"))
+
+    def test_wrapper_coordinator_parity_missing_file_correction_then_blocker(self):
+        stdout = "Status unchanged. " + ("x" * 400)
+        wrapper_out = process_claude_worker_report_output(
+            stdout, self.policy, queue_item=self.item, cwd=TWINPET,
+        )
+        correction = self._resolver_outcome(stdout, repair_rounds_used=0)
+        terminal = self._resolver_outcome(stdout, repair_rounds_used=1)
+        self.assertIsNone(wrapper_out)
+        self.assertEqual(correction.kind, "correction_prompt")
+        self.assertEqual(terminal.kind, "blocker")
+
+    def test_findings_heuristic_rejects_skeletal_stub(self):
+        body = (
+            "# Report\n\nStatus: PASS\n\n"
+            "## Files inspected\n- a.tsx\n\n"
+            "## Red-zone confirmation\nNo modifications.\n\n"
+            "## Recommended next step\nRoute to coordinator.\n\n"
+            + "\n\n".join(f"Short note {i}." for i in range(120))
+        )
+        from worker_workspace import validate_trusted_cli_existing_report_file
+
+        ok, reason = validate_trusted_cli_existing_report_file(body)
+        self.assertFalse(ok)
+        self.assertIn("findings", reason)
+
+    def test_threshold_boundary_799_rejected_800_accepted(self):
+        from worker_workspace import validate_trusted_cli_existing_report_file
+
+        base = (
+            "# Report\n\nStatus: PASS\n\n## Files inspected\n- a.tsx\n\n"
+            "## Findings\n"
+        )
+        tail = (
+            "\n\n## Red-zone confirmation\nNo modifications.\n\n"
+            "## Recommended next step\nRoute to coordinator.\n"
+        )
+        base_len = len((base + tail).strip())
+        findings_799 = "x" * max(0, 799 - base_len)
+        findings_800 = "x" * max(0, 800 - base_len)
+        ok799, _ = validate_trusted_cli_existing_report_file(base + findings_799 + tail)
+        ok800, reason800 = validate_trusted_cli_existing_report_file(base + findings_800 + tail)
+        self.assertFalse(ok799)
+        self.assertTrue(ok800, reason800)
+
+    def test_salvaged_report_with_fail_status_still_report_ready(self):
+        body = self._valid_salvage_report_body().replace("Status: PASS", "Status: FAIL")
+        Path(self.report_path).write_text(body, encoding="utf-8")
+        outcome = self._resolver_outcome("short stdout")
+        self.assertEqual(outcome.kind, "report_ready")
+        self.assertIn("Status:\nFAIL", outcome.report_ready)
+
+
+class TrustedCliCoordinatorSalvageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.report_path = str(Path(self.tmp) / "trusted-cli-report.md")
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "trusted_direct_repo_cli": True,
+            "policy_id": "twinpet-ui-09-c-payment-modal-trusted-cli",
+            "write_files": [],
+            "external_report_write_roots": [self.tmp],
+            "report_paths": [self.report_path],
+            "workspace": {"root": TWINPET},
+        }
+        self.worker_context = {
+            "workspace_policy": self.policy,
+            "policy_id": self.policy["policy_id"],
+            "allowed_report_roots": [self.tmp],
+            "report_paths": [self.report_path],
+            "report_paths_by_role": {"developer": self.report_path},
+        }
+
+    def _valid_report_body(self) -> str:
+        return (
+            "# Twinpet UI-09-C PaymentModal Trusted CLI Read-Only Analysis\n\n"
+            "Status: PASS\n\n"
+            "## Summary\n"
+            "PaymentModal analysis complete for trusted CLI validation.\n\n"
+            "## Files inspected\n"
+            "- src/components/PaymentModal.tsx\n\n"
+            "## Findings\n"
+            "PaymentModal builds payment splits and delegates confirmation. "
+            + ("Additional review notes. " * 40)
+            + "\n\n"
+            "## Red-zone confirmation\n"
+            "No product/source/test/config files were modified.\n\n"
+            "## Recommended next step\n"
+            "Route to AGY UI Lead.\n"
+        )
+
+    def test_coordinator_salvages_short_stdout_with_valid_file(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        Path(self.report_path).write_text(self._valid_report_body(), encoding="utf-8")
+        stdout = "Status unchanged. " + ("x" * 400)
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+        )
+        action = on_worker_output(
+            state, "developer", stdout, worker_context=self.worker_context,
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "coordinator")
+
+    def test_coordinator_native_write_with_valid_file_salvages(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        Path(self.report_path).write_text(self._valid_report_body(), encoding="utf-8")
+        native = (
+            "The report write requires your explicit approval since the path is "
+            "outside the repo working directory."
+        )
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+        )
+        action = on_worker_output(
+            state, "developer", native, worker_context=self.worker_context,
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "coordinator")
+
+    def test_coordinator_fail_status_in_file_is_terminal(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        body = self._valid_report_body().replace("Status: PASS", "Status: FAIL")
+        Path(self.report_path).write_text(body, encoding="utf-8")
+        stdout = "Status unchanged. " + ("x" * 400)
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+        )
+        action = on_worker_output(
+            state, "developer", stdout, worker_context=self.worker_context,
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("FAIL", action.prompt_context or "")
+
+    def test_coordinator_exhausted_repair_terminal_incomplete(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        stdout = "Status unchanged. " + ("x" * 400)
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile=self.policy["policy_id"],
+            session_workspace_mode="read-only",
+            trusted_cli_report_bridge_repair_rounds=1,
+            max_trusted_cli_report_bridge_repair_rounds=1,
+        )
+        action = on_worker_output(
+            state, "developer", stdout, worker_context=self.worker_context,
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("trusted CLI report stdout incomplete", action.prompt_context or "")
 
 
 if __name__ == "__main__":

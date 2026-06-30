@@ -199,6 +199,17 @@ class TrustedCliSalvageResult:
 
 
 @dataclass
+class TrustedCliReportOutcome:
+    """Typed result from the shared trusted CLI report-output resolver."""
+
+    kind: str  # report_ready | correction_prompt | blocker | none
+    text: str = ""
+    report_ready: str = ""
+    repair_reason: str = ""
+    salvage: TrustedCliSalvageResult | None = None
+
+
+@dataclass
 class SnapshotMeta:
     injected: bool = False
     file_count: int = 0
@@ -589,7 +600,55 @@ def validate_trusted_cli_existing_report_file(content: str) -> tuple[bool, str]:
         return False, "missing red-zone or no-modification confirmation"
     if not any(marker in low for marker in _TRUSTED_CLI_REPORT_NEXT_STEP_MARKERS):
         return False, "missing recommended next step"
+    if not _trusted_cli_has_findings_signal(body, low):
+        return False, "missing findings or analysis section"
     return True, ""
+
+
+def _trusted_cli_has_findings_signal(body: str, low: str | None = None) -> bool:
+    """True when report has a findings heading or a substantial analysis paragraph."""
+    low = low if low is not None else body.lower()
+    if "## findings" in low:
+        return True
+    paragraph: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            if paragraph:
+                if len(" ".join(paragraph).strip()) >= 200:
+                    return True
+                paragraph = []
+            continue
+        if stripped:
+            paragraph.append(stripped)
+        elif paragraph:
+            if len(" ".join(paragraph).strip()) >= 200:
+                return True
+            paragraph = []
+    return len(" ".join(paragraph).strip()) >= 200
+
+
+def resolve_expected_trusted_cli_report_path(
+    policy: dict[str, Any] | None,
+    *,
+    role: str = "developer",
+    worker_context: dict[str, Any] | None = None,
+) -> str:
+    """Unified expected report path: by_role -> context paths -> policy paths."""
+    ctx = worker_context if isinstance(worker_context, dict) else {}
+    by_role = ctx.get("report_paths_by_role") or {}
+    if isinstance(by_role, dict):
+        role_path = by_role.get(role) or by_role.get(str(role))
+        if role_path:
+            return str(role_path)
+    ctx_paths = [p for p in (ctx.get("report_paths") or []) if isinstance(p, str) and p.strip()]
+    if ctx_paths:
+        return str(ctx_paths[0])
+    if isinstance(policy, dict):
+        policy_paths = [p for p in (policy.get("report_paths") or []) if isinstance(p, str) and p.strip()]
+        if policy_paths:
+            return str(policy_paths[0])
+    return ""
 
 
 def _trusted_cli_salvage_diagnostics_lines(
@@ -632,7 +691,9 @@ def attempt_salvage_trusted_cli_existing_report(
     policy: dict[str, Any],
     stdout_text: str = "",
     *,
+    role: str = "developer",
     queue_item: dict[str, Any] | None = None,
+    worker_context: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
     native_write_warning: bool = False,
 ) -> TrustedCliSalvageResult:
@@ -643,11 +704,14 @@ def attempt_salvage_trusted_cli_existing_report(
     if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
         result.failure_reason = "not trusted CLI policy"
         return result
-    targets = [p for p in (policy.get("report_paths") or []) if isinstance(p, str) and p.strip()]
-    if not targets:
+    raw_path = resolve_expected_trusted_cli_report_path(
+        policy,
+        role=role,
+        worker_context=worker_context,
+    )
+    if not raw_path:
         result.failure_reason = "expected report path not configured"
         return result
-    raw_path = targets[0]
     result.report_path = raw_path
 
     roots = _external_report_roots(policy)
@@ -1405,59 +1469,130 @@ def try_recover_write_tool_call_leakage(
     return format_report_write_failed_reply(path=raw_path, reason=err)
 
 
+def resolve_trusted_cli_report_outcome(
+    captured: str,
+    policy: dict[str, Any] | None,
+    *,
+    role: str = "developer",
+    queue_item: dict[str, Any] | None = None,
+    worker_context: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
+    repair_rounds_used: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+) -> TrustedCliReportOutcome:
+    """Shared trusted CLI report-output resolver for wrapper and coordinator."""
+    from report_orchestration import parse_report_ready
+
+    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
+        return TrustedCliReportOutcome(kind="none")
+
+    sample = (captured or "").strip()
+    if not sample:
+        return TrustedCliReportOutcome(kind="none")
+
+    profile = str(policy.get("policy_id") or "")
+    mode = str(policy.get("mode") or "")
+    report_path = resolve_expected_trusted_cli_report_path(
+        policy,
+        role=role,
+        worker_context=worker_context,
+    )
+    common_blocker = dict(
+        text=sample,
+        policy=policy,
+        workspace_profile=profile,
+        workspace_mode=mode,
+        report_path=report_path,
+        repair_round=repair_rounds_used,
+        max_repair_rounds=max_repair_rounds,
+    )
+
+    if parse_report_ready(sample) is not None or sample.startswith("REPORT_READY"):
+        return TrustedCliReportOutcome(kind="report_ready", report_ready=sample)
+    if REPORT_BEGIN_MARKER in sample:
+        return TrustedCliReportOutcome(kind="report_ready", report_ready=sample)
+
+    bridge = try_process_scoped_worker_report_output(captured, policy)
+    if bridge is not None:
+        return TrustedCliReportOutcome(kind="report_ready", report_ready=bridge)
+
+    captured_report = try_capture_trusted_cli_stdout_report(captured, policy)
+    if captured_report is not None:
+        return TrustedCliReportOutcome(kind="report_ready", report_ready=captured_report)
+
+    native_write = detect_native_write_permission_prompt(sample)
+    salvage: TrustedCliSalvageResult | None = None
+    if native_write or len(sample) >= 1:
+        salvage = attempt_salvage_trusted_cli_existing_report(
+            policy,
+            sample,
+            role=role,
+            queue_item=queue_item,
+            worker_context=worker_context,
+            cwd=cwd,
+            native_write_warning=native_write,
+        )
+        if salvage.salvaged:
+            return TrustedCliReportOutcome(
+                kind="report_ready",
+                report_ready=salvage.report_ready,
+                salvage=salvage,
+            )
+
+    if detect_trusted_cli_prompt_injection_refusal(sample):
+        return TrustedCliReportOutcome(
+            kind="blocker",
+            repair_reason="refusal",
+            text=format_trusted_cli_refusal_blocker(**common_blocker),
+            salvage=salvage,
+        )
+
+    repair_reason = "native_write" if native_write else "incomplete"
+    if repair_rounds_used < max_repair_rounds:
+        return TrustedCliReportOutcome(
+            kind="correction_prompt",
+            repair_reason=repair_reason,
+            salvage=salvage,
+        )
+
+    if repair_reason == "native_write":
+        blocker = format_trusted_cli_native_write_blocker(
+            cwd=cwd,
+            queue_item=queue_item,
+            **common_blocker,
+        )
+    else:
+        blocker = format_trusted_cli_incomplete_report_blocker(**common_blocker, salvage=salvage)
+    return TrustedCliReportOutcome(
+        kind="blocker",
+        repair_reason=repair_reason,
+        text=blocker,
+        salvage=salvage,
+    )
+
+
 def process_trusted_cli_worker_report_output(
     captured: str,
     policy: dict[str, Any] | None,
     *,
     queue_item: dict[str, Any] | None = None,
     cwd: str | Path | None = None,
+    repair_rounds_used: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
 ) -> str | None:
-    """Trusted CLI: bridge compat, stdout capture, salvage, or structured blockers."""
-    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
-        return None
-    sample = (captured or "").strip()
-    if not sample:
-        return None
-    bridge = try_process_scoped_worker_report_output(captured, policy)
-    if bridge is not None:
-        return bridge
-    captured_report = try_capture_trusted_cli_stdout_report(captured, policy)
-    if captured_report is not None:
-        return captured_report
-    if detect_trusted_cli_prompt_injection_refusal(sample):
-        return format_trusted_cli_refusal_blocker(
-            text=sample,
-            policy=policy,
-            workspace_profile=str(policy.get("policy_id") or ""),
-            workspace_mode=str(policy.get("mode") or ""),
-        )
-    if detect_native_write_permission_prompt(sample):
-        salvage = attempt_salvage_trusted_cli_existing_report(
-            policy,
-            sample,
-            queue_item=queue_item,
-            cwd=cwd,
-            native_write_warning=True,
-        )
-        if salvage.salvaged:
-            return salvage.report_ready
-        return None
-    if len(sample) >= 80 and not sample.startswith("BLOCKER:"):
-        salvage = attempt_salvage_trusted_cli_existing_report(
-            policy,
-            sample,
-            queue_item=queue_item,
-            cwd=cwd,
-        )
-        if salvage.salvaged:
-            return salvage.report_ready
-        return format_trusted_cli_incomplete_report_blocker(
-            text=sample,
-            policy=policy,
-            workspace_profile=str(policy.get("policy_id") or ""),
-            workspace_mode=str(policy.get("mode") or ""),
-            salvage=salvage,
-        )
+    """Trusted CLI wrapper adapter — delegates to shared resolver."""
+    outcome = resolve_trusted_cli_report_outcome(
+        captured,
+        policy,
+        queue_item=queue_item,
+        cwd=cwd,
+        repair_rounds_used=repair_rounds_used,
+        max_repair_rounds=max_repair_rounds,
+    )
+    if outcome.kind == "report_ready":
+        return outcome.report_ready
+    if outcome.kind == "blocker":
+        return outcome.text
     return None
 
 
