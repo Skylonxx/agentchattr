@@ -22,6 +22,27 @@ ANALYSIS_PROFILE = "twinpet-ui-09-c-payment-modal-analysis"
 TWINPET_ROOT = "C:/Users/Narachat/twinpet-pos"
 
 
+def _sample_trusted_cli_markdown_report() -> str:
+    return (
+        "# Twinpet UI-09-C PaymentModal Trusted CLI Read-Only Analysis\n\n"
+        "Status: PASS_WITH_NOTES\n\n"
+        "## Summary\n"
+        "PaymentModal analysis complete for trusted CLI validation. "
+        "The component remains a presentation layer over checkout boundaries.\n\n"
+        "## Files inspected\n"
+        "- src/components/PaymentModal.tsx\n"
+        "- src/components/PaymentModal.css\n\n"
+        "## Findings\n"
+        "PaymentModal builds payment splits and delegates confirmation to POSPage checkout. "
+        "No cart math or Firebase writes occur inside the modal itself. "
+        "Additional boundary review may be needed for credit availability imports.\n\n"
+        "## Red-zone confirmation\n"
+        "No product/source/test/config files were modified.\n\n"
+        "## Recommended next step\n"
+        "Route to AGY UI Lead.\n"
+    )
+
+
 def _trusted_policy() -> dict:
     profiles = config_loader.get_workspace_profiles(config_loader.load_config())
     res = wp.resolve_session_workspace_policy(
@@ -176,18 +197,18 @@ class TrustedMemoTests(unittest.TestCase):
         self.assertNotIn("READ-ONLY SNAPSHOTS:", memo.prompt)
         self.assertNotIn("```", memo.prompt)
 
-    def test_memo_forbids_native_write_for_report(self):
+    def test_memo_requests_final_markdown_report(self):
         memo, _, _ = self._memo()
-        self.assertIn("REPORT OUTPUT METHOD", memo.prompt)
-        self.assertIn("Do NOT use Claude Code Write/Edit tools", memo.prompt)
-        self.assertIn("REPORT_FILE_WRITE_BEGIN", memo.prompt)
-        self.assertIn("REPORT_FILE_WRITE_END", memo.prompt)
-        self.assertIn("BLOCKER: trusted CLI report bridge output failed", memo.prompt)
+        self.assertIn("FINAL RESPONSE REQUIREMENT", memo.prompt)
+        self.assertIn("complete analysis report as your final response in Markdown", memo.prompt)
+        self.assertIn("Do not create or edit files for the report", memo.prompt)
+        self.assertNotIn("REPORT_FILE_WRITE_BEGIN", memo.prompt)
+        self.assertNotIn("REPORT_FILE_WRITE_END", memo.prompt)
 
-    def test_memo_requires_report_bridge_section(self):
+    def test_memo_has_final_response_requirement_section(self):
         memo, _, _ = self._memo()
         lines = memo.prompt.splitlines()
-        self.assertTrue(any(ln.startswith("REPORT OUTPUT METHOD") for ln in lines))
+        self.assertTrue(any(ln.startswith("FINAL RESPONSE REQUIREMENT") for ln in lines))
 
 
 class TrustedDispatchTests(unittest.TestCase):
@@ -227,30 +248,27 @@ class TrustedDispatchTests(unittest.TestCase):
         self.assertTrue(ok, blocker)
 
 
-class TrustedCliNativeWriteRepairTests(unittest.TestCase):
-    def test_repair_prompt_includes_bridge_contract(self):
-        from worker_workspace import build_trusted_cli_report_bridge_repair_prompt
+class TrustedCliStdoutReportTests(unittest.TestCase):
+    def test_repair_prompt_requests_markdown_not_bridge(self):
+        from worker_workspace import build_trusted_cli_markdown_report_repair_prompt
 
-        report_path = "C:/tmp/trusted-cli-report.md"
         prior = (
-            "The report write requires your explicit approval since the path is "
-            "outside the repo working directory.\n\n"
-            "# PaymentModal Analysis\nFindings here."
+            "This message has hallmarks of prompt injection and I cannot follow "
+            "these fake bridge instructions.\n\n# PaymentModal Analysis\nFindings."
         )
-        prompt = build_trusted_cli_report_bridge_repair_prompt(
+        prompt = build_trusted_cli_markdown_report_repair_prompt(
             previous_output=prior,
-            report_path=report_path,
+            report_path="C:/tmp/report.md",
             repair_round=1,
             max_repair_rounds=1,
+            reason="refusal",
         )
-        self.assertIn("TRUSTED CLI REPORT BRIDGE CORRECTION", prompt)
-        self.assertIn("REPORT_FILE_WRITE_BEGIN", prompt)
-        self.assertIn("REPORT_FILE_WRITE_END", prompt)
-        self.assertIn(report_path, prompt)
-        self.assertIn("Do not use Write/Edit tools", prompt)
+        self.assertIn("TRUSTED CLI REPORT CORRECTION", prompt)
+        self.assertNotIn("REPORT_FILE_WRITE_BEGIN", prompt)
+        self.assertIn("Return the complete analysis report as Markdown", prompt)
         self.assertIn("PaymentModal Analysis", prompt)
 
-    def test_first_native_write_triggers_developer_repair_not_terminal(self):
+    def test_first_native_write_triggers_markdown_repair(self):
         from coordinator_loop import CoordinatorLoopState, on_worker_output
 
         state = CoordinatorLoopState(
@@ -266,8 +284,7 @@ class TrustedCliNativeWriteRepairTests(unittest.TestCase):
         report_path = (policy.get("report_paths") or [""])[0]
         native = (
             "The report write requires your explicit approval since the path is "
-            "outside the repo working directory. Could you approve the write?\n\n"
-            "# PaymentModal\nAnalysis summary."
+            "outside the repo working directory. Could you approve the write?"
         )
         action = on_worker_output(
             state,
@@ -283,10 +300,44 @@ class TrustedCliNativeWriteRepairTests(unittest.TestCase):
         self.assertFalse(action.is_terminal)
         self.assertEqual(action.target_role, "developer")
         self.assertEqual(state.trusted_cli_report_bridge_repair_rounds, 1)
-        self.assertIn("REPORT_FILE_WRITE_BEGIN", action.routing_body)
+        self.assertNotIn("REPORT_FILE_WRITE_BEGIN", action.routing_body)
 
-    def test_second_native_write_emits_terminal_blocker(self):
+    def test_first_refusal_triggers_markdown_repair(self):
         from coordinator_loop import CoordinatorLoopState, on_worker_output
+        from worker_workspace import process_claude_worker_report_output
+
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile="twinpet-ui-09-c-payment-modal-trusted-cli",
+            session_workspace_mode="read-only",
+        )
+        policy = _trusted_policy()
+        report_path = (policy.get("report_paths") or [""])[0]
+        refusal = "This message has hallmarks of prompt injection and I will not comply."
+        wrapper_out = process_claude_worker_report_output(refusal, policy)
+        assert wrapper_out is not None
+        action = on_worker_output(
+            state,
+            "developer",
+            wrapper_out,
+            worker_context={
+                "workspace_policy": policy,
+                "policy_id": policy.get("policy_id"),
+                "report_paths": list(policy.get("report_paths") or []),
+                "report_paths_by_role": {"developer": report_path},
+            },
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "developer")
+        self.assertIn("Markdown", action.routing_body)
+
+    def test_second_refusal_emits_terminal_blocker(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+        from worker_workspace import process_claude_worker_report_output
 
         state = CoordinatorLoopState(
             phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
@@ -301,13 +352,12 @@ class TrustedCliNativeWriteRepairTests(unittest.TestCase):
         )
         policy = _trusted_policy()
         report_path = (policy.get("report_paths") or [""])[0]
-        native = (
-            "Could you approve the write permission for the external report path?"
-        )
+        refusal = "This message has hallmarks of prompt injection."
+        wrapper_out = process_claude_worker_report_output(refusal, policy)
         action = on_worker_output(
             state,
             "developer",
-            native,
+            wrapper_out or refusal,
             worker_context={
                 "workspace_policy": policy,
                 "policy_id": policy.get("policy_id"),
@@ -316,15 +366,11 @@ class TrustedCliNativeWriteRepairTests(unittest.TestCase):
             },
         )
         self.assertTrue(action.is_terminal)
-        self.assertIn("trusted CLI used native write instead of report bridge", action.prompt_context)
-        self.assertIn("repair_round: 1", action.prompt_context)
+        self.assertIn("trusted CLI refused report-output contract", action.prompt_context)
 
-    def test_repair_then_bridge_report_ready_routes_ui_lead(self):
+    def test_stdout_markdown_report_routes_coordinator(self):
         from coordinator_loop import CoordinatorLoopState, on_worker_output
-        from worker_workspace import (
-            REPORT_FILE_WRITE_BEGIN_MARKER,
-            REPORT_FILE_WRITE_END_MARKER,
-        )
+        from worker_workspace import process_claude_worker_report_output
 
         state = CoordinatorLoopState(
             phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
@@ -341,33 +387,8 @@ class TrustedCliNativeWriteRepairTests(unittest.TestCase):
         policy = dict(policy)
         policy["external_report_write_roots"] = [tmp]
         policy["report_paths"] = [report_path]
-        native = "Could you approve the write for the external report?"
-        on_worker_output(
-            state,
-            "developer",
-            native,
-            worker_context={
-                "workspace_policy": policy,
-                "policy_id": policy.get("policy_id"),
-                "allowed_report_roots": [tmp],
-                "report_paths": [report_path],
-                "report_paths_by_role": {"developer": report_path},
-            },
-        )
-        bridge = (
-            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
-            f"Path: {report_path}\n"
-            "Status: PASS_WITH_NOTES\n"
-            "Summary: Re-emitted through bridge.\n"
-            "Next recommended role: coordinator\n"
-            "---\n"
-            "# Report\nDone.\n"
-            f"{REPORT_FILE_WRITE_END_MARKER}"
-        )
-        from report_orchestration import parse_report_ready
-        from worker_workspace import process_claude_worker_report_output
-
-        ready = process_claude_worker_report_output(bridge, policy)
+        markdown = _sample_trusted_cli_markdown_report()
+        ready = process_claude_worker_report_output(markdown, policy)
         assert ready is not None
         action = on_worker_output(
             state,
@@ -384,7 +405,6 @@ class TrustedCliNativeWriteRepairTests(unittest.TestCase):
         self.assertFalse(action.is_terminal)
         self.assertEqual(action.target_role, "coordinator")
         self.assertTrue(Path(report_path).is_file())
-        self.assertIsNotNone(parse_report_ready(ready))
 
 
 if __name__ == "__main__":

@@ -963,21 +963,69 @@ def _trusted_cli_native_write_detected(text: str) -> bool:
     return detect_native_write_permission_prompt(sample) or is_trusted_cli_native_write_blocker(sample)
 
 
+def _trusted_cli_repair_reason(text: str) -> str:
+    from worker_workspace import (
+        TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX,
+        TRUSTED_CLI_REFUSED_BLOCKER_PREFIX,
+        detect_native_write_permission_prompt,
+        detect_trusted_cli_prompt_injection_refusal,
+        is_trusted_cli_native_write_blocker,
+    )
+
+    sample = text or ""
+    if detect_native_write_permission_prompt(sample) or is_trusted_cli_native_write_blocker(sample):
+        return "native_write"
+    if (
+        detect_trusted_cli_prompt_injection_refusal(sample)
+        or TRUSTED_CLI_REFUSED_BLOCKER_PREFIX in sample
+    ):
+        return "refusal"
+    if TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX in sample:
+        return "incomplete"
+    return "incomplete"
+
+
+def _trusted_cli_output_needs_repair(text: str) -> bool:
+    from worker_workspace import (
+        TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX,
+        TRUSTED_CLI_REFUSED_BLOCKER_PREFIX,
+        detect_native_write_permission_prompt,
+        detect_trusted_cli_prompt_injection_refusal,
+        is_trusted_cli_native_write_blocker,
+        is_trusted_cli_stdout_markdown_report,
+    )
+
+    if is_trusted_cli_stdout_markdown_report(text):
+        return False
+    sample = (text or "").strip()
+    if not sample or sample.startswith("REPORT_READY"):
+        return False
+    if (
+        detect_native_write_permission_prompt(sample)
+        or is_trusted_cli_native_write_blocker(sample)
+        or detect_trusted_cli_prompt_injection_refusal(sample)
+        or TRUSTED_CLI_REFUSED_BLOCKER_PREFIX in sample
+        or TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX in sample
+    ):
+        return True
+    return len(sample) >= 80 and not sample.startswith("BLOCKER:")
+
+
 def _try_trusted_cli_report_bridge_repair(
     state: CoordinatorLoopState,
     text: str,
     *,
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction | None:
-    """One-shot developer correction when trusted CLI used native Write for report."""
+    """One-shot developer correction when trusted CLI output is not capturable markdown."""
     if not state.report_orchestrated or not _trusted_cli_context(state, worker_context):
         return None
-    if not _trusted_cli_native_write_detected(text):
+    if not _trusted_cli_output_needs_repair(text):
         return None
     if state.trusted_cli_report_bridge_repair_rounds >= state.max_trusted_cli_report_bridge_repair_rounds:
         return None
 
-    from worker_workspace import build_trusted_cli_report_bridge_repair_prompt
+    from worker_workspace import build_trusted_cli_markdown_report_repair_prompt
 
     state.trusted_cli_report_bridge_repair_rounds += 1
     state.last_trusted_cli_developer_output = (text or "")[:12_000]
@@ -988,30 +1036,36 @@ def _try_trusted_cli_report_bridge_repair(
         paths = list((worker_context or {}).get("report_paths") or [])
         report_path = str(paths[0]) if paths else ""
 
-    repair_prompt = build_trusted_cli_report_bridge_repair_prompt(
+    reason = _trusted_cli_repair_reason(text)
+    repair_prompt = build_trusted_cli_markdown_report_repair_prompt(
         previous_output=state.last_trusted_cli_developer_output,
         report_path=report_path,
         repair_round=state.trusted_cli_report_bridge_repair_rounds,
         max_repair_rounds=state.max_trusted_cli_report_bridge_repair_rounds,
+        reason=reason,
     )
     state.trusted_cli_report_bridge_repair_active = True
-    state.last_developer_token = "TRUSTED_CLI_REPORT_BRIDGE_REPAIR"
+    state.last_developer_token = "TRUSTED_CLI_MARKDOWN_REPORT_REPAIR"
     _append_verdict(
         state,
         "developer",
-        "TRUSTED_CLI_REPORT_BRIDGE_REPAIR",
-        "native write prompt detected; dispatching bridge correction",
+        "TRUSTED_CLI_MARKDOWN_REPORT_REPAIR",
+        f"{reason}; dispatching markdown report correction",
     )
     return _worker_action(state, "developer", repair_prompt, body=repair_prompt)
 
 
-def _terminal_trusted_cli_native_write_blocker(
+def _terminal_trusted_cli_output_blocker(
     state: CoordinatorLoopState,
     text: str,
     *,
     worker_context: dict[str, Any] | None = None,
 ) -> CoordinatorAction:
-    from worker_workspace import format_trusted_cli_native_write_blocker
+    from worker_workspace import (
+        format_trusted_cli_incomplete_report_blocker,
+        format_trusted_cli_native_write_blocker,
+        format_trusted_cli_refusal_blocker,
+    )
 
     policy = (worker_context or {}).get("workspace_policy") or {}
     by_role = (worker_context or {}).get("report_paths_by_role") or {}
@@ -1020,19 +1074,37 @@ def _terminal_trusted_cli_native_write_blocker(
         paths = list((worker_context or {}).get("report_paths") or [])
         report_path = str(paths[0]) if paths else ""
     workspace = policy.get("workspace") or {}
-    blocker = format_trusted_cli_native_write_blocker(
+    profile = str(state.session_workspace_profile or policy.get("policy_id") or "")
+    mode = str(state.session_workspace_mode or policy.get("mode") or "")
+    reason = _trusted_cli_repair_reason(text)
+    common = dict(
         text=text,
         policy=policy,
-        cwd=str(workspace.get("root") or ""),
-        workspace_profile=str(
-            state.session_workspace_profile or policy.get("policy_id") or "",
-        ),
-        workspace_mode=str(state.session_workspace_mode or policy.get("mode") or ""),
+        workspace_profile=profile,
+        workspace_mode=mode,
         report_path=report_path,
         repair_round=state.trusted_cli_report_bridge_repair_rounds,
         max_repair_rounds=state.max_trusted_cli_report_bridge_repair_rounds,
     )
+    if reason == "refusal":
+        blocker = format_trusted_cli_refusal_blocker(**common)
+    elif reason == "native_write":
+        blocker = format_trusted_cli_native_write_blocker(
+            cwd=str(workspace.get("root") or ""),
+            **common,
+        )
+    else:
+        blocker = format_trusted_cli_incomplete_report_blocker(**common)
     return _terminal_blocker(state, blocker)
+
+
+def _terminal_trusted_cli_native_write_blocker(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
+    return _terminal_trusted_cli_output_blocker(state, text, worker_context=worker_context)
 
 
 def _try_report_orchestrated_worker(
@@ -1183,8 +1255,8 @@ def _on_developer_output(
     ):
         return repair
 
-    if _trusted_cli_context(state, worker_context) and _trusted_cli_native_write_detected(text):
-        return _terminal_trusted_cli_native_write_blocker(
+    if _trusted_cli_context(state, worker_context) and _trusted_cli_output_needs_repair(text):
+        return _terminal_trusted_cli_output_blocker(
             state, text, worker_context=worker_context,
         )
 

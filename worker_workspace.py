@@ -104,8 +104,15 @@ TRUSTED_CLI_REPORT_BRIDGE_INSTRUCTION = (
 TRUSTED_CLI_NATIVE_WRITE_BLOCKER_PREFIX = (
     "BLOCKER: trusted CLI used native write instead of report bridge"
 )
+TRUSTED_CLI_REFUSED_BLOCKER_PREFIX = (
+    "BLOCKER: trusted CLI refused report-output contract"
+)
+TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX = (
+    "BLOCKER: trusted CLI report stdout incomplete"
+)
 DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS = 1
 TRUSTED_CLI_REPORT_BRIDGE_REPAIR_EXCERPT_CHARS = 4000
+TRUSTED_CLI_MIN_REPORT_CHARS = 800
 
 _NATIVE_WRITE_PERMISSION_PROMPT_RES = (
     re.compile(r"explicit approval", re.IGNORECASE),
@@ -114,6 +121,25 @@ _NATIVE_WRITE_PERMISSION_PROMPT_RES = (
     re.compile(r"outside the repo working directory", re.IGNORECASE),
     re.compile(r"permission prompt should have appeared", re.IGNORECASE),
     re.compile(r"could you approve", re.IGNORECASE),
+)
+_PROMPT_INJECTION_REFUSAL_RES = (
+    re.compile(r"hallmarks of prompt injection", re.IGNORECASE),
+    re.compile(r"prompt injection", re.IGNORECASE),
+    re.compile(r"fake.*bridge", re.IGNORECASE),
+    re.compile(r"fake.*protocol", re.IGNORECASE),
+    re.compile(r"role-play.*routing", re.IGNORECASE),
+    re.compile(r"REPORT_FILE_WRITE_BEGIN/END as a fake", re.IGNORECASE),
+    re.compile(r"cannot follow (these|those|this) instruction", re.IGNORECASE),
+    re.compile(r"refuse to (follow|comply|emit)", re.IGNORECASE),
+)
+_TRUSTED_CLI_REPORT_SECTION_MARKERS = (
+    "## summary",
+    "## files inspected",
+    "## findings",
+    "## evidence",
+    "## red-zone",
+    "## red zone",
+    "## recommended next step",
 )
 
 DEFAULT_SNAPSHOT_MAX_CHARS_PER_FILE = 48_000
@@ -210,6 +236,119 @@ def detect_native_write_permission_prompt(text: str) -> bool:
     return any(pattern.search(sample) for pattern in _NATIVE_WRITE_PERMISSION_PROMPT_RES)
 
 
+def detect_trusted_cli_prompt_injection_refusal(text: str) -> bool:
+    """True when Claude refuses coordinator-style or bridge-like output instructions."""
+    sample = (text or "").strip()
+    if not sample:
+        return False
+    return any(pattern.search(sample) for pattern in _PROMPT_INJECTION_REFUSAL_RES)
+
+
+def parse_trusted_cli_report_status(text: str) -> str:
+    """Extract Status: line from trusted CLI markdown stdout."""
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("status:"):
+            value = stripped.split(":", 1)[1].strip().upper()
+            for token in ("PASS_WITH_NOTES", "REQUEST_CHANGES", "BLOCKER", "FAIL", "PASS"):
+                if value.startswith(token):
+                    return token
+            return value.split()[0] if value else "PASS_WITH_NOTES"
+    return "PASS_WITH_NOTES"
+
+
+def parse_trusted_cli_report_summary(text: str) -> str:
+    """Derive a short summary from trusted CLI markdown stdout."""
+    lines = (text or "").splitlines()
+    for idx, line in enumerate(lines):
+        if line.strip().lower().startswith("## summary"):
+            for follow in lines[idx + 1:]:
+                body = follow.strip()
+                if body.startswith("#"):
+                    break
+                if body:
+                    return body[:240]
+    for line in lines:
+        if line.strip().startswith("#"):
+            return line.strip().lstrip("#").strip()[:240]
+    return "trusted CLI markdown report captured from stdout"
+
+
+def is_trusted_cli_stdout_markdown_report(text: str) -> bool:
+    """True when stdout looks like a complete trusted CLI analysis report."""
+    body = (text or "").strip()
+    if len(body) < TRUSTED_CLI_MIN_REPORT_CHARS:
+        return False
+    if detect_native_write_permission_prompt(body):
+        return False
+    if detect_trusted_cli_prompt_injection_refusal(body):
+        return False
+    if not (body.startswith("#") or "\n# " in body or "\n## " in body):
+        return False
+    low = body.lower()
+    section_hits = sum(1 for marker in _TRUSTED_CLI_REPORT_SECTION_MARKERS if marker in low)
+    has_status = "status:" in low
+    return section_hits >= 2 or (section_hits >= 1 and has_status)
+
+
+def format_trusted_cli_refusal_blocker(
+    *,
+    text: str,
+    policy: dict[str, Any] | None = None,
+    workspace_profile: str = "",
+    workspace_mode: str = "",
+    report_path: str = "",
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+) -> str:
+    if not report_path and isinstance(policy, dict):
+        paths = list(policy.get("report_paths") or [])
+        report_path = paths[0] if paths else ""
+    lines = [
+        TRUSTED_CLI_REFUSED_BLOCKER_PREFIX,
+        "",
+        f"workspace_profile: {workspace_profile or (policy or {}).get('policy_id', '')}",
+        f"workspace_mode: {workspace_mode or (policy or {}).get('mode', '')}",
+        "trusted_direct_repo_cli: true",
+        f"report_path: {report_path}",
+        f"repair_round: {repair_round}",
+        f"max_repair_rounds: {max_repair_rounds}",
+        "contains_prompt_injection_refusal: true",
+        f"contains_report_bridge: {REPORT_FILE_WRITE_BEGIN_MARKER in (text or '')}",
+        f"output_chars: {len((text or '').strip())}",
+    ]
+    return "\n".join(lines)
+
+
+def format_trusted_cli_incomplete_report_blocker(
+    *,
+    text: str,
+    policy: dict[str, Any] | None = None,
+    workspace_profile: str = "",
+    workspace_mode: str = "",
+    report_path: str = "",
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+) -> str:
+    if not report_path and isinstance(policy, dict):
+        paths = list(policy.get("report_paths") or [])
+        report_path = paths[0] if paths else ""
+    lines = [
+        TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX,
+        "",
+        f"workspace_profile: {workspace_profile or (policy or {}).get('policy_id', '')}",
+        f"workspace_mode: {workspace_mode or (policy or {}).get('mode', '')}",
+        "trusted_direct_repo_cli: true",
+        f"report_path: {report_path}",
+        f"repair_round: {repair_round}",
+        f"max_repair_rounds: {max_repair_rounds}",
+        f"output_chars: {len((text or '').strip())}",
+        f"min_report_chars: {TRUSTED_CLI_MIN_REPORT_CHARS}",
+        "Action: return a complete Markdown report in your final response.",
+    ]
+    return "\n".join(lines)
+
+
 def is_trusted_cli_native_write_blocker(text: str) -> bool:
     """True when output is the structured trusted CLI native-write terminal blocker."""
     return TRUSTED_CLI_NATIVE_WRITE_BLOCKER_PREFIX in (text or "")
@@ -230,6 +369,54 @@ def _bounded_trusted_cli_analysis_excerpt(text: str, *, max_chars: int | None = 
     return body[:limit]
 
 
+def build_trusted_cli_markdown_report_repair_prompt(
+    *,
+    previous_output: str,
+    report_path: str = "",
+    repair_round: int = 1,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+    reason: str = "native_write",
+) -> str:
+    """Short correction prompt asking for plain Markdown final report (trusted CLI)."""
+    excerpt = _bounded_trusted_cli_analysis_excerpt(previous_output)
+    reason_line = {
+        "native_write": (
+            "Your previous turn attempted to create the report file or asked for write permission."
+        ),
+        "refusal": (
+            "Your previous turn refused the analysis task or questioned the instructions."
+        ),
+        "incomplete": (
+            "Your previous response was not a complete Markdown analysis report."
+        ),
+    }.get(reason, "Your previous response was not a complete Markdown analysis report.")
+    lines = [
+        "TRUSTED CLI REPORT CORRECTION",
+        "",
+        reason_line,
+        "",
+        "Please do not create or edit files for the report.",
+        "Do not ask for file-write permission.",
+        "Do not inspect source again unless absolutely necessary.",
+        "",
+        "Return the complete analysis report as Markdown in your final response.",
+        "Include at minimum: title, Status line, Summary, Files inspected, Findings,",
+        "Red-zone confirmation, and Recommended next step.",
+        "",
+        f"repair_round: {repair_round}",
+        f"max_repair_rounds: {max_repair_rounds}",
+    ]
+    if report_path:
+        lines.extend(["", f"Reference report path (do not write this file yourself): {report_path}"])
+    if excerpt.strip():
+        lines.extend([
+            "",
+            "PRIOR ANALYSIS EXCERPT (reuse; do not re-read repo unless required):",
+            excerpt.strip(),
+        ])
+    return "\n".join(lines)
+
+
 def build_trusted_cli_report_bridge_repair_prompt(
     *,
     previous_output: str,
@@ -237,50 +424,19 @@ def build_trusted_cli_report_bridge_repair_prompt(
     repair_round: int = 1,
     max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
 ) -> str:
-    """Short correction prompt after trusted CLI native Write instead of report bridge."""
-    excerpt = _bounded_trusted_cli_analysis_excerpt(previous_output)
-    lines = [
-        "TRUSTED CLI REPORT BRIDGE CORRECTION",
-        "",
-        "Your previous trusted CLI turn attempted to use the native Claude Code Write tool "
-        "for the external report.",
-        "",
-        "Do not use Write/Edit tools.",
-        "Do not ask for write permission.",
-        "Do not inspect source again unless absolutely necessary.",
-        "Use your existing analysis and re-emit the report in stdout using exactly one bridge block:",
-        "",
-        "REPORT_FILE_WRITE_BEGIN",
-        f"Path: {report_path or '<expected report path>'}",
-        "Status: PASS_WITH_NOTES",
-        "Summary: <short summary>",
-        "Next recommended role: coordinator",
-        "---",
-        "# <markdown report>",
-        "...",
-        "REPORT_FILE_WRITE_END",
-        "",
-        "If you cannot reconstruct the report from your previous analysis, return:",
-        "BLOCKER: trusted CLI report bridge output failed",
-        "Reason:",
-        "<reason>",
-        "",
-        f"repair_round: {repair_round}",
-        f"max_repair_rounds: {max_repair_rounds}",
-    ]
-    if excerpt.strip():
-        lines.extend([
-            "",
-            "PRIOR ANALYSIS EXCERPT (reuse; do not re-read repo unless required):",
-            excerpt.strip(),
-        ])
-    else:
-        lines.extend([
-            "",
-            "No prior analysis excerpt was captured. Summarize from your current context "
-            "and emit the bridge block only.",
-        ])
-    return "\n".join(lines)
+    """Backward-compatible alias — trusted CLI repair now requests Markdown stdout."""
+    reason = "native_write"
+    if detect_trusted_cli_prompt_injection_refusal(previous_output):
+        reason = "refusal"
+    elif not is_trusted_cli_stdout_markdown_report(previous_output):
+        reason = "incomplete"
+    return build_trusted_cli_markdown_report_repair_prompt(
+        previous_output=previous_output,
+        report_path=report_path,
+        repair_round=repair_round,
+        max_repair_rounds=max_repair_rounds,
+        reason=reason,
+    )
 
 
 def format_trusted_cli_native_write_blocker(
@@ -331,40 +487,44 @@ def format_trusted_cli_native_write_blocker(
         f"session_id: {session_id}",
         f"channel: {channel}",
         "",
-        "Action: re-emit the report using exactly one REPORT_FILE_WRITE_BEGIN / "
-        "REPORT_FILE_WRITE_END block in stdout. Do not use Claude Code Write/Edit tools.",
+        "Action: return the complete Markdown report in your final response. "
+        "Do not create or edit report files.",
     ]
     return "\n".join(lines)
+
+
+def try_capture_trusted_cli_stdout_report(
+    text: str,
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Save a complete trusted CLI markdown report from stdout and emit REPORT_READY."""
+    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
+        return None
+    if not is_trusted_cli_stdout_markdown_report(text):
+        return None
+    targets = [p for p in (policy.get("report_paths") or []) if isinstance(p, str) and p.strip()]
+    if not targets:
+        return None
+    body = (text or "").strip()
+    status = parse_trusted_cli_report_status(body)
+    summary = parse_trusted_cli_report_summary(body)
+    ok, saved_path, err = write_validated_external_report(targets[0], body, policy)
+    if ok:
+        return format_report_ready_after_worker_write(
+            path=saved_path,
+            status=status,
+            summary=summary,
+            notes="Trusted CLI markdown report captured from stdout.",
+        )
+    return format_report_write_failed_reply(path=targets[0], reason=err)
 
 
 def try_recover_trusted_cli_stdout_report(
     text: str,
     policy: dict[str, Any] | None,
 ) -> str | None:
-    """Save a complete markdown report from stdout when bridge markers are absent."""
-    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
-        return None
-    if detect_native_write_permission_prompt(text):
-        return None
-    if REPORT_FILE_WRITE_BEGIN_MARKER in (text or "") or (text or "").lstrip().startswith("REPORT_READY"):
-        return None
-    targets = [p for p in (policy.get("report_paths") or []) if isinstance(p, str) and p.strip()]
-    if not targets:
-        return None
-    body = (text or "").strip()
-    if not body.startswith("#") and "\n# " not in body and "\n## " not in body:
-        return None
-    if len(body) < 200:
-        return None
-    ok, saved_path, err = write_validated_external_report(targets[0], body, policy)
-    if ok:
-        return format_report_ready_after_worker_write(
-            path=saved_path,
-            status="PASS_WITH_NOTES",
-            summary="Recovered markdown report from trusted CLI stdout.",
-            notes="Recovered complete markdown from stdout without REPORT_FILE_WRITE bridge.",
-        )
-    return format_report_write_failed_reply(path=targets[0], reason=err)
+    """Backward-compatible alias for trusted CLI stdout capture."""
+    return try_capture_trusted_cli_stdout_report(text, policy)
 
 
 def is_docs_only_snapshot_mode(
@@ -1076,6 +1236,41 @@ def try_recover_write_tool_call_leakage(
     return format_report_write_failed_reply(path=raw_path, reason=err)
 
 
+def process_trusted_cli_worker_report_output(
+    captured: str,
+    policy: dict[str, Any] | None,
+) -> str | None:
+    """Trusted CLI: bridge compat, stdout markdown capture, or structured blockers."""
+    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
+        return None
+    sample = (captured or "").strip()
+    if not sample:
+        return None
+    bridge = try_process_scoped_worker_report_output(captured, policy)
+    if bridge is not None:
+        return bridge
+    captured_report = try_capture_trusted_cli_stdout_report(captured, policy)
+    if captured_report is not None:
+        return captured_report
+    if detect_trusted_cli_prompt_injection_refusal(sample):
+        return format_trusted_cli_refusal_blocker(
+            text=sample,
+            policy=policy,
+            workspace_profile=str(policy.get("policy_id") or ""),
+            workspace_mode=str(policy.get("mode") or ""),
+        )
+    if detect_native_write_permission_prompt(sample):
+        return None
+    if len(sample) >= 80 and not sample.startswith("BLOCKER:"):
+        return format_trusted_cli_incomplete_report_blocker(
+            text=sample,
+            policy=policy,
+            workspace_profile=str(policy.get("policy_id") or ""),
+            workspace_mode=str(policy.get("mode") or ""),
+        )
+    return None
+
+
 def process_claude_worker_report_output(
     captured: str,
     policy: dict[str, Any] | None,
@@ -1084,13 +1279,14 @@ def process_claude_worker_report_output(
     cwd: str | Path | None = None,
 ) -> str | None:
     """Return transformed worker output when report-write bridge handles it."""
+    if isinstance(policy, dict) and is_trusted_direct_repo_cli_policy(policy):
+        handled = process_trusted_cli_worker_report_output(captured, policy)
+        if handled is not None:
+            return handled
+        return None
     handled = try_process_scoped_worker_report_output(captured, policy)
     if handled is not None:
         return handled
-    if isinstance(policy, dict) and is_trusted_direct_repo_cli_policy(policy):
-        recovered = try_recover_trusted_cli_stdout_report(captured, policy)
-        if recovered is not None:
-            return recovered
     leakage = detect_tool_call_leakage(captured)
     if leakage and str(leakage.get("tool_name", "")).lower() == "write":
         return try_recover_write_tool_call_leakage(captured, policy)

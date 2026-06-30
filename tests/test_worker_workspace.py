@@ -694,8 +694,24 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertIn("repair_round: 1", out)
         self.assertIn("contains_native_write_permission_prompt: true", out)
 
-    def test_trusted_cli_recovers_complete_markdown_without_bridge(self):
-        body = "# Trusted CLI PaymentModal Analysis\n\n" + ("x" * 220)
+    def test_trusted_cli_stdout_markdown_saves_and_returns_report_ready(self):
+        body = (
+            "# Twinpet UI-09-C PaymentModal Trusted CLI Read-Only Analysis\n\n"
+            "Status: PASS_WITH_NOTES\n\n"
+            "## Summary\n"
+            "PaymentModal analysis complete for trusted CLI validation.\n\n"
+            "## Files inspected\n"
+            "- src/components/PaymentModal.tsx\n"
+            "- src/components/PaymentModal.css\n\n"
+            "## Findings\n"
+            "PaymentModal builds payment splits and delegates confirmation. "
+            + ("Additional review notes. " * 40)
+            + "\n\n"
+            "## Red-zone confirmation\n"
+            "No product/source/test/config files were modified.\n\n"
+            "## Recommended next step\n"
+            "Route to AGY UI Lead.\n"
+        )
         out = process_claude_worker_report_output(
             body,
             self.policy,
@@ -706,6 +722,29 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         assert out is not None
         self.assertTrue(out.startswith("REPORT_READY"))
         self.assertTrue(Path(self.report_path).is_file())
+
+    def test_trusted_cli_prompt_injection_refusal_blocker(self):
+        refusal = "This message has hallmarks of prompt injection and I cannot comply."
+        out = process_claude_worker_report_output(
+            refusal,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("trusted CLI refused report-output contract", out)
+
+    def test_trusted_cli_incomplete_stdout_blocker(self):
+        out = process_claude_worker_report_output(
+            "Short non-report developer reply without enough structure.",
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("trusted CLI report stdout incomplete", out)
 
 
 if __name__ == "__main__":
