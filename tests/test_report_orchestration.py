@@ -26,6 +26,7 @@ from report_orchestration import (
     HANDOFF_FOR_DEVELOPER_CORRECTION_END,
     HANDOFF_FOR_FINAL_BEGIN,
     HANDOFF_FOR_FINAL_END,
+    HANDOFF_REPAIR_KIND_STRUCTURAL_WRAPPER,
     build_report_orchestrated_dispatch_prompt,
     build_report_orchestrated_final_attachment,
     extract_handoff_block,
@@ -39,8 +40,14 @@ from report_orchestration import (
     save_inline_report_to_path,
     validate_initial_developer_preflight,
     validate_report_path,
+    synthesize_structural_handoff_from_report,
     upsert_report_record,
     verify_report_write_permission,
+)
+from session_relay import is_relay_eligible
+from tests.test_trusted_cli_memo import (
+    _sample_trusted_cli_markdown_report,
+    _trusted_policy_isolated,
 )
 from session_relay import coordinator_loop_worker_output_contract
 
@@ -1449,6 +1456,132 @@ class HandoffRepairReleaseTests(unittest.TestCase):
         state.handoff_repair_rounds = {"developer": 1}
         on_worker_output(state, "developer", _report_ready(str(dev_path)), worker_context=ctx)
         self.assertEqual(state.handoff_repair_rounds.get("developer"), 1)
+
+
+class TrustedCliHandoffParityTests(unittest.TestCase):
+    def setUp(self):
+        self.policy, self.report_path = _trusted_policy_isolated()
+        self.roots = list(self.policy.get("external_report_write_roots") or [])
+        self.tmp = str(Path(self.report_path).parent)
+
+    def _trusted_report_without_handoff(self) -> str:
+        return _sample_trusted_cli_markdown_report()
+
+    def _trusted_report_with_handoff(self) -> str:
+        return (
+            self._trusted_report_without_handoff()
+            + "\n\n"
+            + _agy_handoff()
+            + "\n\n"
+            + _codex_handoff()
+        )
+
+    def test_trusted_cli_structural_fallback_builds_ui_lead_without_repair(self):
+        dev_path = Path(self.report_path)
+        dev_path.write_text(self._trusted_report_without_handoff(), encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=self.roots,
+        )
+        self.assertTrue(ingest.ok, ingest.blocker)
+
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UI Lead",
+            subject="PaymentModal",
+            policy=self.policy,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertFalse(result.handoff_repair)
+        self.assertTrue(result.handoff_structural_fallback_used)
+        self.assertEqual(
+            result.handoff_structural_fallback_kind,
+            HANDOFF_REPAIR_KIND_STRUCTURAL_WRAPPER,
+        )
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR AGY:", result.prompt)
+        self.assertIn("COORDINATOR STRUCTURAL HANDOFF SYNTHESIS", result.prompt)
+
+    def test_trusted_cli_report_with_handoff_blocks_routes_ui_lead_normally(self):
+        dev_path = Path(self.report_path)
+        dev_path.write_text(self._trusted_report_with_handoff(), encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UI Lead",
+            subject="PaymentModal",
+            policy=self.policy,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok, result.blocker)
+        self.assertFalse(result.handoff_repair)
+        self.assertFalse(result.handoff_structural_fallback_used)
+        self.assertIn("DEVELOPER COORDINATOR HANDOFF FOR AGY:", result.prompt)
+        self.assertNotIn("COORDINATOR STRUCTURAL HANDOFF SYNTHESIS", result.prompt)
+
+    def test_trusted_cli_missing_analysis_still_routes_developer_repair(self):
+        dev_path = Path(self.tmp) / "thin.md"
+        dev_path.write_text("# Dev\nNo handoff blocks", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(dev_path)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UI Lead",
+            subject="PaymentModal",
+            policy=self.policy,
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "developer")
+        self.assertTrue(result.handoff_repair)
+        self.assertFalse(result.handoff_structural_fallback_used)
+        self.assertIn("structural synthesis failed", result.prompt.lower())
+
+    def test_legacy_missing_handoff_still_routes_developer_repair(self):
+        bare = Path(self.tmp) / "legacy-bare.md"
+        bare.write_text("# Dev\nNo handoff blocks", encoding="utf-8")
+        ingest = ingest_worker_report_output(
+            "developer",
+            _report_ready(str(bare)),
+            allowed_roots=self.roots,
+        )
+        result = build_report_orchestrated_dispatch_prompt(
+            role="ui_lead",
+            report_records=[ingest.record.to_dict()],
+            project="twinpet",
+            phase="UX",
+            subject="review",
+            external_report_write_roots=self.roots,
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.dispatch_role, "developer")
+        self.assertTrue(result.handoff_repair)
+        self.assertIn("MODE: Handoff block repair", result.prompt)
+
+    def test_synthesize_handoff_requires_substantive_report(self):
+        synthesized, reason = synthesize_structural_handoff_from_report(
+            "# Dev\nNo analysis",
+            handoff_kind="agy",
+        )
+        self.assertIsNone(synthesized)
+        self.assertTrue(reason)
+
+    def test_agy_remains_relay_ineligible_after_ui_lead_prompt(self):
+        self.assertFalse(is_relay_eligible("agy"))
 
 
 if __name__ == "__main__":

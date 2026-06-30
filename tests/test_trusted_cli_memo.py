@@ -8,7 +8,14 @@ from pathlib import Path
 
 import config_loader
 import workspace_policy as wp
-from report_orchestration import build_report_orchestrated_dispatch_prompt, is_report_orchestrated_policy
+from report_orchestration import (
+    HANDOFF_FOR_AGY_BEGIN,
+    HANDOFF_FOR_AGY_END,
+    HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+    HANDOFF_FOR_CODEX_REVIEWER_END,
+    build_report_orchestrated_dispatch_prompt,
+    is_report_orchestrated_policy,
+)
 from trusted_cli_memo import (
     REQUIRED_MEMO_SECTIONS,
     build_trusted_cli_execution_memo,
@@ -230,6 +237,17 @@ class TrustedMemoTests(unittest.TestCase):
         memo, _, _ = self._memo()
         lines = memo.prompt.splitlines()
         self.assertTrue(any(ln.startswith("FINAL RESPONSE REQUIREMENT") for ln in lines))
+
+    def test_memo_includes_required_handoff_block_markers(self):
+        memo, _, _ = self._memo()
+        for marker in (
+            HANDOFF_FOR_AGY_BEGIN,
+            HANDOFF_FOR_AGY_END,
+            HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+            HANDOFF_FOR_CODEX_REVIEWER_END,
+        ):
+            self.assertIn(marker, memo.prompt)
+        self.assertIn("REQUIRED HANDOFF BLOCKS IN YOUR REPORT", memo.prompt)
 
 
 class TrustedDispatchTests(unittest.TestCase):

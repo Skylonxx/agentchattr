@@ -14,7 +14,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 from worker_workspace import REPORT_BEGIN_MARKER, REPORT_END_MARKER, extract_report_block
 
@@ -154,7 +154,12 @@ class ReportPromptResult:
     report_reread_after_repair: bool = False
     handoff_validation_reason: str = ""
     refreshed_report_records: list[dict[str, Any]] | None = None
+    handoff_structural_fallback_used: bool = False
+    handoff_structural_fallback_kind: str = ""
 
+
+HANDOFF_REPAIR_KIND_STRUCTURAL_WRAPPER = "structural_wrapper"
+HANDOFF_REPAIR_OWNER_COORDINATOR = "coordinator"
 
 PARSER_EXPECTED_HANDOFF_MARKER_NAMES: tuple[str, ...] = (
     HANDOFF_FOR_AGY_BEGIN,
@@ -1030,6 +1035,129 @@ def collect_owner_handoff_validation(
     return missing, invalid, scan_found_handoff_marker_names(content)
 
 
+class _ResolvedDeveloperHandoff(NamedTuple):
+    handoff: str
+    structural_fallback_used: bool = False
+    structural_fallback_kind: str = ""
+
+
+def _extract_markdown_section_bodies(content: str) -> dict[str, str]:
+    """Map normalized ## heading names to section body text."""
+    sections: dict[str, str] = {}
+    current_key = ""
+    current_lines: list[str] = []
+    preamble: list[str] = []
+
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            if current_key:
+                sections[current_key] = "\n".join(current_lines).strip()
+            current_key = stripped[3:].strip().lower()
+            current_lines = []
+        elif current_key:
+            current_lines.append(line)
+        elif stripped.startswith("# "):
+            preamble.append(line)
+        else:
+            preamble.append(line)
+
+    if current_key:
+        sections[current_key] = "\n".join(current_lines).strip()
+    if preamble:
+        sections["__preamble__"] = "\n".join(preamble).strip()
+    return sections
+
+
+def _section_body_matching(sections: dict[str, str], *fragments: str) -> str:
+    frags = [f.lower() for f in fragments if f]
+    for key, body in sections.items():
+        if key == "__preamble__" or not body.strip():
+            continue
+        key_low = key.lower()
+        if any(f in key_low for f in frags):
+            return body.strip()
+    return ""
+
+
+def _extract_status_line(content: str) -> str:
+    for line in (content or "").splitlines():
+        stripped = line.strip()
+        if stripped.lower().startswith("status:"):
+            return stripped
+    return ""
+
+
+def report_has_structural_handoff_source_content(content: str) -> tuple[bool, str]:
+    """True when trusted CLI report has enough analysis for coordinator handoff synthesis."""
+    from worker_workspace import validate_trusted_cli_existing_report_file
+
+    return validate_trusted_cli_existing_report_file(content)
+
+
+def synthesize_structural_handoff_from_report(
+    content: str,
+    *,
+    handoff_kind: str,
+) -> tuple[str | None, str]:
+    """Synthesize AGY/Codex handoff text from accepted trusted CLI report sections."""
+    ok, reason = report_has_structural_handoff_source_content(content)
+    if not ok:
+        return None, reason or "insufficient analysis content"
+
+    sections = _extract_markdown_section_bodies(content)
+    status_line = _extract_status_line(content)
+    lines = [
+        "COORDINATOR STRUCTURAL HANDOFF SYNTHESIS (coordinator-owned fallback; "
+        "developer report accepted but handoff wrapper markers were missing):",
+        "",
+    ]
+    if status_line:
+        lines.extend([status_line, ""])
+
+    if handoff_kind == "agy":
+        field_specs: tuple[tuple[str, tuple[str, ...]], ...] = (
+            ("PaymentModal files inspected", ("files inspected",)),
+            ("UI/UX findings by severity", ("findings", "ui/ux")),
+            ("Accessibility / focus / keyboard risks", ("accessibility", "keyboard", "focus")),
+            ("POS cashier workflow risks", ("cashier", "pos", "workflow")),
+            ("Narrow-screen / responsive risks", ("narrow", "responsive", "screen")),
+            ("Print / receipt behavior notes", ("print", "receipt")),
+            ("Recommended safe implementation scope", ("recommended", "next step", "implementation")),
+            ("Exact allowed implementation files", ("allowed", "exact")),
+            ("Red-zone confirmation", ("red-zone", "red zone", "no product")),
+        )
+    elif handoff_kind == "codex_reviewer":
+        field_specs = (
+            ("Summary of analysis", ("summary",)),
+            ("Files inspected", ("files inspected",)),
+            ("Risk boundaries", ("findings", "risk")),
+            ("Exact recommended implementation files", ("allowed", "exact", "implementation")),
+            (
+                "Red-zone confirmation (no source/test/config modifications)",
+                ("red-zone", "red zone", "no product"),
+            ),
+            ("Codex verification checklist", ("recommended", "next step", "verify")),
+        )
+    else:
+        return None, f"unknown handoff_kind: {handoff_kind}"
+
+    appended = 0
+    for label, frags in field_specs:
+        body = _section_body_matching(sections, *frags)
+        if body:
+            lines.extend([f"- {label}:", body, ""])
+            appended += 1
+
+    if appended == 0:
+        return None, "no report sections matched for synthesis"
+
+    handoff = "\n".join(lines).strip()
+    if not is_handoff_sufficient(handoff):
+        return None, "synthesized handoff below minimum length"
+    return handoff, HANDOFF_REPAIR_KIND_STRUCTURAL_WRAPPER
+
+
 def format_handoff_validation_diagnostics(
     *,
     intended_next_role: str,
@@ -1748,6 +1876,125 @@ def _validate_handoff_for_dispatch(
     return handoff
 
 
+def _resolve_developer_handoff_for_dispatch(
+    report_content: str,
+    *,
+    begin: str,
+    end: str,
+    block_name: str,
+    owner_role: str,
+    report_path: str,
+    max_chars: int,
+    expected_output_path: str = "",
+    report_sha256: str = "",
+    report_size_bytes: int = 0,
+    last_report_status: str = "",
+    include_correction_handoff: bool = False,
+    allowed_roots: list[str] | None = None,
+    intended_next_role: str = "",
+    report_hash_before: str = "",
+    using_cached_report: bool = False,
+    report_reread_after_repair: bool = False,
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_HANDOFF_REPAIR_ROUNDS_PER_ROLE,
+    policy: dict[str, Any] | None = None,
+) -> ReportPromptResult | _ResolvedDeveloperHandoff:
+    """Extract developer handoff; synthesize wrapper when trusted CLI report lacks markers only."""
+    handoff = extract_handoff_block(report_content, begin, end)
+    validate_kwargs = {
+        "owner_role": owner_role,
+        "report_path": report_path,
+        "block_name": block_name,
+        "max_chars": max_chars,
+        "expected_output_path": expected_output_path,
+        "report_sha256": report_sha256,
+        "report_size_bytes": report_size_bytes,
+        "last_report_status": last_report_status,
+        "include_correction_handoff": include_correction_handoff,
+        "allowed_roots": allowed_roots,
+        "report_content": report_content,
+        "intended_next_role": intended_next_role,
+        "report_hash_before": report_hash_before,
+        "using_cached_report": using_cached_report,
+        "report_reread_after_repair": report_reread_after_repair,
+        "repair_round": repair_round,
+        "max_repair_rounds": max_repair_rounds,
+    }
+
+    if handoff is not None:
+        validated = _validate_handoff_for_dispatch(handoff, **validate_kwargs)
+        if isinstance(validated, ReportPromptResult):
+            return validated
+        return _ResolvedDeveloperHandoff(handoff=validated)
+
+    trusted_cli = isinstance(policy, dict) and bool(policy.get("trusted_direct_repo_cli"))
+    if trusted_cli:
+        if begin == HANDOFF_FOR_AGY_BEGIN:
+            handoff_kind = "agy"
+        elif begin == HANDOFF_FOR_CODEX_REVIEWER_BEGIN:
+            handoff_kind = "codex_reviewer"
+        else:
+            handoff_kind = ""
+        if handoff_kind:
+            synthesized, diag = synthesize_structural_handoff_from_report(
+                report_content,
+                handoff_kind=handoff_kind,
+            )
+            if synthesized is not None:
+                validated = _validate_handoff_for_dispatch(synthesized, **validate_kwargs)
+                if isinstance(validated, ReportPromptResult):
+                    return validated
+                return _ResolvedDeveloperHandoff(
+                    handoff=validated,
+                    structural_fallback_used=True,
+                    structural_fallback_kind=HANDOFF_REPAIR_KIND_STRUCTURAL_WRAPPER,
+                )
+            return build_handoff_repair_result(
+                owner_role=owner_role,
+                report_path=report_path,
+                missing_blocks=[block_name],
+                reason=(
+                    f"REQUEST_CHANGES: trusted CLI report lacks {block_name} and "
+                    f"coordinator structural synthesis failed: {diag}"
+                ),
+                expected_output_path=expected_output_path,
+                report_sha256=report_sha256,
+                report_size_bytes=report_size_bytes,
+                last_report_status=last_report_status,
+                include_correction_handoff=include_correction_handoff,
+                allowed_roots=allowed_roots,
+                report_content=report_content,
+                intended_next_role=intended_next_role,
+                report_hash_before=report_hash_before,
+                using_cached_report=using_cached_report,
+                report_reread_after_repair=report_reread_after_repair,
+                repair_round=repair_round,
+                max_repair_rounds=max_repair_rounds,
+                found_marker_names=scan_found_handoff_marker_names(report_content),
+            )
+
+    return build_handoff_repair_result(
+        owner_role=owner_role,
+        report_path=report_path,
+        missing_blocks=[block_name],
+        reason=f"REQUEST_CHANGES: report missing {block_name}",
+        expected_output_path=expected_output_path,
+        report_sha256=report_sha256,
+        report_size_bytes=report_size_bytes,
+        last_report_status=last_report_status,
+        include_correction_handoff=include_correction_handoff,
+        allowed_roots=allowed_roots,
+        report_content=report_content,
+        intended_next_role=intended_next_role,
+        report_hash_before=report_hash_before,
+        using_cached_report=using_cached_report,
+        report_reread_after_repair=report_reread_after_repair,
+        repair_round=repair_round,
+        max_repair_rounds=max_repair_rounds,
+        found_marker_names=scan_found_handoff_marker_names(report_content),
+    )
+
+
 def build_report_orchestrated_dispatch_prompt(
     *,
     role: str,
@@ -1855,37 +2102,40 @@ def build_report_orchestrated_dispatch_prompt(
         ok, dev_content, dev = _load_record_content(dev)
         if not ok:
             return _with_refreshed_records(ReportPromptResult(ok=False, blocker=dev_content))
-        agy_handoff = extract_handoff_block(
-            dev_content, HANDOFF_FOR_AGY_BEGIN, HANDOFF_FOR_AGY_END,
-        )
-        validated = _validate_handoff_for_dispatch(
-            agy_handoff,
+        resolved = _resolve_developer_handoff_for_dispatch(
+            dev_content,
+            begin=HANDOFF_FOR_AGY_BEGIN,
+            end=HANDOFF_FOR_AGY_END,
+            block_name=f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}",
             owner_role="developer",
             report_path=dev.path,
-            block_name=f"{HANDOFF_FOR_AGY_BEGIN} / {HANDOFF_FOR_AGY_END}",
             max_chars=max_chars,
             expected_output_path=dev.path,
             report_sha256=dev.sha256,
             report_size_bytes=dev.size_bytes,
             last_report_status=dev.status,
             allowed_roots=roots,
-            report_content=dev_content,
             intended_next_role="ui_lead",
             report_hash_before=hash_before,
             report_reread_after_repair=reread,
+            policy=policy,
         )
-        if isinstance(validated, ReportPromptResult):
-            return _with_refreshed_records(validated)
-        return _with_refreshed_records(build_ui_lead_report_prompt(
+        if isinstance(resolved, ReportPromptResult):
+            return _with_refreshed_records(resolved)
+        ui_result = build_ui_lead_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
             developer_record=dev,
-            developer_handoff=validated,
+            developer_handoff=resolved.handoff,
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
-        ))
+        )
+        if resolved.structural_fallback_used:
+            ui_result.handoff_structural_fallback_used = True
+            ui_result.handoff_structural_fallback_kind = resolved.structural_fallback_kind
+        return _with_refreshed_records(ui_result)
 
     if role == "reviewer":
         if not dev:
@@ -1897,27 +2147,28 @@ def build_report_orchestrated_dispatch_prompt(
         ok, dev_content, dev = _load_record_content(dev)
         if not ok:
             return _with_refreshed_records(ReportPromptResult(ok=False, blocker=dev_content))
-        dev_handoff = extract_handoff_block(
-            dev_content, HANDOFF_FOR_CODEX_REVIEWER_BEGIN, HANDOFF_FOR_CODEX_REVIEWER_END,
-        )
-        validated_dev = _validate_handoff_for_dispatch(
-            dev_handoff,
+        resolved_dev = _resolve_developer_handoff_for_dispatch(
+            dev_content,
+            begin=HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+            end=HANDOFF_FOR_CODEX_REVIEWER_END,
+            block_name=(
+                f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN} / {HANDOFF_FOR_CODEX_REVIEWER_END}"
+            ),
             owner_role="developer",
             report_path=dev.path,
-            block_name=f"{HANDOFF_FOR_CODEX_REVIEWER_BEGIN} / {HANDOFF_FOR_CODEX_REVIEWER_END}",
             max_chars=max_chars,
             expected_output_path=dev.path,
             report_sha256=dev.sha256,
             report_size_bytes=dev.size_bytes,
             last_report_status=dev.status,
             allowed_roots=roots,
-            report_content=dev_content,
             intended_next_role="reviewer",
             report_hash_before=dev_hash_before,
             report_reread_after_repair=reread,
+            policy=policy,
         )
-        if isinstance(validated_dev, ReportPromptResult):
-            return _with_refreshed_records(validated_dev)
+        if isinstance(resolved_dev, ReportPromptResult):
+            return _with_refreshed_records(resolved_dev)
         agy_handoff = ""
         if agy:
             agy_hash_before = agy.sha256
@@ -1949,18 +2200,24 @@ def build_report_orchestrated_dispatch_prompt(
             if isinstance(validated_agy, ReportPromptResult):
                 return _with_refreshed_records(validated_agy)
             agy_handoff = validated_agy
-        return _with_refreshed_records(build_reviewer_report_prompt(
+        reviewer_result = build_reviewer_report_prompt(
             project=project,
             phase=phase,
             subject=subject,
             developer_record=dev,
-            developer_handoff=validated_dev,
+            developer_handoff=resolved_dev.handoff,
             agy_record=agy,
             agy_handoff=agy_handoff,
             instruction=instruction,
             expected_output_path=expected_output_path,
             external_report_write_roots=external_report_write_roots,
-        ))
+        )
+        if resolved_dev.structural_fallback_used:
+            reviewer_result.handoff_structural_fallback_used = True
+            reviewer_result.handoff_structural_fallback_kind = (
+                resolved_dev.structural_fallback_kind
+            )
+        return _with_refreshed_records(reviewer_result)
 
     if role == "developer" and awaiting_developer_correction:
         correction_source = (developer_correction_source or "").strip().lower()

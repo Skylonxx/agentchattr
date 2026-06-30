@@ -33,6 +33,7 @@ REQUIRED_MEMO_SECTIONS = (
     "REQUIRED TESTS",
     "REQUIRED EVIDENCE",
     "REPORT PATH",
+    "REQUIRED HANDOFF BLOCKS IN YOUR REPORT",
     "FINAL RESPONSE REQUIREMENT",
     "FINAL REPLY FORMAT",
     "STOP CONDITIONS",
@@ -62,6 +63,48 @@ def _bullet_list(items: list[str], *, empty: str = "(none)") -> list[str]:
     if not items:
         return [f"  - {empty}"]
     return [f"  - {i}" for i in items]
+
+
+def _trusted_cli_handoff_block_lines() -> list[str]:
+    """Handoff marker instructions aligned with report_orchestration constants."""
+    from report_orchestration import (
+        HANDOFF_FOR_AGY_BEGIN,
+        HANDOFF_FOR_AGY_END,
+        HANDOFF_FOR_CODEX_REVIEWER_BEGIN,
+        HANDOFF_FOR_CODEX_REVIEWER_END,
+    )
+
+    return [
+        "REQUIRED HANDOFF BLOCKS IN YOUR REPORT:",
+        "  Include these marker blocks inside your Markdown report body:",
+        "",
+        f"  {HANDOFF_FOR_AGY_BEGIN}",
+        "  <concise UI/UX handoff for AGY UI Lead>",
+        f"  {HANDOFF_FOR_AGY_END}",
+        "",
+        f"  {HANDOFF_FOR_CODEX_REVIEWER_BEGIN}",
+        "  <concise reviewer handoff for Codex Reviewer>",
+        f"  {HANDOFF_FOR_CODEX_REVIEWER_END}",
+        "",
+        "  AGY handoff must include:",
+        "  - PaymentModal files inspected",
+        "  - UI/UX findings by severity",
+        "  - accessibility/focus/keyboard risks",
+        "  - responsive/narrow-screen risks",
+        "  - print/receipt behavior notes",
+        "  - recommended safe implementation scope",
+        "  - exact allowed files",
+        "  - red-zone confirmation",
+        "",
+        "  Codex Reviewer handoff must include:",
+        "  - summary of analysis",
+        "  - files inspected",
+        "  - risk boundaries",
+        "  - exact recommended implementation files",
+        "  - confirmation no source/test/config modifications",
+        "  - items Codex should verify before approving implementation",
+        "",
+    ]
 
 
 def build_trusted_cli_execution_memo(
@@ -155,6 +198,7 @@ def build_trusted_cli_execution_memo(
         f"  {expected_output_path or '(coordinator-provided Ai-Report path)'}",
         "  This is the only external report path you may write to (if you choose file output).",
         "",
+        *_trusted_cli_handoff_block_lines(),
         "FINAL RESPONSE REQUIREMENT:",
         "  Return the full Markdown report in stdout OR write it only to the exact REPORT PATH above.",
         "  If you write the file, return a short completion message in stdout.",
