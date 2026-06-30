@@ -101,6 +101,12 @@ TRUSTED_CLI_REPORT_BRIDGE_INSTRUCTION = (
     "- If you cannot output the bridge, return: BLOCKER: trusted CLI report bridge output failed"
 )
 
+TRUSTED_CLI_NATIVE_WRITE_BLOCKER_PREFIX = (
+    "BLOCKER: trusted CLI used native write instead of report bridge"
+)
+DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS = 1
+TRUSTED_CLI_REPORT_BRIDGE_REPAIR_EXCERPT_CHARS = 4000
+
 _NATIVE_WRITE_PERMISSION_PROMPT_RES = (
     re.compile(r"explicit approval", re.IGNORECASE),
     re.compile(r"write permission", re.IGNORECASE),
@@ -204,31 +210,121 @@ def detect_native_write_permission_prompt(text: str) -> bool:
     return any(pattern.search(sample) for pattern in _NATIVE_WRITE_PERMISSION_PROMPT_RES)
 
 
+def is_trusted_cli_native_write_blocker(text: str) -> bool:
+    """True when output is the structured trusted CLI native-write terminal blocker."""
+    return TRUSTED_CLI_NATIVE_WRITE_BLOCKER_PREFIX in (text or "")
+
+
+def _bounded_trusted_cli_analysis_excerpt(text: str, *, max_chars: int | None = None) -> str:
+    """Return bounded prior-analysis excerpt for bridge correction prompts."""
+    limit = max_chars or TRUSTED_CLI_REPORT_BRIDGE_REPAIR_EXCERPT_CHARS
+    body = (text or "").strip()
+    if not body:
+        return ""
+    if is_trusted_cli_native_write_blocker(body):
+        lines = body.splitlines()
+        body = "\n".join(
+            ln for ln in lines
+            if not ln.strip().startswith(("workspace_", "contains_", "trusted_", "report_path:", "cwd:", "session_id:", "channel:", "Action:"))
+        ).strip()
+    return body[:limit]
+
+
+def build_trusted_cli_report_bridge_repair_prompt(
+    *,
+    previous_output: str,
+    report_path: str,
+    repair_round: int = 1,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+) -> str:
+    """Short correction prompt after trusted CLI native Write instead of report bridge."""
+    excerpt = _bounded_trusted_cli_analysis_excerpt(previous_output)
+    lines = [
+        "TRUSTED CLI REPORT BRIDGE CORRECTION",
+        "",
+        "Your previous trusted CLI turn attempted to use the native Claude Code Write tool "
+        "for the external report.",
+        "",
+        "Do not use Write/Edit tools.",
+        "Do not ask for write permission.",
+        "Do not inspect source again unless absolutely necessary.",
+        "Use your existing analysis and re-emit the report in stdout using exactly one bridge block:",
+        "",
+        "REPORT_FILE_WRITE_BEGIN",
+        f"Path: {report_path or '<expected report path>'}",
+        "Status: PASS_WITH_NOTES",
+        "Summary: <short summary>",
+        "Next recommended role: coordinator",
+        "---",
+        "# <markdown report>",
+        "...",
+        "REPORT_FILE_WRITE_END",
+        "",
+        "If you cannot reconstruct the report from your previous analysis, return:",
+        "BLOCKER: trusted CLI report bridge output failed",
+        "Reason:",
+        "<reason>",
+        "",
+        f"repair_round: {repair_round}",
+        f"max_repair_rounds: {max_repair_rounds}",
+    ]
+    if excerpt.strip():
+        lines.extend([
+            "",
+            "PRIOR ANALYSIS EXCERPT (reuse; do not re-read repo unless required):",
+            excerpt.strip(),
+        ])
+    else:
+        lines.extend([
+            "",
+            "No prior analysis excerpt was captured. Summarize from your current context "
+            "and emit the bridge block only.",
+        ])
+    return "\n".join(lines)
+
+
 def format_trusted_cli_native_write_blocker(
     *,
     text: str,
-    policy: dict[str, Any] | None,
-    cwd: str | Path | None,
-    queue_item: dict[str, Any] | None,
+    policy: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
+    queue_item: dict[str, Any] | None = None,
+    workspace_profile: str = "",
+    workspace_mode: str = "",
+    report_path: str = "",
+    session_id: str = "",
+    channel: str = "",
+    repair_round: int = 0,
+    max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
 ) -> str:
     """Structured blocker when trusted CLI used native Write instead of report bridge."""
     ctx = worker_context_from_queue_item(queue_item)
-    report_paths = list((policy or {}).get("report_paths") or [])
-    report_path = report_paths[0] if report_paths else ""
-    wpc = queue_item.get("workspace_policy_context") if isinstance(queue_item, dict) else {}
-    channel = ""
-    session_id = ""
-    if isinstance(wpc, dict):
-        channel = str(wpc.get("channel") or "")
-        session_id = str(wpc.get("session_id") or "")
+    if not report_path:
+        report_paths = list((policy or {}).get("report_paths") or [])
+        report_path = report_paths[0] if report_paths else ""
+    if not workspace_profile:
+        workspace_profile = str(ctx.get("policy_id") or (policy or {}).get("policy_id") or "")
+    if not workspace_mode:
+        workspace_mode = str(ctx.get("policy_mode") or (policy or {}).get("mode") or "")
+    if not session_id or not channel:
+        wpc = queue_item.get("workspace_policy_context") if isinstance(queue_item, dict) else {}
+        if isinstance(wpc, dict):
+            channel = channel or str(wpc.get("channel") or "")
+            session_id = session_id or str(wpc.get("session_id") or "")
+    has_bridge = (
+        REPORT_FILE_WRITE_BEGIN_MARKER in (text or "")
+        and REPORT_FILE_WRITE_END_MARKER in (text or "")
+    )
     lines = [
-        "BLOCKER: trusted CLI used native write instead of report bridge",
+        TRUSTED_CLI_NATIVE_WRITE_BLOCKER_PREFIX,
         "",
-        f"workspace_profile: {ctx.get('policy_id') or (policy or {}).get('policy_id') or ''}",
-        f"workspace_mode: {ctx.get('policy_mode') or (policy or {}).get('mode') or ''}",
+        f"workspace_profile: {workspace_profile}",
+        f"workspace_mode: {workspace_mode}",
         "trusted_direct_repo_cli: true",
         f"report_path: {report_path}",
-        f"contains_report_bridge: {'REPORT_FILE_WRITE_BEGIN' in (text or '') and 'REPORT_FILE_WRITE_END' in (text or '')}",
+        f"repair_round: {repair_round}",
+        f"max_repair_rounds: {max_repair_rounds}",
+        f"contains_report_bridge: {has_bridge}",
         f"contains_report_ready: {str(text or '').lstrip().startswith('REPORT_READY')}",
         "contains_native_write_permission_prompt: true",
         f"cwd: {cwd or ctx.get('workspace_root') or ''}",
@@ -286,11 +382,15 @@ def is_docs_only_snapshot_mode(
         return False
     if isinstance(item, dict):
         relay_meta = item.get("relay_meta")
-        if isinstance(relay_meta, dict) and relay_meta.get("handoff_repair"):
+        if isinstance(relay_meta, dict) and (
+            relay_meta.get("handoff_repair") or relay_meta.get("trusted_cli_report_bridge_repair")
+        ):
             return False
         wpc = item.get("workspace_policy_context")
         if isinstance(wpc, dict) and (
-            wpc.get("handoff_repair") or wpc.get("skip_snapshot_injection")
+            wpc.get("handoff_repair")
+            or wpc.get("trusted_cli_report_bridge_repair")
+            or wpc.get("skip_snapshot_injection")
         ):
             return False
     if not is_workspace_bound_queue_item(item):
@@ -991,13 +1091,6 @@ def process_claude_worker_report_output(
         recovered = try_recover_trusted_cli_stdout_report(captured, policy)
         if recovered is not None:
             return recovered
-        if detect_native_write_permission_prompt(captured):
-            return format_trusted_cli_native_write_blocker(
-                text=captured,
-                policy=policy,
-                cwd=cwd,
-                queue_item=queue_item,
-            )
     leakage = detect_tool_call_leakage(captured)
     if leakage and str(leakage.get("tool_name", "")).lower() == "write":
         return try_recover_write_tool_call_leakage(captured, policy)

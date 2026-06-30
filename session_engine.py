@@ -412,14 +412,18 @@ class SessionEngine:
 
     def _make_relay_queue_entry(self, *, prompt: str, session: dict, phase_idx: int,
                                 turn_idx: int, role: str, channel: str,
-                                handoff_repair: bool = False) -> dict:
+                                handoff_repair: bool = False,
+                                trusted_cli_report_bridge_repair: bool = False) -> dict:
         wpc = self._session_workspace_policy_context(
             session, role, phase_idx, turn_idx,
         )
-        if handoff_repair:
+        if handoff_repair or trusted_cli_report_bridge_repair:
             wpc = dict(wpc)
-            wpc["handoff_repair"] = True
             wpc["skip_snapshot_injection"] = True
+        if handoff_repair:
+            wpc["handoff_repair"] = True
+        if trusted_cli_report_bridge_repair:
+            wpc["trusted_cli_report_bridge_repair"] = True
         return make_relay_queue_entry(
             prompt=prompt,
             session_id=session["id"],
@@ -429,6 +433,7 @@ class SessionEngine:
             channel=channel,
             workspace_policy_context=wpc,
             handoff_repair=handoff_repair,
+            trusted_cli_report_bridge_repair=trusted_cli_report_bridge_repair,
         )
 
     def list_active(self) -> list[dict]:
@@ -1717,61 +1722,79 @@ class SessionEngine:
         policy = session.get("workspace_policy") or {}
         cast = session.get("cast", {})
         worker_ctx = self._worker_context_from_session(session)
-        result = build_report_orchestrated_dispatch_prompt(
-            role=role,
-            report_records=cls.report_records,
-            project=channel,
-            phase=phase["name"],
-            subject=session.get("goal", "")[:120] or "report-review",
-            instruction=instruction,
-            awaiting_developer_correction=cls.awaiting_developer_correction,
-            developer_correction_source=cls.developer_correction_source,
-            requires_agy=cls.requires_agy,
-            expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
-            external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
-            max_chars=int(worker_ctx.get("max_report_prompt_chars") or DEFAULT_MAX_REPORT_PROMPT_CHARS),
-            prompt_memo_body=self._session_prompt_body(session),
-            policy=policy,
+        trusted_bridge_repair = bool(
+            getattr(cls, "trusted_cli_report_bridge_repair_active", False)
+            and role == "developer"
+            and instruction.strip()
         )
-        if not result.ok:
-            log.warning(
-                "Session %d: report-orchestrated dispatch blocked: %s",
-                session["id"],
-                result.blocker,
-            )
-            self._fail_worker_dispatch_not_started(
-                session,
-                cls,
+        if trusted_bridge_repair:
+            prompt = instruction.strip()
+            cls.trusted_cli_report_bridge_repair_active = False
+            effective_role = role
+            effective_agent = cast.get(effective_role) or agent
+            effective_agent_base = self._get_agent_base(effective_agent)
+            dispatch_role = role
+            handoff_repair = False
+            result = None
+        else:
+            result = build_report_orchestrated_dispatch_prompt(
                 role=role,
-                assigned_agent=agent,
-                reason=result.blocker,
-                prompt_built=False,
+                report_records=cls.report_records,
+                project=channel,
+                phase=phase["name"],
+                subject=session.get("goal", "")[:120] or "report-review",
+                instruction=instruction,
+                awaiting_developer_correction=cls.awaiting_developer_correction,
+                developer_correction_source=cls.developer_correction_source,
+                requires_agy=cls.requires_agy,
+                expected_output_path=str((worker_ctx.get("report_paths_by_role") or {}).get(role) or ""),
+                external_report_write_roots=list(worker_ctx.get("allowed_report_roots") or []),
+                max_chars=int(worker_ctx.get("max_report_prompt_chars") or DEFAULT_MAX_REPORT_PROMPT_CHARS),
+                prompt_memo_body=self._session_prompt_body(session),
+                policy=policy,
             )
-            return False
+            if not result.ok:
+                log.warning(
+                    "Session %d: report-orchestrated dispatch blocked: %s",
+                    session["id"],
+                    result.blocker,
+                )
+                self._fail_worker_dispatch_not_started(
+                    session,
+                    cls,
+                    role=role,
+                    assigned_agent=agent,
+                    reason=result.blocker,
+                    prompt_built=False,
+                )
+                return False
 
-        if result.refreshed_report_records is not None:
-            cls.report_records = list(result.refreshed_report_records)
-            self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
+            if result.refreshed_report_records is not None:
+                cls.report_records = list(result.refreshed_report_records)
+                self._store.update_coordinator_loop_state(session["id"], cls.to_dict())
 
-        prompt = result.prompt
-        dispatch_role = result.dispatch_role or role
-        effective_role = dispatch_role
-        effective_agent = cast.get(effective_role) or agent
-        effective_agent_base = self._get_agent_base(effective_agent)
+            prompt = result.prompt
+            dispatch_role = result.dispatch_role or role
+            effective_role = dispatch_role
+            effective_agent = cast.get(effective_role) or agent
+            effective_agent_base = self._get_agent_base(effective_agent)
+            handoff_repair = bool(getattr(result, "handoff_repair", False))
+
         workspace_bound = bool((policy.get("workspace") or {}).get("root"))
         contract = coordinator_loop_worker_output_contract(
             effective_role,
             workspace_bound=workspace_bound,
             report_orchestrated=cls.report_orchestrated,
         )
-        if contract:
+        if contract and not trusted_bridge_repair:
             prompt = f"{prompt}\n\n{contract}"
 
-        handoff_repair = bool(getattr(result, "handoff_repair", False))
         repair_owner = (
-            getattr(result, "handoff_repair_owner_role", "") or dispatch_role or role
+            (getattr(result, "handoff_repair_owner_role", "") if result is not None else "")
+            or dispatch_role
+            or role
         )
-        if handoff_repair:
+        if handoff_repair and result is not None:
             rounds = dict(getattr(cls, "handoff_repair_rounds", {}) or {})
             max_repairs = int(
                 getattr(cls, "max_handoff_repair_rounds_per_role", 2) or 2,
@@ -1910,6 +1933,10 @@ class SessionEngine:
             wpc = dict(wpc)
             wpc["handoff_repair"] = True
             wpc["skip_snapshot_injection"] = True
+        if trusted_bridge_repair:
+            wpc = dict(wpc)
+            wpc["trusted_cli_report_bridge_repair"] = True
+            wpc["skip_snapshot_injection"] = True
         try:
             if relay_ok and effective_role in ("developer", "reviewer", "ui_lead"):
                 dispatch_method = "relay_entry"
@@ -1921,6 +1948,7 @@ class SessionEngine:
                     role=effective_role,
                     channel=channel,
                     handoff_repair=handoff_repair,
+                    trusted_cli_report_bridge_repair=trusted_bridge_repair,
                 )
                 self._trigger.trigger_sync(
                     effective_agent, channel=channel, relay_entry=relay_entry,

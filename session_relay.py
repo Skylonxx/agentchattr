@@ -1150,6 +1150,7 @@ def make_relay_queue_entry(
     channel: str = "general",
     workspace_policy_context: dict | None = None,
     handoff_repair: bool = False,
+    trusted_cli_report_bridge_repair: bool = False,
 ) -> dict:
     """Build a queue entry dict for a relay session turn.
 
@@ -1176,10 +1177,15 @@ def make_relay_queue_entry(
     }
     if handoff_repair:
         entry["relay_meta"]["handoff_repair"] = True
+    if trusted_cli_report_bridge_repair:
+        entry["relay_meta"]["trusted_cli_report_bridge_repair"] = True
     if workspace_policy_context:
         entry["workspace_policy_context"] = dict(workspace_policy_context)
         if handoff_repair:
             entry["workspace_policy_context"]["handoff_repair"] = True
+            entry["workspace_policy_context"]["skip_snapshot_injection"] = True
+        if trusted_cli_report_bridge_repair:
+            entry["workspace_policy_context"]["trusted_cli_report_bridge_repair"] = True
             entry["workspace_policy_context"]["skip_snapshot_injection"] = True
     return entry
 

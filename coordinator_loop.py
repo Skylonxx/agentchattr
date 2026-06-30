@@ -185,6 +185,10 @@ class CoordinatorLoopState:
     blocker_reason: str = ""
     handoff_repair_rounds: dict[str, int] = field(default_factory=dict)
     max_handoff_repair_rounds_per_role: int = 2
+    trusted_cli_report_bridge_repair_rounds: int = 0
+    max_trusted_cli_report_bridge_repair_rounds: int = 1
+    trusted_cli_report_bridge_repair_active: bool = False
+    last_trusted_cli_developer_output: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CoordinatorLoopState:
@@ -243,6 +247,14 @@ class CoordinatorLoopState:
             } if isinstance(data.get("handoff_repair_rounds"), dict) else {},
             max_handoff_repair_rounds_per_role=int(
                 data.get("max_handoff_repair_rounds_per_role", 2)),
+            trusted_cli_report_bridge_repair_rounds=int(
+                data.get("trusted_cli_report_bridge_repair_rounds", 0)),
+            max_trusted_cli_report_bridge_repair_rounds=int(
+                data.get("max_trusted_cli_report_bridge_repair_rounds", 1)),
+            trusted_cli_report_bridge_repair_active=bool(
+                data.get("trusted_cli_report_bridge_repair_active", False)),
+            last_trusted_cli_developer_output=str(
+                data.get("last_trusted_cli_developer_output", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -288,6 +300,12 @@ class CoordinatorLoopState:
             "blocker_reason": self.blocker_reason,
             "handoff_repair_rounds": dict(self.handoff_repair_rounds),
             "max_handoff_repair_rounds_per_role": self.max_handoff_repair_rounds_per_role,
+            "trusted_cli_report_bridge_repair_rounds": self.trusted_cli_report_bridge_repair_rounds,
+            "max_trusted_cli_report_bridge_repair_rounds": (
+                self.max_trusted_cli_report_bridge_repair_rounds
+            ),
+            "trusted_cli_report_bridge_repair_active": self.trusted_cli_report_bridge_repair_active,
+            "last_trusted_cli_developer_output": self.last_trusted_cli_developer_output,
         }
 
 
@@ -919,6 +937,104 @@ def _build_max_developer_rounds_diagnostics(
     return "\n".join(lines)
 
 
+def _trusted_cli_context(
+    state: CoordinatorLoopState,
+    worker_context: dict[str, Any] | None,
+) -> bool:
+    policy = (worker_context or {}).get("workspace_policy") or {}
+    if policy.get("trusted_direct_repo_cli"):
+        return True
+    profile = str(
+        state.session_workspace_profile
+        or (worker_context or {}).get("policy_id")
+        or policy.get("policy_id")
+        or ""
+    )
+    return profile.endswith("trusted-cli") or "trusted-cli" in profile.lower()
+
+
+def _trusted_cli_native_write_detected(text: str) -> bool:
+    from worker_workspace import (
+        detect_native_write_permission_prompt,
+        is_trusted_cli_native_write_blocker,
+    )
+
+    sample = text or ""
+    return detect_native_write_permission_prompt(sample) or is_trusted_cli_native_write_blocker(sample)
+
+
+def _try_trusted_cli_report_bridge_repair(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction | None:
+    """One-shot developer correction when trusted CLI used native Write for report."""
+    if not state.report_orchestrated or not _trusted_cli_context(state, worker_context):
+        return None
+    if not _trusted_cli_native_write_detected(text):
+        return None
+    if state.trusted_cli_report_bridge_repair_rounds >= state.max_trusted_cli_report_bridge_repair_rounds:
+        return None
+
+    from worker_workspace import build_trusted_cli_report_bridge_repair_prompt
+
+    state.trusted_cli_report_bridge_repair_rounds += 1
+    state.last_trusted_cli_developer_output = (text or "")[:12_000]
+
+    by_role = (worker_context or {}).get("report_paths_by_role") or {}
+    report_path = str(by_role.get("developer") or "")
+    if not report_path:
+        paths = list((worker_context or {}).get("report_paths") or [])
+        report_path = str(paths[0]) if paths else ""
+
+    repair_prompt = build_trusted_cli_report_bridge_repair_prompt(
+        previous_output=state.last_trusted_cli_developer_output,
+        report_path=report_path,
+        repair_round=state.trusted_cli_report_bridge_repair_rounds,
+        max_repair_rounds=state.max_trusted_cli_report_bridge_repair_rounds,
+    )
+    state.trusted_cli_report_bridge_repair_active = True
+    state.last_developer_token = "TRUSTED_CLI_REPORT_BRIDGE_REPAIR"
+    _append_verdict(
+        state,
+        "developer",
+        "TRUSTED_CLI_REPORT_BRIDGE_REPAIR",
+        "native write prompt detected; dispatching bridge correction",
+    )
+    return _worker_action(state, "developer", repair_prompt, body=repair_prompt)
+
+
+def _terminal_trusted_cli_native_write_blocker(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
+    from worker_workspace import format_trusted_cli_native_write_blocker
+
+    policy = (worker_context or {}).get("workspace_policy") or {}
+    by_role = (worker_context or {}).get("report_paths_by_role") or {}
+    report_path = str(by_role.get("developer") or "")
+    if not report_path:
+        paths = list((worker_context or {}).get("report_paths") or [])
+        report_path = str(paths[0]) if paths else ""
+    workspace = policy.get("workspace") or {}
+    blocker = format_trusted_cli_native_write_blocker(
+        text=text,
+        policy=policy,
+        cwd=str(workspace.get("root") or ""),
+        workspace_profile=str(
+            state.session_workspace_profile or policy.get("policy_id") or "",
+        ),
+        workspace_mode=str(state.session_workspace_mode or policy.get("mode") or ""),
+        report_path=report_path,
+        repair_round=state.trusted_cli_report_bridge_repair_rounds,
+        max_repair_rounds=state.max_trusted_cli_report_bridge_repair_rounds,
+    )
+    return _terminal_blocker(state, blocker)
+
+
 def _try_report_orchestrated_worker(
     state: CoordinatorLoopState,
     role: str,
@@ -973,6 +1089,10 @@ def _try_report_orchestrated_worker(
     state.report_records = upsert_report_record(state.report_records, record)
     if not prior_hash or prior_hash != record.sha256:
         state.handoff_repair_rounds.pop(role, None)
+    if role == "developer":
+        state.trusted_cli_report_bridge_repair_rounds = 0
+        state.trusted_cli_report_bridge_repair_active = False
+        state.last_trusted_cli_developer_output = ""
     _append_verdict(state, role, "REPORT_READY", parsed.summary or record.path)
     state.last_output_summary = (parsed.summary or record.path)[:500]
     status = parsed.status
@@ -1057,6 +1177,16 @@ def _on_developer_output(
         state, "developer", text, worker_context=worker_context,
     ):
         return handled
+
+    if repair := _try_trusted_cli_report_bridge_repair(
+        state, text, worker_context=worker_context,
+    ):
+        return repair
+
+    if _trusted_cli_context(state, worker_context) and _trusted_cli_native_write_detected(text):
+        return _terminal_trusted_cli_native_write_blocker(
+            state, text, worker_context=worker_context,
+        )
 
     token, notes = _parse_developer_verdict(text)
     _append_verdict(state, "developer", token, notes)

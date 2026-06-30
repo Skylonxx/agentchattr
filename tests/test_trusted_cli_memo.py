@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import config_loader
 import workspace_policy as wp
@@ -223,6 +225,166 @@ class TrustedDispatchTests(unittest.TestCase):
             external_report_write_roots=roots,
         )
         self.assertTrue(ok, blocker)
+
+
+class TrustedCliNativeWriteRepairTests(unittest.TestCase):
+    def test_repair_prompt_includes_bridge_contract(self):
+        from worker_workspace import build_trusted_cli_report_bridge_repair_prompt
+
+        report_path = "C:/tmp/trusted-cli-report.md"
+        prior = (
+            "The report write requires your explicit approval since the path is "
+            "outside the repo working directory.\n\n"
+            "# PaymentModal Analysis\nFindings here."
+        )
+        prompt = build_trusted_cli_report_bridge_repair_prompt(
+            previous_output=prior,
+            report_path=report_path,
+            repair_round=1,
+            max_repair_rounds=1,
+        )
+        self.assertIn("TRUSTED CLI REPORT BRIDGE CORRECTION", prompt)
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", prompt)
+        self.assertIn("REPORT_FILE_WRITE_END", prompt)
+        self.assertIn(report_path, prompt)
+        self.assertIn("Do not use Write/Edit tools", prompt)
+        self.assertIn("PaymentModal Analysis", prompt)
+
+    def test_first_native_write_triggers_developer_repair_not_terminal(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile="twinpet-ui-09-c-payment-modal-trusted-cli",
+            session_workspace_mode="read-only",
+        )
+        policy = _trusted_policy()
+        report_path = (policy.get("report_paths") or [""])[0]
+        native = (
+            "The report write requires your explicit approval since the path is "
+            "outside the repo working directory. Could you approve the write?\n\n"
+            "# PaymentModal\nAnalysis summary."
+        )
+        action = on_worker_output(
+            state,
+            "developer",
+            native,
+            worker_context={
+                "workspace_policy": policy,
+                "policy_id": policy.get("policy_id"),
+                "report_paths": list(policy.get("report_paths") or []),
+                "report_paths_by_role": {"developer": report_path},
+            },
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "developer")
+        self.assertEqual(state.trusted_cli_report_bridge_repair_rounds, 1)
+        self.assertIn("REPORT_FILE_WRITE_BEGIN", action.routing_body)
+
+    def test_second_native_write_emits_terminal_blocker(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile="twinpet-ui-09-c-payment-modal-trusted-cli",
+            session_workspace_mode="read-only",
+            trusted_cli_report_bridge_repair_rounds=1,
+            max_trusted_cli_report_bridge_repair_rounds=1,
+        )
+        policy = _trusted_policy()
+        report_path = (policy.get("report_paths") or [""])[0]
+        native = (
+            "Could you approve the write permission for the external report path?"
+        )
+        action = on_worker_output(
+            state,
+            "developer",
+            native,
+            worker_context={
+                "workspace_policy": policy,
+                "policy_id": policy.get("policy_id"),
+                "report_paths": list(policy.get("report_paths") or []),
+                "report_paths_by_role": {"developer": report_path},
+            },
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("trusted CLI used native write instead of report bridge", action.prompt_context)
+        self.assertIn("repair_round: 1", action.prompt_context)
+
+    def test_repair_then_bridge_report_ready_routes_ui_lead(self):
+        from coordinator_loop import CoordinatorLoopState, on_worker_output
+        from worker_workspace import (
+            REPORT_FILE_WRITE_BEGIN_MARKER,
+            REPORT_FILE_WRITE_END_MARKER,
+        )
+
+        state = CoordinatorLoopState(
+            phase=__import__("coordinator_loop").CoordinatorPhase.AWAIT_DEVELOPER,
+            awaiting_role="developer",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            session_workspace_profile="twinpet-ui-09-c-payment-modal-trusted-cli",
+            session_workspace_mode="read-only",
+        )
+        policy = _trusted_policy()
+        tmp = tempfile.mkdtemp()
+        report_path = str(Path(tmp) / "trusted-cli-report.md")
+        policy = dict(policy)
+        policy["external_report_write_roots"] = [tmp]
+        policy["report_paths"] = [report_path]
+        native = "Could you approve the write for the external report?"
+        on_worker_output(
+            state,
+            "developer",
+            native,
+            worker_context={
+                "workspace_policy": policy,
+                "policy_id": policy.get("policy_id"),
+                "allowed_report_roots": [tmp],
+                "report_paths": [report_path],
+                "report_paths_by_role": {"developer": report_path},
+            },
+        )
+        bridge = (
+            f"{REPORT_FILE_WRITE_BEGIN_MARKER}\n"
+            f"Path: {report_path}\n"
+            "Status: PASS_WITH_NOTES\n"
+            "Summary: Re-emitted through bridge.\n"
+            "Next recommended role: coordinator\n"
+            "---\n"
+            "# Report\nDone.\n"
+            f"{REPORT_FILE_WRITE_END_MARKER}"
+        )
+        from report_orchestration import parse_report_ready
+        from worker_workspace import process_claude_worker_report_output
+
+        ready = process_claude_worker_report_output(bridge, policy)
+        assert ready is not None
+        action = on_worker_output(
+            state,
+            "developer",
+            ready,
+            worker_context={
+                "workspace_policy": policy,
+                "policy_id": policy.get("policy_id"),
+                "allowed_report_roots": [tmp],
+                "report_paths": [report_path],
+                "report_paths_by_role": {"developer": report_path},
+            },
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "coordinator")
+        self.assertTrue(Path(report_path).is_file())
+        self.assertIsNotNone(parse_report_ready(ready))
 
 
 if __name__ == "__main__":

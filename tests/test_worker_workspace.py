@@ -660,7 +660,7 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertTrue(out.startswith("REPORT_READY"))
         self.assertTrue(Path(self.report_path).is_file())
 
-    def test_trusted_cli_native_write_permission_becomes_blocker(self):
+    def test_trusted_cli_native_write_passes_through_for_coordinator_repair(self):
         prompt_text = (
             "The report write requires your explicit approval since the path is "
             "outside the repo working directory. Could you approve the write?"
@@ -671,11 +671,28 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
             queue_item=self.item,
             cwd=TWINPET,
         )
-        self.assertIsNotNone(out)
-        assert out is not None
+        self.assertIsNone(out)
+
+    def test_trusted_cli_native_write_terminal_blocker_helper(self):
+        from worker_workspace import format_trusted_cli_native_write_blocker
+
+        prompt_text = (
+            "The report write requires your explicit approval since the path is "
+            "outside the repo working directory."
+        )
+        out = format_trusted_cli_native_write_blocker(
+            text=prompt_text,
+            policy=self.policy,
+            cwd=TWINPET,
+            workspace_profile=self.policy["policy_id"],
+            workspace_mode="read-only",
+            report_path=self.report_path,
+            repair_round=1,
+            max_repair_rounds=1,
+        )
         self.assertTrue(out.startswith("BLOCKER: trusted CLI used native write"))
+        self.assertIn("repair_round: 1", out)
         self.assertIn("contains_native_write_permission_prompt: true", out)
-        self.assertIn("contains_report_bridge: False", out)
 
     def test_trusted_cli_recovers_complete_markdown_without_bridge(self):
         body = "# Trusted CLI PaymentModal Analysis\n\n" + ("x" * 220)

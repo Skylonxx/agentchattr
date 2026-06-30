@@ -147,11 +147,15 @@ def is_on_demand_snapshot_mode(
         return False
     if isinstance(item, dict):
         relay_meta = item.get("relay_meta")
-        if isinstance(relay_meta, dict) and relay_meta.get("handoff_repair"):
+        if isinstance(relay_meta, dict) and (
+            relay_meta.get("handoff_repair") or relay_meta.get("trusted_cli_report_bridge_repair")
+        ):
             return False
         wpc = item.get("workspace_policy_context")
         if isinstance(wpc, dict) and (
-            wpc.get("handoff_repair") or wpc.get("skip_snapshot_injection")
+            wpc.get("handoff_repair")
+            or wpc.get("trusted_cli_report_bridge_repair")
+            or wpc.get("skip_snapshot_injection")
         ):
             return False
     if not is_workspace_bound_queue_item(item):
