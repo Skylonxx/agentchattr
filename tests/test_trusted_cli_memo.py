@@ -35,7 +35,9 @@ def _sample_trusted_cli_markdown_report() -> str:
         "## Findings\n"
         "PaymentModal builds payment splits and delegates confirmation to POSPage checkout. "
         "No cart math or Firebase writes occur inside the modal itself. "
-        "Additional boundary review may be needed for credit availability imports.\n\n"
+        "Additional boundary review may be needed for credit availability imports. "
+        + ("Additional trusted CLI validation notes. " * 8)
+        + "\n\n"
         "## Red-zone confirmation\n"
         "No product/source/test/config files were modified.\n\n"
         "## Recommended next step\n"

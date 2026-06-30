@@ -141,6 +141,30 @@ _TRUSTED_CLI_REPORT_SECTION_MARKERS = (
     "## red zone",
     "## recommended next step",
 )
+_TRUSTED_CLI_REPORT_EVIDENCE_MARKERS = (
+    "## files inspected",
+    "files inspected",
+    "## evidence",
+    "git rev-parse",
+    "git status",
+    "head:",
+)
+_TRUSTED_CLI_REPORT_REDZONE_MARKERS = (
+    "red-zone",
+    "red zone",
+    "no product",
+    "no modification",
+    "were not modified",
+    "unchanged",
+    "not modified",
+)
+_TRUSTED_CLI_REPORT_NEXT_STEP_MARKERS = (
+    "recommended next",
+    "next recommended",
+    "next step",
+    "route to agy",
+    "route to ui",
+)
 
 DEFAULT_SNAPSHOT_MAX_CHARS_PER_FILE = 48_000
 SNAPSHOT_HEAD_CHARS = 24_000
@@ -161,6 +185,17 @@ class ReportSaveResult:
     saved: bool = False
     path: str = ""
     notes: list[str] = field(default_factory=list)
+
+
+@dataclass
+class TrustedCliSalvageResult:
+    salvaged: bool = False
+    report_ready: str = ""
+    report_path: str = ""
+    failure_reason: str = ""
+    file_exists: bool = False
+    report_chars: int = 0
+    stdout_chars: int = 0
 
 
 @dataclass
@@ -329,10 +364,13 @@ def format_trusted_cli_incomplete_report_blocker(
     report_path: str = "",
     repair_round: int = 0,
     max_repair_rounds: int = DEFAULT_MAX_TRUSTED_CLI_REPORT_BRIDGE_REPAIR_ROUNDS,
+    salvage: TrustedCliSalvageResult | None = None,
 ) -> str:
     if not report_path and isinstance(policy, dict):
         paths = list(policy.get("report_paths") or [])
         report_path = paths[0] if paths else ""
+    if salvage and salvage.report_path:
+        report_path = salvage.report_path
     lines = [
         TRUSTED_CLI_INCOMPLETE_BLOCKER_PREFIX,
         "",
@@ -344,6 +382,11 @@ def format_trusted_cli_incomplete_report_blocker(
         f"max_repair_rounds: {max_repair_rounds}",
         f"output_chars: {len((text or '').strip())}",
         f"min_report_chars: {TRUSTED_CLI_MIN_REPORT_CHARS}",
+        "trusted_cli_report_salvage_attempted: true",
+        f"salvage_failure_reason: {(salvage.failure_reason if salvage else 'not attempted')}",
+        f"file_exists: {salvage.file_exists if salvage else False}",
+        f"report_chars: {salvage.report_chars if salvage else 0}",
+        f"stdout_chars: {salvage.stdout_chars if salvage else len((text or '').strip())}",
         "Action: return a complete Markdown report in your final response.",
     ]
     return "\n".join(lines)
@@ -525,6 +568,132 @@ def try_recover_trusted_cli_stdout_report(
 ) -> str | None:
     """Backward-compatible alias for trusted CLI stdout capture."""
     return try_capture_trusted_cli_stdout_report(text, policy)
+
+
+def validate_trusted_cli_existing_report_file(content: str) -> tuple[bool, str]:
+    """Validate on-disk trusted CLI report content for salvage acceptance."""
+    body = (content or "").strip()
+    if len(body) < TRUSTED_CLI_MIN_REPORT_CHARS:
+        return False, f"report too short ({len(body)} < {TRUSTED_CLI_MIN_REPORT_CHARS})"
+    if not (body.startswith("#") or "\n# " in body or "\n## " in body):
+        return False, "missing markdown heading"
+    low = body.lower()
+    has_status = "status:" in low or any(
+        token in low for token in ("pass_with_notes", "request_changes", "status: pass")
+    )
+    if not has_status:
+        return False, "missing status or verdict"
+    if not any(marker in low for marker in _TRUSTED_CLI_REPORT_EVIDENCE_MARKERS):
+        return False, "missing files inspected or evidence section"
+    if not any(marker in low for marker in _TRUSTED_CLI_REPORT_REDZONE_MARKERS):
+        return False, "missing red-zone or no-modification confirmation"
+    if not any(marker in low for marker in _TRUSTED_CLI_REPORT_NEXT_STEP_MARKERS):
+        return False, "missing recommended next step"
+    return True, ""
+
+
+def _trusted_cli_salvage_diagnostics_lines(
+    *,
+    salvaged: bool,
+    report_path: str,
+    report_chars: int,
+    stdout_chars: int,
+    status: str,
+    summary: str,
+    policy: dict[str, Any],
+    queue_item: dict[str, Any] | None,
+    cwd: str | Path | None,
+    native_write_warning: bool = False,
+) -> str:
+    ctx = worker_context_from_queue_item(queue_item)
+    wpc = queue_item.get("workspace_policy_context") if isinstance(queue_item, dict) else {}
+    session_id = str((wpc or {}).get("session_id") or "")
+    channel = str((wpc or {}).get("channel") or "")
+    lines = [
+        "trusted_cli_report_salvaged=true",
+        f"report_path={report_path}",
+        f"report_chars={report_chars}",
+        f"stdout_chars={stdout_chars}",
+        f"status={status}",
+        f"summary={summary[:120]}",
+        f"workspace_profile={policy.get('policy_id') or ctx.get('policy_id') or ''}",
+        f"workspace_mode={policy.get('mode') or ctx.get('policy_mode') or ''}",
+        "trusted_direct_repo_cli=true",
+        f"cwd={cwd or ctx.get('workspace_root') or ''}",
+        f"session_id={session_id}",
+        f"channel={channel}",
+    ]
+    if native_write_warning:
+        lines.append("native_write_prompt_with_valid_report=true")
+    return "\n".join(lines)
+
+
+def attempt_salvage_trusted_cli_existing_report(
+    policy: dict[str, Any],
+    stdout_text: str = "",
+    *,
+    queue_item: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
+    native_write_warning: bool = False,
+) -> TrustedCliSalvageResult:
+    """Try to accept an existing expected Ai-Report .md file before incomplete blocker."""
+    from report_orchestration import read_report_file, validate_report_path
+
+    result = TrustedCliSalvageResult(stdout_chars=len((stdout_text or "").strip()))
+    if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
+        result.failure_reason = "not trusted CLI policy"
+        return result
+    targets = [p for p in (policy.get("report_paths") or []) if isinstance(p, str) and p.strip()]
+    if not targets:
+        result.failure_reason = "expected report path not configured"
+        return result
+    raw_path = targets[0]
+    result.report_path = raw_path
+
+    roots = _external_report_roots(policy)
+    ok, reason, resolved = validate_report_path(raw_path, allowed_roots=roots)
+    if not ok or resolved is None:
+        result.failure_reason = reason or "report path outside allowed roots"
+        return result
+    result.report_path = str(resolved)
+    result.file_exists = resolved.is_file()
+    if not result.file_exists:
+        result.failure_reason = "report file not found"
+        return result
+    read_ok, content, _sha, _size = read_report_file(resolved)
+    if not read_ok:
+        result.failure_reason = content or "cannot read report file"
+        return result
+    result.report_chars = len(content.strip())
+    valid, why = validate_trusted_cli_existing_report_file(content)
+    if not valid:
+        result.failure_reason = why
+        return result
+    status = parse_trusted_cli_report_status(content)
+    summary = parse_trusted_cli_report_summary(content)
+    diag = _trusted_cli_salvage_diagnostics_lines(
+        salvaged=True,
+        report_path=str(resolved),
+        report_chars=result.report_chars,
+        stdout_chars=result.stdout_chars,
+        status=status,
+        summary=summary,
+        policy=policy,
+        queue_item=queue_item,
+        cwd=cwd,
+        native_write_warning=native_write_warning,
+    )
+    notes = "Trusted CLI existing report salvaged from expected path."
+    if native_write_warning:
+        notes += " Native write permission prompt ignored because valid report file exists."
+    result.salvaged = True
+    result.report_ready = format_report_ready_after_worker_write(
+        path=str(resolved),
+        status=status,
+        summary=summary,
+        notes=f"{notes}\n\n{diag}",
+    )
+    return result
 
 
 def is_docs_only_snapshot_mode(
@@ -1239,8 +1408,11 @@ def try_recover_write_tool_call_leakage(
 def process_trusted_cli_worker_report_output(
     captured: str,
     policy: dict[str, Any] | None,
+    *,
+    queue_item: dict[str, Any] | None = None,
+    cwd: str | Path | None = None,
 ) -> str | None:
-    """Trusted CLI: bridge compat, stdout markdown capture, or structured blockers."""
+    """Trusted CLI: bridge compat, stdout capture, salvage, or structured blockers."""
     if not isinstance(policy, dict) or not is_trusted_direct_repo_cli_policy(policy):
         return None
     sample = (captured or "").strip()
@@ -1260,13 +1432,31 @@ def process_trusted_cli_worker_report_output(
             workspace_mode=str(policy.get("mode") or ""),
         )
     if detect_native_write_permission_prompt(sample):
+        salvage = attempt_salvage_trusted_cli_existing_report(
+            policy,
+            sample,
+            queue_item=queue_item,
+            cwd=cwd,
+            native_write_warning=True,
+        )
+        if salvage.salvaged:
+            return salvage.report_ready
         return None
     if len(sample) >= 80 and not sample.startswith("BLOCKER:"):
+        salvage = attempt_salvage_trusted_cli_existing_report(
+            policy,
+            sample,
+            queue_item=queue_item,
+            cwd=cwd,
+        )
+        if salvage.salvaged:
+            return salvage.report_ready
         return format_trusted_cli_incomplete_report_blocker(
             text=sample,
             policy=policy,
             workspace_profile=str(policy.get("policy_id") or ""),
             workspace_mode=str(policy.get("mode") or ""),
+            salvage=salvage,
         )
     return None
 
@@ -1280,7 +1470,12 @@ def process_claude_worker_report_output(
 ) -> str | None:
     """Return transformed worker output when report-write bridge handles it."""
     if isinstance(policy, dict) and is_trusted_direct_repo_cli_policy(policy):
-        handled = process_trusted_cli_worker_report_output(captured, policy)
+        handled = process_trusted_cli_worker_report_output(
+            captured,
+            policy,
+            queue_item=queue_item,
+            cwd=cwd,
+        )
         if handled is not None:
             return handled
         return None

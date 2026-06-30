@@ -745,6 +745,130 @@ class TrustedCliReportBridgeTests(unittest.TestCase):
         self.assertIsNotNone(out)
         assert out is not None
         self.assertIn("trusted CLI report stdout incomplete", out)
+        self.assertIn("trusted_cli_report_salvage_attempted: true", out)
+        self.assertIn("file_exists: False", out)
+
+    def _valid_salvage_report_body(self) -> str:
+        return (
+            "# Twinpet UI-09-C PaymentModal Trusted CLI Read-Only Analysis\n\n"
+            "Status: PASS\n\n"
+            "## Summary\n"
+            "PaymentModal analysis complete for trusted CLI validation.\n\n"
+            "## Files inspected\n"
+            "- src/components/PaymentModal.tsx\n"
+            "- src/components/PaymentModal.css\n\n"
+            "## Findings\n"
+            "PaymentModal builds payment splits and delegates confirmation. "
+            + ("Additional review notes. " * 40)
+            + "\n\n"
+            "## Red-zone confirmation\n"
+            "No product/source/test/config files were modified.\n\n"
+            "## Recommended next step\n"
+            "Route to AGY UI Lead.\n"
+        )
+
+    def test_trusted_cli_salvages_existing_report_when_stdout_short(self):
+        Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
+        stdout = "Status unchanged. Here's the analysis summary in a short completion note."
+        out = process_claude_worker_report_output(
+            stdout,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertIn("trusted_cli_report_salvaged=true", out)
+        self.assertIn("Status:\nPASS", out)
+        self.assertIn(self.report_path.replace("\\", "/"), out.replace("\\", "/"))
+
+    def test_trusted_cli_salvage_missing_file_still_blocks(self):
+        out = process_claude_worker_report_output(
+            "Status unchanged. Here's the analysis.",
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("trusted CLI report stdout incomplete", out)
+        self.assertIn("salvage_failure_reason: report file not found", out)
+
+    def test_trusted_cli_salvage_rejects_disallowed_path(self):
+        policy = dict(self.policy)
+        policy["report_paths"] = ["C:/outside/disallowed-report.md"]
+        policy["external_report_write_roots"] = [self.tmp]
+        out = process_claude_worker_report_output(
+            "Status unchanged. Here's the analysis.",
+            policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("trusted CLI report stdout incomplete", out)
+        self.assertIn("outside allowed roots", out)
+
+    def test_trusted_cli_salvage_rejects_too_short_report_file(self):
+        Path(self.report_path).write_text("# Too short\nStatus: PASS\n", encoding="utf-8")
+        out = process_claude_worker_report_output(
+            "Status unchanged. Here's the analysis.",
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("report too short", out)
+
+    def test_trusted_cli_salvage_rejects_report_missing_sections(self):
+        body = (
+            "# Report\n\nStatus: PASS\n\n"
+            + ("x" * 900)
+            + "\n"
+        )
+        Path(self.report_path).write_text(body, encoding="utf-8")
+        out = process_claude_worker_report_output(
+            "Status unchanged. Here's the analysis.",
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertIn("missing files inspected or evidence section", out)
+
+    def test_trusted_cli_native_write_with_valid_report_salvages(self):
+        Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
+        native = (
+            "The report write requires your explicit approval since the path is "
+            "outside the repo working directory."
+        )
+        out = process_claude_worker_report_output(
+            native,
+            self.policy,
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertIsNotNone(out)
+        assert out is not None
+        self.assertTrue(out.startswith("REPORT_READY"))
+        self.assertIn("native_write_prompt_with_valid_report=true", out)
+
+    def test_attempt_salvage_extracts_status_and_summary(self):
+        from worker_workspace import attempt_salvage_trusted_cli_existing_report
+
+        Path(self.report_path).write_text(self._valid_salvage_report_body(), encoding="utf-8")
+        result = attempt_salvage_trusted_cli_existing_report(
+            self.policy,
+            "short stdout",
+            queue_item=self.item,
+            cwd=TWINPET,
+        )
+        self.assertTrue(result.salvaged)
+        self.assertIn("Status:\nPASS", result.report_ready)
+        self.assertIn("PaymentModal analysis complete", result.report_ready)
 
 
 if __name__ == "__main__":
