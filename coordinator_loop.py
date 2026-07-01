@@ -791,8 +791,40 @@ def _detect_ui_changed(notes: str) -> bool:
     keywords = (
         ".tsx", ".jsx", ".css", "layout", "modal", "button", "responsive",
         "ui ", " ux", "tailwind", "flowbite", "screen", "dashboard",
+        "accessibility", "focus", "keyboard",
     )
     return any(k in low for k in keywords)
+
+
+LATE_UI_SIGNAL_TOKEN = "LATE_UI_SIGNAL_DETECTED"
+
+
+def _maybe_apply_late_ui_reclassification(
+    state: CoordinatorLoopState,
+    notes: str,
+    *,
+    source: str,
+) -> bool:
+    """One-directional upgrade: requires_agy false→true when UI content appears late."""
+    if not state.classified or state.requires_agy:
+        return False
+    if "ui_lead" not in WORKER_ROLES:
+        return False
+    if not _detect_ui_changed(notes):
+        return False
+    state.ui_changed = True
+    state.requires_agy = True
+    state.agy_approved = False
+    _append_verdict(
+        state,
+        "coordinator",
+        LATE_UI_SIGNAL_TOKEN,
+        (
+            f"LATE_UI_SIGNAL_DETECTED: upgraded requires_agy from false to true "
+            f"based on UI-relevant {source} report content."
+        ),
+    )
+    return True
 
 
 def on_worker_output(
@@ -860,11 +892,12 @@ def _next_role_hint_after_developer_ready(
     budget_exceeded: bool = False,
     correction_source: str = "",
 ) -> str:
-    if correction_source == "ui_lead" or (
-        state.developer_correction_complete and not state.agy_approved
+    if state.requires_agy and (
+        correction_source == "ui_lead"
+        or (state.developer_correction_complete and not state.agy_approved)
     ):
         return (
-            "Developer correction after AGY REQUEST_CHANGES is complete. "
+            "Developer correction after AGY REQUEST CHANGES is complete. "
             "Route ui_lead for UX re-check with explicit TO: header."
         )
     if state.requires_agy and not state.agy_approved:
@@ -1281,6 +1314,14 @@ def _try_report_orchestrated_worker(
     _append_verdict(state, role, "REPORT_READY", parsed.summary or record.path)
     state.last_output_summary = (parsed.summary or record.path)[:500]
     status = parsed.status
+    ui_signal_text = " ".join(
+        part for part in (
+            parsed.summary,
+            parsed.notes,
+            record.summary,
+            text,
+        ) if part
+    )
 
     if status in ("BLOCKER", "FAIL"):
         return _terminal_blocker(
@@ -1292,6 +1333,7 @@ def _try_report_orchestrated_worker(
         state.developer_has_substantial_output = True
         state.last_developer_analysis = ""
         state.developer_round += 1
+        _maybe_apply_late_ui_reclassification(state, ui_signal_text, source="developer")
         over_budget = state.developer_round > state.max_developer_rounds
         if status in ("PASS", "PASS_WITH_NOTES"):
             if over_budget:
@@ -1336,7 +1378,10 @@ def _try_report_orchestrated_worker(
         state.developer_correction_complete = False
         if state.review_round > state.max_review_rounds:
             return _terminal_blocker(state, "max review_round exceeded")
-        ui_changed = _detect_ui_changed(parsed.notes or parsed.summary)
+        _maybe_apply_late_ui_reclassification(
+            state, ui_signal_text, source="reviewer",
+        )
+        ui_changed = state.ui_changed or _detect_ui_changed(ui_signal_text)
         state.ui_changed = ui_changed
         if ui_changed and state.requires_agy:
             state.agy_approved = False
@@ -1413,6 +1458,8 @@ def _on_developer_output(
         )
 
     if token == "READY_FOR_COORDINATOR" and substantial:
+        ui_signal_text = (text or "").strip() or f"{token}\n{notes}".strip()
+        _maybe_apply_late_ui_reclassification(state, ui_signal_text, source="developer")
         return _coordinator_action_after_developer_ready(state)
 
     return _coordinator_action(
@@ -1512,7 +1559,8 @@ def _on_reviewer_output(
     if state.review_round > state.max_review_rounds:
         return _terminal_blocker(state, "max review_round exceeded")
 
-    ui_changed = _detect_ui_changed(notes)
+    _maybe_apply_late_ui_reclassification(state, notes, source="reviewer")
+    ui_changed = state.ui_changed or _detect_ui_changed(notes)
     state.ui_changed = ui_changed
     if ui_changed and state.requires_agy:
         state.agy_approved = False

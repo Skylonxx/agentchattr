@@ -1,12 +1,16 @@
 """Unit tests for coordinator_loop pure state machine (Phase 1)."""
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 
 from coordinator_loop import (
     COORDINATOR_ROLE,
+    LATE_UI_SIGNAL_TOKEN,
     WORKER_ROLES,
     CoordinatorPhase,
+    coordinator_allowed_tokens,
     on_coordinator_output,
     on_session_start,
     on_worker_output,
@@ -493,6 +497,162 @@ class CoordinatorLoopAgyTokenTests(unittest.TestCase):
         action = on_worker_output(state, "ui_lead", "PASS WITH NOTES\nsoft")
         self.assertTrue(action.is_terminal)
         self.assertEqual(action.terminal_kind, "blocker")
+
+
+def _report_ready_with_ui_summary(path: str, status: str = "PASS_WITH_NOTES") -> str:
+    return (
+        "REPORT_READY\n\n"
+        f"Status:\n{status}\n\n"
+        f"Report:\n{path}\n\n"
+        "Summary:\n"
+        "`PaymentModal.tsx` and `PaymentModal.css` implement a portal-rendered payment modal "
+        "with responsive layout, accessibility, focus, and keyboard handling.\n\n"
+        "Next recommended role:\ncoordinator\n\n"
+        "Notes:\nnotes\n"
+    )
+
+
+class LateUiReclassificationTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.roots = [self.tmp]
+        self.dev_path = Path(self.tmp) / "dev-report.md"
+        self.dev_path.write_text(
+            "# PaymentModal\n"
+            "PaymentModal.tsx and PaymentModal.css modal layout responsive accessibility focus keyboard.",
+            encoding="utf-8",
+        )
+        self.ctx = {
+            "report_paths": [str(self.dev_path)],
+            "allowed_report_roots": self.roots,
+            "max_report_prompt_chars": 120_000,
+        }
+
+    def test_non_ui_developer_report_upgrades_requires_agy(self):
+        state, _ = on_session_start(
+            "Validate trusted CLI flow",
+            session_meta={"report_orchestrated": True},
+        )
+        _classify_non_ui(state)
+        self.assertFalse(state.requires_agy)
+        on_coordinator_output(state, "NEXT: developer\nBegin.")
+        action = on_worker_output(
+            state,
+            "developer",
+            _report_ready_with_ui_summary(str(self.dev_path)),
+            worker_context=self.ctx,
+        )
+        self.assertEqual(action.target_role, COORDINATOR_ROLE)
+        self.assertTrue(state.requires_agy)
+        self.assertTrue(state.ui_changed)
+        self.assertFalse(state.agy_approved)
+        tokens = coordinator_allowed_tokens(state)
+        self.assertIn("NEXT: ui_lead", tokens)
+        self.assertNotIn("NEXT: reviewer", tokens)
+        late = [e for e in state.verdict_log if e.get("token") == LATE_UI_SIGNAL_TOKEN]
+        self.assertEqual(len(late), 1)
+        self.assertIn("upgraded requires_agy", late[0]["notes"])
+        self.assertIn("Route ui_lead", action.prompt_context)
+        route = on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
+        self.assertEqual(route.target_role, "ui_lead")
+        self.assertEqual(state.malformed_coordinator_round, 0)
+
+    def test_non_ui_without_ui_keywords_stays_non_ui(self):
+        state, _ = on_session_start("Validate trusted CLI flow")
+        _classify_non_ui(state)
+        _next(state, "developer")
+        action = on_worker_output(
+            state,
+            "developer",
+            "READY_FOR_COORDINATOR\n"
+            + ("Trusted CLI handoff block parity and reviewer bridge normalization. " * 25),
+        )
+        self.assertEqual(action.target_role, COORDINATOR_ROLE)
+        self.assertFalse(state.requires_agy)
+        self.assertFalse(state.ui_changed)
+        tokens = coordinator_allowed_tokens(state)
+        self.assertNotIn("NEXT: ui_lead", tokens)
+        self.assertIn("NEXT: reviewer", tokens)
+        self.assertNotIn("Route ui_lead", action.prompt_context)
+
+    def test_initial_ui_classification_unchanged(self):
+        state, _ = on_session_start("ui task")
+        _classify_ui(state)
+        self.assertTrue(state.requires_agy)
+        _next(state, "developer")
+        action = on_worker_output(
+            state,
+            "developer",
+            "READY_FOR_COORDINATOR\n" + ("PaymentModal.tsx layout analysis. " * 30),
+        )
+        self.assertIn("Route ui_lead", action.prompt_context)
+        tokens = coordinator_allowed_tokens(state)
+        self.assertIn("NEXT: ui_lead", tokens)
+        route = on_coordinator_output(state, "NEXT: ui_lead\nReview.")
+        self.assertEqual(route.target_role, "ui_lead")
+
+    def test_hint_no_ui_lead_when_non_ui_and_no_late_signal(self):
+        state, _ = on_session_start("backend")
+        _classify_non_ui(state)
+        _next(state, "developer")
+        on_worker_output(state, "developer", "READY_FOR_COORDINATOR\nBackend-only analysis.")
+        _next(state, "reviewer")
+        on_worker_output(state, "reviewer", "REQUEST CHANGES\nFix routing contract.")
+        _next(state, "developer")
+        action = on_worker_output(
+            state,
+            "developer",
+            "READY_FOR_COORDINATOR\n" + ("Backend routing contract fix plan. " * 20),
+        )
+        self.assertNotIn("Route ui_lead", action.prompt_context)
+        self.assertIn("Route reviewer", action.prompt_context)
+
+    def test_session_92_smoke_after_reviewer_correction(self):
+        """Simulate session 92: NON_UI classify, UI report, reviewer REQUEST_CHANGES, dev fix."""
+        rev_path = Path(self.tmp) / "rev.md"
+        rev_path.write_text(
+            "# Review\nPayment-flow UX/accessibility gaps in PaymentModal modal layout.",
+            encoding="utf-8",
+        )
+        state, _ = on_session_start(
+            "Validate trusted CLI flow after handoff block parity and reviewer bridge normalization fixes",
+            session_meta={"report_orchestrated": True},
+        )
+        _classify_non_ui(state)
+        on_coordinator_output(state, "NEXT: developer\nAnalyze.")
+        on_worker_output(
+            state,
+            "developer",
+            _report_ready_with_ui_summary(str(self.dev_path)),
+            worker_context=self.ctx,
+        )
+        self.assertTrue(state.requires_agy)
+        on_coordinator_output(state, "NEXT: ui_lead\nReview UX.")
+        on_worker_output(state, "ui_lead", "UX_APPROVED\nok")
+        on_coordinator_output(state, "NEXT: reviewer\nReview.")
+        rev_ctx = dict(self.ctx, report_paths=[str(rev_path)])
+        on_worker_output(
+            state,
+            "reviewer",
+            _report_ready_with_ui_summary(str(rev_path), status="REQUEST_CHANGES").replace(
+                "PASS_WITH_NOTES", "REQUEST_CHANGES",
+            ),
+            worker_context=rev_ctx,
+        )
+        on_coordinator_output(state, "NEXT: developer\nFix.")
+        action = on_worker_output(
+            state,
+            "developer",
+            _report_ready_with_ui_summary(str(self.dev_path)),
+            worker_context=self.ctx,
+        )
+        self.assertTrue(state.requires_agy)
+        tokens = coordinator_allowed_tokens(state)
+        self.assertIn("NEXT: ui_lead", tokens)
+        self.assertIn("Route ui_lead", action.prompt_context)
+        route = on_coordinator_output(state, "NEXT: ui_lead\nUX re-check.")
+        self.assertEqual(route.target_role, "ui_lead")
+        self.assertNotIn("ui_lead_not_allowed", route.prompt_context)
 
 
 if __name__ == "__main__":
