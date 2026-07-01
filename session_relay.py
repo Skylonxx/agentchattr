@@ -9,9 +9,16 @@ and return plain text only.
 import re
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
+
+# Repo root for server-side role-doc reads (session_relay.py lives at repo root).
+_REPO_ROOT = Path(__file__).resolve().parent
+
+# Bounded role-doc excerpt injected into routing prompts (server-side seal).
+ROLE_DOC_MAX_CHARS = 8000
 
 # ---------------------------------------------------------------------------
 # Explicit TO: routing headers (repository routing contract)
@@ -50,6 +57,138 @@ AGENT_BASE_ROUTING_TO_TARGETS: dict[str, str] = {
     "claude": "Developer",
     "agy": "UI Lead",
 }
+
+_ROLE_HEADER_PREFIXES = (
+    "TO:",
+    "FROM:",
+    "ROLE:",
+    "MODE:",
+    "PROJECT:",
+    "PHASE:",
+    "SUBJECT:",
+    "ROLE_ID:",
+    "ROLE_DOC:",
+    "assigned_agent:",
+    "transport:",
+)
+
+
+def role_doc_repo_root() -> Path:
+    """Return repo root used for server-side role-doc loading."""
+    return _REPO_ROOT
+
+
+def resolve_role_doc_alias(role: str) -> str:
+    """Return docs/ai-roles path alias for a role_id, or empty string."""
+    return ROLE_DOC_ALIASES.get((role or "").strip().lower(), "")
+
+
+@dataclass
+class RoleDocLoadResult:
+    source: str
+    content: str = ""
+    status: str = "missing"  # ok | missing | empty | truncated | error
+
+
+def load_bounded_role_doc(
+    role: str,
+    *,
+    max_chars: int = ROLE_DOC_MAX_CHARS,
+    repo_root: Path | None = None,
+) -> RoleDocLoadResult:
+    """Load a bounded role-doc excerpt for prompt injection."""
+    role_key = (role or "").strip().lower()
+    source = resolve_role_doc_alias(role_key)
+    if not source:
+        return RoleDocLoadResult(source="", status="missing")
+    root = repo_root or _REPO_ROOT
+    path = root / Path(source.replace("\\", "/"))
+    if not path.is_file():
+        return RoleDocLoadResult(source=source, status="missing")
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        log.warning("Failed to read role doc %s: %s", source, exc)
+        return RoleDocLoadResult(source=source, status="error")
+    if not raw:
+        return RoleDocLoadResult(source=source, status="empty")
+    if len(raw) <= max_chars:
+        return RoleDocLoadResult(source=source, content=raw, status="ok")
+    truncated = (
+        raw[:max_chars]
+        + f"\n... [role doc truncated, {len(raw)} chars total]"
+    )
+    return RoleDocLoadResult(source=source, content=truncated, status="truncated")
+
+
+def build_role_context_block(
+    role: str,
+    *,
+    max_chars: int = ROLE_DOC_MAX_CHARS,
+    repo_root: Path | None = None,
+) -> str:
+    """Build sealed ROLE_CONTEXT block with bounded server-side doc content."""
+    role_key = (role or "").strip().lower()
+    if not role_key:
+        return ""
+    loaded = load_bounded_role_doc(role_key, max_chars=max_chars, repo_root=repo_root)
+    if not loaded.source:
+        return ""
+    lines = ["ROLE_CONTEXT:", f"- source: {loaded.source}"]
+    if loaded.status in ("missing", "error"):
+        lines.append("- status: ROLE_DOC_MISSING")
+        return "\n".join(lines)
+    if loaded.status == "empty":
+        lines.append("- status: ROLE_DOC_EMPTY")
+        return "\n".join(lines)
+    if loaded.status == "truncated":
+        lines.append("- status: bounded (truncated)")
+    lines.append("- content:")
+    for content_line in loaded.content.splitlines():
+        lines.append(f"  {content_line}")
+    return "\n".join(lines)
+
+
+def _has_role_context_block(text: str) -> bool:
+    return "ROLE_CONTEXT:" in (text or "")
+
+
+def _inject_role_context_if_missing(
+    text: str,
+    *,
+    role: str,
+    repo_root: Path | None = None,
+) -> str:
+    """Insert ROLE_CONTEXT after routing headers when absent."""
+    sample = text or ""
+    if _has_role_context_block(sample):
+        return sample
+    block = build_role_context_block(role, repo_root=repo_root)
+    if not block:
+        return sample
+    lines = sample.splitlines()
+    insert_at = 0
+    saw_header = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            if saw_header:
+                insert_at = i + 1
+                break
+            continue
+        if any(stripped.startswith(prefix) for prefix in _ROLE_HEADER_PREFIXES):
+            saw_header = True
+            insert_at = i + 1
+            continue
+        if saw_header:
+            insert_at = i
+            break
+    new_lines = lines[:insert_at] + [""] + block.splitlines()
+    if insert_at < len(lines):
+        if new_lines and new_lines[-1]:
+            new_lines.append("")
+        new_lines.extend(lines[insert_at:])
+    return "\n".join(new_lines).strip()
 
 
 def has_explicit_to_header(text: str) -> bool:
@@ -153,8 +292,10 @@ def ensure_explicit_routing_headers(
 ) -> str:
     """Prepend routing headers when the prompt lacks an explicit TO: line."""
     body = (text or "").strip()
+    role_key = (role or "").strip().lower()
     if has_explicit_to_header(body):
-        return _normalize_first_to_line(body, role=role)
+        normalized = _normalize_first_to_line(body, role=role)
+        return _inject_role_context_if_missing(normalized, role=role_key)
     to_target = resolve_routing_to_target(role=role, agent_base=agent_base)
     headers = build_routing_header_block(
         to_target=to_target,
@@ -167,7 +308,13 @@ def ensure_explicit_routing_headers(
         assigned_agent=agent_base,
         transport=transport,
     )
-    return f"{headers}\n\n{body}" if body else headers
+    role_context = build_role_context_block(role_key)
+    parts = [headers]
+    if role_context:
+        parts.append(role_context)
+    if body:
+        parts.append(body)
+    return "\n\n".join(parts)
 
 
 def is_readonly_no_tool_reviewer_policy(policy: dict | None) -> bool:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 import config_loader
 import coordinator_loop as cl
@@ -18,9 +20,11 @@ from session_relay import (
     build_coordinator_loop_prompt,
     build_coordinator_loop_ui_lead_prompt,
     build_relay_prompt,
+    build_role_context_block,
     build_safety_gate_prompt,
     ensure_explicit_routing_headers,
     has_explicit_to_header,
+    load_bounded_role_doc,
     resolve_routing_to_target,
 )
 
@@ -86,6 +90,91 @@ class RoutingHeaderHelperTests(unittest.TestCase):
             ensure_explicit_routing_headers(original, role=""),
             original,
         )
+
+
+class RoleDocInjectionTests(unittest.TestCase):
+    def test_developer_prompt_embeds_bounded_role_context(self):
+        out = ensure_explicit_routing_headers(
+            "Implement PaymentModal fix.",
+            role="developer",
+            agent_base="claude",
+        )
+        self.assertIn("ROLE_CONTEXT:", out)
+        self.assertIn(f"- source: {ROLE_DOC_ALIASES['developer']}", out)
+        self.assertIn("- content:", out)
+        self.assertIn("# Developer", out)
+        self.assertNotIn("Load docs/ai-roles/developer.md before acting", out)
+
+    def test_relay_prompt_includes_role_context_server_side(self):
+        prompt = build_relay_prompt(
+            session_name="sess",
+            goal="analysis",
+            phase_name="develop",
+            phase_index=0,
+            total_phases=4,
+            role="developer",
+            instruction="Produce revised blueprint.",
+            agent_base="claude",
+        )
+        self.assertIn("ROLE_CONTEXT:", prompt)
+        self.assertIn("# Developer", prompt)
+        self.assertIn("TO: Developer", prompt)
+        self.assertNotIn("TO: Claude Developer", prompt)
+        self.assertIn("assigned_agent: claude", prompt)
+
+    def test_ui_lead_prompt_includes_ux_lead_role_context(self):
+        prompt = build_coordinator_loop_ui_lead_prompt(
+            session_name="sess",
+            channel="ch",
+            goal="ui review",
+            phase_name="ui",
+            phase_index=1,
+            total_phases=4,
+            instruction="Review UX blueprint.",
+        )
+        self.assertIn("ROLE_CONTEXT:", prompt)
+        self.assertIn("# UX Lead", prompt)
+        self.assertIn("TO: UI Lead", prompt)
+        self.assertIn("assigned_agent: agy", prompt)
+
+    def test_missing_role_doc_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            block = build_role_context_block("developer", repo_root=Path(tmp))
+        self.assertIn("ROLE_CONTEXT:", block)
+        self.assertIn("- status: ROLE_DOC_MISSING", block)
+        self.assertIn(f"- source: {ROLE_DOC_ALIASES['developer']}", block)
+
+    def test_long_role_doc_is_truncated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_path = Path(tmp) / "docs" / "ai-roles"
+            doc_path.mkdir(parents=True)
+            long_body = "X" * 500
+            (doc_path / "developer.md").write_text(long_body, encoding="utf-8")
+            loaded = load_bounded_role_doc(
+                "developer",
+                max_chars=100,
+                repo_root=Path(tmp),
+            )
+            self.assertEqual(loaded.status, "truncated")
+            self.assertIn("[role doc truncated, 500 chars total]", loaded.content)
+            block = build_role_context_block(
+                "developer",
+                max_chars=100,
+                repo_root=Path(tmp),
+            )
+            self.assertIn("- status: bounded (truncated)", block)
+
+    def test_stale_to_header_gets_role_context_injected(self):
+        original = "TO: Codex Reviewer\n\nBody text"
+        out = ensure_explicit_routing_headers(original, role="reviewer")
+        self.assertIn("TO: Reviewer", out)
+        self.assertIn("ROLE_CONTEXT:", out)
+        self.assertIn("# Reviewer", out)
+        self.assertIn("Body text", out)
+
+    def test_role_context_not_duplicated(self):
+        out = ensure_explicit_routing_headers("Task body.", role="reviewer")
+        self.assertEqual(out.count("ROLE_CONTEXT:"), 1)
 
 
 class CoordinatorPromptHeaderTests(unittest.TestCase):
