@@ -1526,6 +1526,22 @@ class SessionEngine:
             self._store.complete(session_id, message_id)
             return
 
+        if action.terminal_kind == "implementation_brief_ready":
+            self._store.update_coordinator_loop_state(session_id, cls.to_dict())
+            self._messages.add(
+                sender="system",
+                text=action.prompt_context[:12000],
+                msg_type="session_coord_brief_ready",
+                channel=channel,
+                metadata={
+                    "session_id": session_id,
+                    "phase": cls.phase.value,
+                    "terminal_kind": "implementation_brief_ready",
+                },
+            )
+            self._store.pause(session_id)
+            return
+
         reason = action.prompt_context or cls.blocker_reason or "blocked"
         self._messages.add(
             sender="system",
@@ -2176,6 +2192,13 @@ class SessionEngine:
             return
 
         if self._agent_uses_store_exec(agent):
+            from session_relay import is_readonly_planning_mode
+
+            readonly_planning = is_readonly_planning_mode(
+                cls.session_workspace_mode,
+                report_orchestrated=cls.report_orchestrated,
+                policy=policy,
+            )
             prompt = build_coordinator_loop_ui_lead_prompt(
                     session_name=tmpl.get("name", "?"),
                     channel=channel,
@@ -2185,6 +2208,7 @@ class SessionEngine:
                     total_phases=len(phases),
                     instruction=instruction,
                     context_messages=self._get_recent_context(channel),
+                    readonly_planning=readonly_planning,
             )
             if report_contract:
                 prompt = f"{prompt}\n\n{report_contract}"

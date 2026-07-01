@@ -249,6 +249,24 @@ class CoordinatorPromptHeaderTests(unittest.TestCase):
         self.assertIn("assigned_agent: agy", prompt)
         self.assertIn("transport: store_exec", prompt)
 
+    def test_ui_lead_readonly_planning_prompt_advertises_brief_outcome(self):
+        prompt = build_coordinator_loop_ui_lead_prompt(
+            session_name="sess",
+            channel="ch",
+            goal="ui planning",
+            phase_name="ui",
+            phase_index=1,
+            total_phases=4,
+            instruction="Produce UX implementation brief.",
+            readonly_planning=True,
+        )
+        self.assertIn("UX_IMPLEMENTATION_BRIEF_READY", prompt)
+        self.assertIn("## Design Intent", prompt)
+        self.assertIn("## Allowed Files", prompt)
+        self.assertIn("ROLE_CONTEXT:", prompt)
+        self.assertIn("TO: UI Lead", prompt)
+        self.assertNotIn("TO: AGY UI Lead", prompt)
+
     def test_safety_gate_prompt_has_role_first_to_header(self):
         prompt = build_safety_gate_prompt(
             session_name="sess",

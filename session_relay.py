@@ -78,6 +78,21 @@ def role_doc_repo_root() -> Path:
     return _REPO_ROOT
 
 
+def is_readonly_planning_mode(
+    workspace_mode: str = "",
+    *,
+    report_orchestrated: bool = False,
+    policy: dict | None = None,
+) -> bool:
+    """True when UI Lead should produce planning briefs (not post-implementation QA)."""
+    if report_orchestrated:
+        return False
+    mode = str(workspace_mode or "").lower()
+    if isinstance(policy, dict):
+        mode = mode or str(policy.get("mode") or "").lower()
+    return mode in ("read-only", "read-only-analysis", "scratch-readonly")
+
+
 def resolve_role_doc_alias(role: str) -> str:
     """Return docs/ai-roles path alias for a role_id, or empty string."""
     return ROLE_DOC_ALIASES.get((role or "").strip().lower(), "")
@@ -1191,6 +1206,17 @@ def build_coordinator_loop_prompt(
     )
 
 
+_UI_LEAD_BRIEF_SECTIONS = (
+    "## Design Intent",
+    "## Allowed Files",
+    "## Red Zones",
+    "## Acceptance Criteria",
+    "## Keyboard / Focus / Accessibility Constraints",
+    "## Responsive Requirements",
+    "## Tests / Re-check Plan",
+)
+
+
 def build_coordinator_loop_ui_lead_prompt(
     *,
     session_name: str,
@@ -1201,8 +1227,9 @@ def build_coordinator_loop_ui_lead_prompt(
     total_phases: int,
     instruction: str,
     context_messages: list[dict] | None = None,
+    readonly_planning: bool = False,
 ) -> str:
-    """Headless UI lead prompt for coordinator_loop (strict UX_APPROVED contract)."""
+    """Headless UI lead prompt for coordinator_loop."""
     lines = [
         f"SESSION: {session_name}",
         f"CHANNEL: #{channel}",
@@ -1219,16 +1246,35 @@ def build_coordinator_loop_ui_lead_prompt(
             sender = msg.get("sender", "?")
             text = msg.get("text", "")
             lines.append(f"  [{sender}]: {text}")
-    lines.extend([
-        "",
-        "OUTPUT CONTRACT (strict — headless store_exec; plain text only):",
-        "First line MUST be exactly one of:",
-        "UX_APPROVED",
-        "REQUEST UX CHANGES",
-        "BLOCKED",
-        "PASS WITH NOTES is NOT valid in coordinator_loop.",
-        "Do not use tools, shell, git, MCP, or file edits.",
-    ])
+    lines.append("")
+    lines.append("OUTPUT CONTRACT (strict — headless store_exec; plain text only):")
+    if readonly_planning:
+        lines.extend([
+            "READ-ONLY PLANNING MODE — produce an actionable UX implementation brief.",
+            "Role-doc context is embedded above in ROLE_CONTEXT; do not load files.",
+            "First line MUST be exactly:",
+            "  UX_IMPLEMENTATION_BRIEF_READY",
+            "Then include structured brief sections:",
+        ])
+        for section in _UI_LEAD_BRIEF_SECTIONS:
+            lines.append(f"  {section}")
+        lines.extend([
+            "",
+            "The coordinator stops for Owner/Gemini authorization.",
+            "Do not implement code. Do not route developer yourself.",
+            "",
+            "POST-IMPLEMENTATION QA (only after implementation exists):",
+            "  UX_APPROVED / REQUEST UX CHANGES / BLOCKED",
+        ])
+    else:
+        lines.extend([
+            "First line MUST be exactly one of:",
+            "UX_APPROVED",
+            "REQUEST UX CHANGES",
+            "BLOCKED",
+            "PASS WITH NOTES is NOT valid in coordinator_loop.",
+        ])
+    lines.append("Do not use tools, shell, git, MCP, or file edits.")
     body = "\n\n".join(lines)
     return ensure_explicit_routing_headers(
         body,
@@ -1311,6 +1357,7 @@ def coordinator_loop_worker_output_contract(
         lines = [
             "OUTPUT CONTRACT (first non-empty line is authoritative):",
             "  PROGRESS — inspection in progress",
+            "  UX_IMPLEMENTATION_BRIEF_READY — read-only planning brief (planning mode only)",
             "  UX_APPROVED / REQUEST UX CHANGES / BLOCKED",
         ]
         if workspace_bound:

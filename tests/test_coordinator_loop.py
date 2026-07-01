@@ -197,7 +197,8 @@ class CoordinatorLoopClassificationTests(unittest.TestCase):
         action = _next(state, "developer", "Implement UI.")
         self.assertEqual(action.target_role, "developer")
         self.assertIn("Implement UI.", action.routing_body)
-        self.assertIn("TO: Claude Developer", action.routing_body)
+        self.assertIn("TO: Developer", action.routing_body)
+        self.assertNotIn("TO: Claude Developer", action.routing_body)
 
     def test_after_classify_non_ui_next_developer_accepted(self):
         state, _ = on_session_start("task")
@@ -406,7 +407,8 @@ class CoordinatorLoopRoutingParserTests(unittest.TestCase):
         _classify_ui(state)
         action = _next(state, "developer", "Exact prompt body")
         self.assertIn("Exact prompt body", action.routing_body)
-        self.assertIn("TO: Claude Developer", action.routing_body)
+        self.assertIn("TO: Developer", action.routing_body)
+        self.assertNotIn("TO: Claude Developer", action.routing_body)
         self.assertIn("Exact prompt body", action.prompt_context)
 
     def test_final_without_colon_rejected(self):
@@ -748,6 +750,73 @@ class UiLeadReportBridgeRepairTests(unittest.TestCase):
         )
         self.assertTrue(Path(self.agy_path).is_file())
         self.assertEqual(state.ui_lead_report_bridge_repair_rounds, 0)
+
+
+class UiLeadImplementationBriefTests(unittest.TestCase):
+    def setUp(self):
+        self.brief_output = (
+            "UX_IMPLEMENTATION_BRIEF_READY\n\n"
+            "## Design Intent\nPayment modal focus and keyboard flow.\n\n"
+            "## Allowed Files\nsrc/components/PaymentModal.tsx\n\n"
+            "## Red Zones\nsrc/pages/POSPage.tsx\n"
+        )
+
+    def _readonly_state(self):
+        state, _ = on_session_start(
+            "read-only UI planning",
+            session_meta={"workspace_mode": "read-only-analysis"},
+        )
+        _classify_ui(state)
+        return state
+
+    def test_brief_ready_stops_for_owner_authorization(self):
+        state = self._readonly_state()
+        _next(state, "ui_lead")
+        action = on_worker_output(state, "ui_lead", self.brief_output)
+        self.assertTrue(action.is_terminal)
+        self.assertEqual(action.terminal_kind, "implementation_brief_ready")
+        self.assertTrue(state.ui_implementation_brief_ready)
+        self.assertIn("Design Intent", state.ui_implementation_brief)
+        self.assertIn("Owner/Gemini authorization", action.prompt_context)
+
+    def test_brief_ready_prevents_developer_auto_routing(self):
+        state = self._readonly_state()
+        _next(state, "ui_lead")
+        on_worker_output(state, "ui_lead", self.brief_output)
+        tokens = coordinator_allowed_tokens(state)
+        self.assertNotIn("NEXT: developer", tokens)
+        self.assertFalse(state.awaiting_developer_correction)
+
+    def test_brief_ready_rejected_outside_readonly_planning(self):
+        state, _ = on_session_start("task")
+        _classify_ui(state)
+        _next(state, "ui_lead")
+        action = on_worker_output(state, "ui_lead", self.brief_output)
+        self.assertTrue(action.is_terminal)
+        self.assertEqual(action.terminal_kind, "blocker")
+
+    def test_brief_ready_does_not_increment_ui_round(self):
+        state = self._readonly_state()
+        _next(state, "ui_lead")
+        on_worker_output(state, "ui_lead", self.brief_output)
+        self.assertEqual(state.ui_round, 0)
+
+    def test_ux_approved_still_works(self):
+        state, _ = on_session_start("task")
+        _classify_ui(state)
+        _next(state, "ui_lead")
+        action = on_worker_output(state, "ui_lead", "UX_APPROVED\nLooks good.")
+        self.assertFalse(action.is_terminal)
+        self.assertTrue(state.agy_approved)
+
+    def test_request_ux_changes_still_works(self):
+        state, _ = on_session_start("task")
+        _classify_ui(state)
+        _next(state, "ui_lead")
+        action = on_worker_output(state, "ui_lead", "REQUEST UX CHANGES\nFix spacing.")
+        self.assertFalse(action.is_terminal)
+        self.assertTrue(state.awaiting_developer_correction)
+        self.assertEqual(state.ui_round, 1)
 
 
 if __name__ == "__main__":

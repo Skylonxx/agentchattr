@@ -193,6 +193,8 @@ class CoordinatorLoopState:
     max_ui_lead_report_bridge_repair_rounds: int = 1
     ui_lead_report_bridge_repair_active: bool = False
     last_ui_lead_report_bridge_output: str = ""
+    ui_implementation_brief_ready: bool = False
+    ui_implementation_brief: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CoordinatorLoopState:
@@ -267,6 +269,9 @@ class CoordinatorLoopState:
                 data.get("ui_lead_report_bridge_repair_active", False)),
             last_ui_lead_report_bridge_output=str(
                 data.get("last_ui_lead_report_bridge_output", "")),
+            ui_implementation_brief_ready=bool(
+                data.get("ui_implementation_brief_ready", False)),
+            ui_implementation_brief=str(data.get("ui_implementation_brief", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -324,6 +329,8 @@ class CoordinatorLoopState:
             ),
             "ui_lead_report_bridge_repair_active": self.ui_lead_report_bridge_repair_active,
             "last_ui_lead_report_bridge_output": self.last_ui_lead_report_bridge_output,
+            "ui_implementation_brief_ready": self.ui_implementation_brief_ready,
+            "ui_implementation_brief": self.ui_implementation_brief,
         }
 
 
@@ -457,6 +464,31 @@ def _terminal_final(state: CoordinatorLoopState, body: str) -> CoordinatorAction
     )
 
 
+def _terminal_implementation_brief_ready(
+    state: CoordinatorLoopState,
+    brief: str,
+) -> CoordinatorAction:
+    """Stop read-only planning for Owner/Gemini authorization of UX brief."""
+    state.ui_implementation_brief_ready = True
+    state.ui_implementation_brief = (brief or "").strip()
+    state.phase = CoordinatorPhase.HALTED
+    state.awaiting_role = COORDINATOR_ROLE
+    state.awaiting_developer_correction = False
+    state.halt_reason = "UX implementation brief ready for owner authorization"
+    body = (
+        "UX_IMPLEMENTATION_BRIEF_READY: session stopped for Owner/Gemini authorization. "
+        "Do not route developer implementation in read-only planning mode.\n\n"
+        f"{state.ui_implementation_brief}"
+    )
+    return CoordinatorAction(
+        target_role=COORDINATOR_ROLE,
+        prompt_context=body,
+        is_terminal=True,
+        terminal_kind="implementation_brief_ready",
+        routing_body=body,
+    )
+
+
 def _coordinator_action(state: CoordinatorLoopState, prompt: str) -> CoordinatorAction:
     state.phase = CoordinatorPhase.AWAIT_COORDINATOR
     state.awaiting_role = COORDINATOR_ROLE
@@ -528,6 +560,10 @@ def _reject_out_of_turn_worker(state: CoordinatorLoopState, role: str) -> Coordi
 
 
 def _validate_next_role(state: CoordinatorLoopState, role: str) -> str | None:
+    if state.ui_implementation_brief_ready:
+        return (
+            f"NEXT: {role} rejected — UX implementation brief awaiting owner authorization"
+        )
     if role == "ui_lead" and not state.requires_agy:
         return "NEXT: ui_lead rejected when requires_agy is false"
     if role == "reviewer" and state.requires_agy and not state.agy_approved:
@@ -757,6 +793,8 @@ def _parse_ui_lead_verdict(text: str) -> tuple[str, str]:
         return "BLOCKER", reason or first
     if first in ("UX_APPROVED", "REQUEST UX CHANGES", "BLOCKED"):
         return first, _body_after_first_line(text)
+    if first == "UX_IMPLEMENTATION_BRIEF_READY":
+        return first, _body_after_first_line(text)
     if first == "PASS WITH NOTES":
         return "INVALID", "PASS WITH NOTES is not valid AGY approval"
     return "AMBIGUOUS", first or "empty ui_lead output"
@@ -812,6 +850,23 @@ def _detect_ui_changed(notes: str) -> bool:
         "accessibility", "focus", "keyboard",
     )
     return any(k in low for k in keywords)
+
+
+def _is_readonly_planning_mode(
+    state: CoordinatorLoopState,
+    worker_context: dict[str, Any] | None = None,
+) -> bool:
+    """True when UI Lead is in read-only planning (not post-implementation QA)."""
+    from session_relay import is_readonly_planning_mode
+
+    policy = None
+    if isinstance(worker_context, dict):
+        policy = worker_context.get("workspace_policy")
+    return is_readonly_planning_mode(
+        state.session_workspace_mode,
+        report_orchestrated=state.report_orchestrated,
+        policy=policy if isinstance(policy, dict) else None,
+    )
 
 
 LATE_UI_SIGNAL_TOKEN = "LATE_UI_SIGNAL_DETECTED"
@@ -1585,6 +1640,14 @@ def _on_ui_lead_output(
             state,
             f"UI lead reported PROGRESS. Status: {notes[:400]}",
         )
+
+    if token == "UX_IMPLEMENTATION_BRIEF_READY":
+        if not _is_readonly_planning_mode(state, worker_context):
+            return _terminal_blocker(
+                state,
+                "UX_IMPLEMENTATION_BRIEF_READY is only valid in read-only planning mode",
+            )
+        return _terminal_implementation_brief_ready(state, notes or (text or "").strip())
 
     if token == "UX_APPROVED":
         state.agy_approved = True
