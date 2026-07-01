@@ -2550,12 +2550,41 @@ class _DryrunRecordingStore(_FakeSessionStore):
         super().__init__(sessions=[], templates=templates or {})
         self.created = []
 
-    def create(self, template_id, channel, cast, started_by, goal=""):
-        self.created.append({"template_id": template_id, "channel": channel,
-                             "cast": cast, "started_by": started_by, "goal": goal})
-        session = {"id": len(self.created), "template_id": template_id,
-                   "template_name": template_id, "channel": channel, "cast": cast,
-                   "state": "active", "current_phase": 0, "current_turn": 0}
+    def create(self, template_id, channel, cast, started_by, goal="",
+               prompt_body="", prompt_id="",
+               workspace_policy=None, workspace_policy_hash=None,
+               workspace_policy_version=None):
+        record = {
+            "template_id": template_id,
+            "channel": channel,
+            "cast": cast,
+            "started_by": started_by,
+            "goal": goal,
+            "prompt_body": prompt_body,
+            "prompt_id": prompt_id,
+        }
+        if workspace_policy is not None:
+            record["workspace_policy"] = workspace_policy
+        self.created.append(record)
+        session = {
+            "id": len(self.created),
+            "template_id": template_id,
+            "template_name": template_id,
+            "channel": channel,
+            "cast": cast,
+            "state": "active",
+            "current_phase": 0,
+            "current_turn": 0,
+            "goal": goal,
+            "prompt_body": prompt_body,
+            "prompt_id": prompt_id,
+        }
+        if workspace_policy is not None:
+            session["workspace_policy"] = dict(workspace_policy)
+        if workspace_policy_hash is not None:
+            session["workspace_policy_hash"] = workspace_policy_hash
+        if workspace_policy_version is not None:
+            session["workspace_policy_version"] = workspace_policy_version
         self._sessions.append(session)
         return session
 
