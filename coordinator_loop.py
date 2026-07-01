@@ -189,6 +189,10 @@ class CoordinatorLoopState:
     max_trusted_cli_report_bridge_repair_rounds: int = 1
     trusted_cli_report_bridge_repair_active: bool = False
     last_trusted_cli_developer_output: str = ""
+    ui_lead_report_bridge_repair_rounds: int = 0
+    max_ui_lead_report_bridge_repair_rounds: int = 1
+    ui_lead_report_bridge_repair_active: bool = False
+    last_ui_lead_report_bridge_output: str = ""
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CoordinatorLoopState:
@@ -255,6 +259,14 @@ class CoordinatorLoopState:
                 data.get("trusted_cli_report_bridge_repair_active", False)),
             last_trusted_cli_developer_output=str(
                 data.get("last_trusted_cli_developer_output", "")),
+            ui_lead_report_bridge_repair_rounds=int(
+                data.get("ui_lead_report_bridge_repair_rounds", 0)),
+            max_ui_lead_report_bridge_repair_rounds=int(
+                data.get("max_ui_lead_report_bridge_repair_rounds", 1)),
+            ui_lead_report_bridge_repair_active=bool(
+                data.get("ui_lead_report_bridge_repair_active", False)),
+            last_ui_lead_report_bridge_output=str(
+                data.get("last_ui_lead_report_bridge_output", "")),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -306,6 +318,12 @@ class CoordinatorLoopState:
             ),
             "trusted_cli_report_bridge_repair_active": self.trusted_cli_report_bridge_repair_active,
             "last_trusted_cli_developer_output": self.last_trusted_cli_developer_output,
+            "ui_lead_report_bridge_repair_rounds": self.ui_lead_report_bridge_repair_rounds,
+            "max_ui_lead_report_bridge_repair_rounds": (
+                self.max_ui_lead_report_bridge_repair_rounds
+            ),
+            "ui_lead_report_bridge_repair_active": self.ui_lead_report_bridge_repair_active,
+            "last_ui_lead_report_bridge_output": self.last_ui_lead_report_bridge_output,
         }
 
 
@@ -1139,6 +1157,76 @@ def _try_trusted_cli_report_bridge_repair(
     return _worker_action(state, "developer", repair_prompt, body=repair_prompt)
 
 
+def _try_ui_lead_report_bridge_repair(
+    state: CoordinatorLoopState,
+    text: str,
+    *,
+    worker_context: dict[str, Any] | None = None,
+    repair_reason: str = "",
+) -> CoordinatorAction | None:
+    """One-shot ui_lead correction when REPORT_FILE_WRITE_END is missing."""
+    if not state.report_orchestrated:
+        return None
+    if state.ui_lead_report_bridge_repair_rounds >= state.max_ui_lead_report_bridge_repair_rounds:
+        return None
+
+    from worker_workspace import (
+        build_ui_lead_report_bridge_repair_prompt,
+        resolve_expected_trusted_cli_report_path,
+    )
+
+    state.ui_lead_report_bridge_repair_rounds += 1
+    state.last_ui_lead_report_bridge_output = (text or "")[:12_000]
+    policy = (worker_context or {}).get("workspace_policy") or {}
+    report_path = resolve_expected_trusted_cli_report_path(
+        policy,
+        role="ui_lead",
+        worker_context=worker_context,
+    )
+    repair_prompt = build_ui_lead_report_bridge_repair_prompt(
+        expected_report_path=report_path,
+        previous_output=state.last_ui_lead_report_bridge_output,
+        repair_round=state.ui_lead_report_bridge_repair_rounds,
+        max_repair_rounds=state.max_ui_lead_report_bridge_repair_rounds,
+    )
+    state.ui_lead_report_bridge_repair_active = True
+    _append_verdict(
+        state,
+        "ui_lead",
+        "UI_LEAD_REPORT_BRIDGE_REPAIR",
+        repair_reason or "incomplete REPORT_FILE_WRITE block",
+    )
+    return _worker_action(state, "ui_lead", repair_prompt, body=repair_prompt)
+
+
+def _terminal_or_repair_report_write_failed(
+    state: CoordinatorLoopState,
+    role: str,
+    text: str,
+    failed,
+    *,
+    worker_context: dict[str, Any] | None = None,
+) -> CoordinatorAction:
+    reason = str(getattr(failed, "reason", "") or "")
+    if role == "ui_lead" and "missing REPORT_FILE_WRITE_END" in reason:
+        if handled := _try_ui_lead_report_bridge_repair(
+            state,
+            text,
+            worker_context=worker_context,
+            repair_reason=reason,
+        ):
+            return handled
+    return _terminal_blocker(
+        state,
+        (
+            "BLOCKER: external report write failed\n"
+            f"reason={reason or 'worker could not write report'}\n"
+            f"expected_report={getattr(failed, 'expected_report_path', None) or '(missing)'}\n"
+            f"status={getattr(failed, 'status', None) or 'FAIL'}"
+        ),
+    )
+
+
 def _terminal_trusted_cli_output_blocker(
     state: CoordinatorLoopState,
     text: str,
@@ -1250,27 +1338,15 @@ def _try_report_orchestrated_worker(
         if normalized is not None:
             failed_norm = parse_report_write_failed(normalized)
             if failed_norm is not None:
-                return _terminal_blocker(
-                    state,
-                    (
-                        "BLOCKER: external report write failed\n"
-                        f"reason={failed_norm.reason or 'worker could not write report'}\n"
-                        f"expected_report={failed_norm.expected_report_path or '(missing)'}\n"
-                        f"status={failed_norm.status or 'FAIL'}"
-                    ),
+                return _terminal_or_repair_report_write_failed(
+                    state, role, text, failed_norm, worker_context=ctx,
                 )
             text = normalized
 
     failed = parse_report_write_failed(text)
     if failed is not None:
-        return _terminal_blocker(
-            state,
-            (
-                "BLOCKER: external report write failed\n"
-                f"reason={failed.reason or 'worker could not write report'}\n"
-                f"expected_report={failed.expected_report_path or '(missing)'}\n"
-                f"status={failed.status or 'FAIL'}"
-            ),
+        return _terminal_or_repair_report_write_failed(
+            state, role, text, failed, worker_context=ctx,
         )
 
     first = _first_non_empty_line(text)
@@ -1311,6 +1387,10 @@ def _try_report_orchestrated_worker(
         state.trusted_cli_report_bridge_repair_rounds = 0
         state.trusted_cli_report_bridge_repair_active = False
         state.last_trusted_cli_developer_output = ""
+    if role == "ui_lead":
+        state.ui_lead_report_bridge_repair_rounds = 0
+        state.ui_lead_report_bridge_repair_active = False
+        state.last_ui_lead_report_bridge_output = ""
     _append_verdict(state, role, "REPORT_READY", parsed.summary or record.path)
     state.last_output_summary = (parsed.summary or record.path)[:500]
     status = parsed.status

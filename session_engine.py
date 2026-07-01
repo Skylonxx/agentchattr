@@ -1735,9 +1735,23 @@ class SessionEngine:
             and role == "developer"
             and instruction.strip()
         )
+        ui_lead_bridge_repair = bool(
+            getattr(cls, "ui_lead_report_bridge_repair_active", False)
+            and role == "ui_lead"
+            and instruction.strip()
+        )
         if trusted_bridge_repair:
             prompt = instruction.strip()
             cls.trusted_cli_report_bridge_repair_active = False
+            effective_role = role
+            effective_agent = cast.get(effective_role) or agent
+            effective_agent_base = self._get_agent_base(effective_agent)
+            dispatch_role = role
+            handoff_repair = False
+            result = None
+        elif ui_lead_bridge_repair:
+            prompt = instruction.strip()
+            cls.ui_lead_report_bridge_repair_active = False
             effective_role = role
             effective_agent = cast.get(effective_role) or agent
             effective_agent_base = self._get_agent_base(effective_agent)
@@ -1794,7 +1808,7 @@ class SessionEngine:
             workspace_bound=workspace_bound,
             report_orchestrated=cls.report_orchestrated,
         )
-        if contract and not trusted_bridge_repair:
+        if contract and not trusted_bridge_repair and not ui_lead_bridge_repair:
             prompt = f"{prompt}\n\n{contract}"
 
         repair_owner = (
@@ -1942,11 +1956,18 @@ class SessionEngine:
         wpc["max_trusted_cli_report_bridge_repair_rounds"] = (
             cls.max_trusted_cli_report_bridge_repair_rounds
         )
+        wpc["ui_lead_report_bridge_repair_rounds"] = cls.ui_lead_report_bridge_repair_rounds
+        wpc["max_ui_lead_report_bridge_repair_rounds"] = (
+            cls.max_ui_lead_report_bridge_repair_rounds
+        )
         if handoff_repair:
             wpc["handoff_repair"] = True
             wpc["skip_snapshot_injection"] = True
         if trusted_bridge_repair:
             wpc["trusted_cli_report_bridge_repair"] = True
+            wpc["skip_snapshot_injection"] = True
+        if ui_lead_bridge_repair:
+            wpc["ui_lead_report_bridge_repair"] = True
             wpc["skip_snapshot_injection"] = True
         try:
             if relay_ok and effective_role in ("developer", "reviewer", "ui_lead"):

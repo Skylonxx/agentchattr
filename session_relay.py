@@ -1057,6 +1057,8 @@ def coordinator_loop_worker_output_contract(
             "  ---\n"
             "  <markdown body>\n"
             "  REPORT_FILE_WRITE_END\n\n"
+            "REPORT_FILE_WRITE_END must be the final non-empty line.\n"
+            "Output exactly one complete report block; keep the report body concise enough for store_exec.\n"
             "The worker runtime validates the path and writes the file, then transforms output to REPORT_READY.\n"
             "Do not emit <tool_call> XML.\n\n"
             "If you cannot write the report file despite permission being configured, return:\n"

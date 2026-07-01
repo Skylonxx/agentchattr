@@ -655,5 +655,100 @@ class LateUiReclassificationTests(unittest.TestCase):
         self.assertNotIn("ui_lead_not_allowed", route.prompt_context)
 
 
+class UiLeadReportBridgeRepairTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        agy_root = Path(self.tmp) / "agy"
+        agy_root.mkdir()
+        self.channel = "twinpet-ui-09-c-trus"
+        self.agy_path = str(agy_root / f"{self.channel}-ux-review.md")
+        self.policy = {
+            "mode": "read-only",
+            "analysis_report_only": True,
+            "trusted_direct_repo_cli": True,
+            "write_files": [],
+            "external_report_write_roots": [self.tmp, str(agy_root)],
+            "report_paths": [self.agy_path],
+        }
+        self.ctx = {
+            "workspace_policy": self.policy,
+            "allowed_report_roots": [self.tmp, str(agy_root)],
+            "report_paths_by_role": {"ui_lead": self.agy_path},
+            "max_report_prompt_chars": 120_000,
+        }
+
+    def _incomplete_bridge(self) -> str:
+        return (
+            "REPORT_FILE_WRITE_BEGIN\n"
+            f"Path: {self.agy_path}\n"
+            "Status: REQUEST_CHANGES\n"
+            "Summary: UX review incomplete block.\n"
+            "Next recommended role: developer\n"
+            "---\n"
+            "# UX Review\nMissing END marker.\n"
+        )
+
+    def _complete_bridge(self) -> str:
+        return (
+            "REPORT_FILE_WRITE_BEGIN\n"
+            f"Path: {self.agy_path}\n"
+            "Status: REQUEST_CHANGES\n"
+            "Summary: UX review complete.\n"
+            "Next recommended role: developer\n"
+            "---\n"
+            "# UX Review\nFocus and keyboard fixes needed.\n"
+            "REPORT_FILE_WRITE_END\n"
+        )
+
+    def test_first_incomplete_bridge_triggers_one_repair(self):
+        state, _ = on_session_start("task", session_meta={"report_orchestrated": True})
+        _classify_ui(state)
+        _next(state, "ui_lead")
+        action = on_worker_output(
+            state,
+            "ui_lead",
+            self._incomplete_bridge(),
+            worker_context=self.ctx,
+        )
+        self.assertFalse(action.is_terminal)
+        self.assertEqual(action.target_role, "ui_lead")
+        self.assertEqual(state.ui_lead_report_bridge_repair_rounds, 1)
+        self.assertIn("REPORT_FILE_WRITE_END was missing", action.routing_body)
+
+    def test_second_incomplete_bridge_terminal_blocks(self):
+        from coordinator_loop import CoordinatorLoopState, CoordinatorPhase
+
+        state = CoordinatorLoopState(
+            phase=CoordinatorPhase.AWAIT_UI_LEAD,
+            awaiting_role="ui_lead",
+            report_orchestrated=True,
+            classified=True,
+            requires_agy=True,
+            ui_lead_report_bridge_repair_rounds=1,
+            max_ui_lead_report_bridge_repair_rounds=1,
+        )
+        action = on_worker_output(
+            state,
+            "ui_lead",
+            self._incomplete_bridge(),
+            worker_context=self.ctx,
+        )
+        self.assertTrue(action.is_terminal)
+        self.assertIn("external report write failed", action.prompt_context)
+
+    def test_repair_success_produces_report_ready(self):
+        state, _ = on_session_start("task", session_meta={"report_orchestrated": True})
+        _classify_ui(state)
+        _next(state, "ui_lead")
+        on_worker_output(
+            state,
+            "ui_lead",
+            self._complete_bridge(),
+            worker_context=self.ctx,
+        )
+        self.assertTrue(Path(self.agy_path).is_file())
+        self.assertEqual(state.ui_lead_report_bridge_repair_rounds, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

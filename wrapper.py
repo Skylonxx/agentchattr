@@ -1134,6 +1134,53 @@ def _normalize_codex_relay_report_output(
     )
 
 
+def _normalize_agy_store_report_output(
+    captured: str,
+    item: dict | None,
+    *,
+    data_dir,
+) -> str | None:
+    """Normalize report-orchestrated AGY store_exec output before relay truncation."""
+    if not isinstance(item, dict) or not (captured or "").strip():
+        return None
+    wpc = item.get("workspace_policy_context")
+    if not isinstance(wpc, dict):
+        return None
+    from workspace_policy_runtime import (
+        canonical_policy_from_queue_context,
+        load_persisted_session_record,
+    )
+    from worker_workspace import (
+        build_report_orchestrated_worker_context,
+        normalize_report_orchestrated_worker_output,
+    )
+
+    policy = canonical_policy_from_queue_context(queue_context=wpc, data_dir=data_dir)
+    if not isinstance(policy, dict) and isinstance(wpc.get("workspace_policy"), dict):
+        policy = dict(wpc["workspace_policy"])
+    if not isinstance(policy, dict):
+        return None
+    role = str(wpc.get("session_role") or "ui_lead")
+    channel = str(wpc.get("channel") or item.get("channel") or "general")
+    session_id = wpc.get("session_id")
+    if session_id is not None and data_dir is not None:
+        session = load_persisted_session_record(data_dir, int(session_id))
+        if isinstance(session, dict):
+            channel = str(session.get("channel") or channel)
+    worker_context = build_report_orchestrated_worker_context(
+        policy,
+        channel=channel,
+        worker_context=wpc,
+    )
+    return normalize_report_orchestrated_worker_output(
+        captured,
+        policy,
+        role=role,
+        worker_context=worker_context,
+        channel=channel,
+    )
+
+
 def _process_claude_worker_output(
     captured: str,
     *,
@@ -1515,8 +1562,16 @@ def _looks_like_codexsafe_safety_verdict(text: str) -> bool:
     return False
 
 
-def _prepare_agy_relay_text(raw: str | None) -> tuple[str | None, str | None]:
-    """Validate and redact AGY output before local /api/send relay (fail-closed)."""
+def _is_agy_report_control_payload(text: str) -> bool:
+    """True when AGY output is a short report-orchestration control message."""
+    non_empty = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not non_empty:
+        return False
+    return non_empty[0] in ("REPORT_READY", "REPORT_WRITE_FAILED")
+
+
+def _validate_agy_raw_reply(raw: str | None) -> tuple[str | None, str | None]:
+    """Safety validation for AGY raw reply — no relay truncation."""
     from safety_invariants import contains_secret, redact_secrets
 
     if raw is None or not str(raw).strip():
@@ -1531,9 +1586,20 @@ def _prepare_agy_relay_text(raw: str | None) -> tuple[str | None, str | None]:
     text = redact_secrets(text)
     if contains_secret(text):
         return None, _AGY_FAIL_SENSITIVE
-    full_len = len(text)
-    if full_len > 2000:
-        text = text[:2000] + f"... [truncated, {full_len} chars total]"
+    return text, None
+
+
+def _prepare_agy_relay_text(raw: str | None) -> tuple[str | None, str | None]:
+    """Validate and redact AGY output before local /api/send relay (fail-closed)."""
+    validated, fail_marker = _validate_agy_raw_reply(raw)
+    if fail_marker:
+        return None, fail_marker
+    text = validated
+    assert text is not None
+    if not _is_agy_report_control_payload(text):
+        full_len = len(text)
+        if full_len > 2000:
+            text = text[:2000] + f"... [truncated, {full_len} chars total]"
     return text, None
 
 
@@ -1584,9 +1650,12 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     rather than printing it to stdout.  The path is deterministic:
       <agy_data_dir>/brain/<conv_id>/.system_generated/logs/transcript.jsonl
 
-    Prefers MODEL content whose first non-empty line is a valid AGY UX verdict
-    token.  Rejects obvious directory-listing/tool output (fail-closed).
+    Prefers report-orchestrated REPORT_FILE_WRITE bridge replies, then MODEL
+    content whose first non-empty line is a valid AGY UX verdict token.
+    Rejects obvious directory-listing/tool output (fail-closed).
     """
+    from worker_workspace import REPORT_FILE_WRITE_BEGIN_MARKER
+
     if agy_data_dir is None:
         agy_data_dir = str(
             Path.home() / ".gemini" / "antigravity-cli"
@@ -1619,14 +1688,22 @@ def _extract_agy_reply(conversation_id: str, agy_data_dir: str | None = None) ->
     if not model_replies:
         return ""
 
+    bridge_replies = [
+        r for r in model_replies
+        if REPORT_FILE_WRITE_BEGIN_MARKER in r
+        and _validate_agy_raw_reply(r)[1] is None
+    ]
+    if bridge_replies:
+        return bridge_replies[-1]
+
     verdict_replies = [r for r in model_replies if _agy_first_verdict_token(r)]
     if verdict_replies:
         return verdict_replies[-1]
 
     for reply in reversed(model_replies):
-        relay_text, fail_marker = _prepare_agy_relay_text(reply)
-        if relay_text and fail_marker is None:
-            return relay_text
+        validated, fail_marker = _validate_agy_raw_reply(reply)
+        if validated and fail_marker is None:
+            return validated
 
     return ""
 
@@ -2509,7 +2586,7 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
             if proc.stdout:
                 raw_reply = proc.stdout.decode("utf-8", errors="replace").strip()
                 if raw_reply:
-                    _, stdout_fail = _prepare_agy_relay_text(raw_reply)
+                    _, stdout_fail = _validate_agy_raw_reply(raw_reply)
                     if stdout_fail:
                         raw_reply = ""
                         fail_marker = stdout_fail
@@ -2528,6 +2605,18 @@ def run_agent_store_exec(command, cwd, env, agent, start_watcher, *,
                 else:
                     fail_marker = _AGY_FAIL_CONV_ID
                     print(f"  > {agent} could not find conversation ID in log")
+
+            # Normalize report-orchestrated bridge output from full raw reply
+            # before relay truncation (mirrors Codex relay path).
+            if raw_reply:
+                queue_item = item if isinstance(item, dict) else None
+                normalized = _normalize_agy_store_report_output(
+                    raw_reply,
+                    queue_item,
+                    data_dir=data_dir,
+                )
+                if normalized:
+                    raw_reply = normalized
 
             # Safety filters + relay (fail-closed)
             if get_token_fn:

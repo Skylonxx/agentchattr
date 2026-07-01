@@ -476,6 +476,51 @@ def build_trusted_cli_markdown_report_repair_prompt(
     return "\n".join(lines)
 
 
+def build_ui_lead_report_bridge_repair_prompt(
+    *,
+    expected_report_path: str,
+    previous_output: str = "",
+    repair_round: int = 1,
+    max_repair_rounds: int = 1,
+) -> str:
+    """One-shot AGY/ui_lead repair when REPORT_FILE_WRITE_END is missing."""
+    excerpt = (previous_output or "").strip()[:1500]
+    lines = [
+        "AGY REPORT BRIDGE REPAIR",
+        "",
+        "Your previous report block was incomplete because REPORT_FILE_WRITE_END was missing.",
+        "Re-emit the complete report block only.",
+        "Do not redo analysis unless needed.",
+        "Do not write to Twinpet.",
+        "Do not include extra commentary outside the block.",
+        "",
+        "REPORT_FILE_WRITE_END must be the final non-empty line.",
+        "Output exactly one complete REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END block.",
+        "",
+        f"Use exactly this path:\n{expected_report_path or '(configured AGY report path)'}",
+        "",
+        f"repair_round: {repair_round}",
+        f"max_repair_rounds: {max_repair_rounds}",
+        "",
+        "REPORT_FILE_WRITE_BEGIN / REPORT_FILE_WRITE_END FORMAT:",
+        "  REPORT_FILE_WRITE_BEGIN",
+        f"  Path: {expected_report_path or '<absolute .md path>'}",
+        "  Status: REQUEST_CHANGES",
+        "  Summary: <short summary>",
+        "  Next recommended role: coordinator",
+        "  ---",
+        "  <markdown report body>",
+        "  REPORT_FILE_WRITE_END",
+    ]
+    if excerpt:
+        lines.extend([
+            "",
+            "PRIOR OUTPUT EXCERPT (reuse content; fix the block wrapper only):",
+            excerpt,
+        ])
+    return "\n".join(lines)
+
+
 def build_trusted_cli_report_bridge_repair_prompt(
     *,
     previous_output: str,
