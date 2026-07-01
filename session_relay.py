@@ -18,20 +18,37 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 ROLE_ROUTING_TO_TARGETS: dict[str, str] = {
-    "coordinator": "Codex Coordinator",
-    "developer": "Claude Developer",
-    "ui_lead": "AGY UI Lead",
-    "reviewer": "Codex Reviewer",
-    "safety_gate": "CodexSafe Safety Gate",
+    "coordinator": "Coordinator",
+    "developer": "Developer",
+    "ui_lead": "UI Lead",
+    "reviewer": "Reviewer",
+    "safety_gate": "Safety Gate",
+}
+
+ROLE_DOC_ALIASES: dict[str, str] = {
+    "coordinator": "docs/ai-roles/workflow-coordinator.md",
+    "developer": "docs/ai-roles/developer.md",
+    "ui_lead": "docs/ai-roles/ux-lead.md",
+    "reviewer": "docs/ai-roles/reviewer.md",
+    "safety_gate": "docs/ai-roles/safety-reviewer.md",
+}
+
+# Legacy brand-mixed TO labels normalized to role-first when rewriting headers.
+_BRAND_MIXED_TO_ROLE_FIRST: dict[str, str] = {
+    "Codex Coordinator": "Coordinator",
+    "Claude Developer": "Developer",
+    "AGY UI Lead": "UI Lead",
+    "Codex Reviewer": "Reviewer",
+    "CodexSafe Safety Gate": "Safety Gate",
 }
 
 AGENT_BASE_ROUTING_TO_TARGETS: dict[str, str] = {
-    "codex_coordinator": "Codex Coordinator",
-    "codex_reviewer": "Codex Reviewer",
+    "codex_coordinator": "Coordinator",
+    "codex_reviewer": "Reviewer",
     "codex": "Codex",
-    "codexsafe": "CodexSafe Safety Gate",
-    "claude": "Claude Developer",
-    "agy": "AGY UI Lead",
+    "codexsafe": "Safety Gate",
+    "claude": "Developer",
+    "agy": "UI Lead",
 }
 
 
@@ -47,11 +64,42 @@ def has_explicit_to_header(text: str) -> bool:
 
 def resolve_routing_to_target(*, role: str = "", agent_base: str = "") -> str:
     """Resolve the TO: target label for a session role or agent identity."""
+    role_key = (role or "").strip().lower()
+    if role_key in ROLE_ROUTING_TO_TARGETS:
+        return ROLE_ROUTING_TO_TARGETS[role_key]
     base = (agent_base or "").strip().lower()
     if base in AGENT_BASE_ROUTING_TO_TARGETS:
         return AGENT_BASE_ROUTING_TO_TARGETS[base]
-    role_key = (role or "").strip().lower()
-    return ROLE_ROUTING_TO_TARGETS.get(role_key, role_key.title() or "Agent")
+    return role_key.title() or "Agent"
+
+
+def _normalize_first_to_line(text: str, *, role: str = "") -> str:
+    """Normalize brand-mixed TO: headers to role-first when safe."""
+    lines = (text or "").splitlines()
+    if not lines:
+        return text or ""
+    out: list[str] = []
+    normalized = False
+    for line in lines:
+        if normalized:
+            out.append(line)
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+        if stripped.upper().startswith("TO:"):
+            target = stripped[3:].strip()
+            if role:
+                out.append(f"TO: {resolve_routing_to_target(role=role)}")
+            elif target in _BRAND_MIXED_TO_ROLE_FIRST:
+                out.append(f"TO: {_BRAND_MIXED_TO_ROLE_FIRST[target]}")
+            else:
+                out.append(line)
+            normalized = True
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 def build_routing_header_block(
@@ -63,9 +111,11 @@ def build_routing_header_block(
     subject: str = "session-handoff",
     from_source: str = "agentchattr-session-engine",
     mode: str = "session-handoff",
+    assigned_agent: str = "",
+    transport: str = "",
 ) -> str:
     """Build mandatory multi-agent routing header block."""
-    return "\n".join([
+    lines = [
         f"TO: {to_target}",
         f"FROM: {from_source}",
         f"ROLE: {role}",
@@ -73,7 +123,20 @@ def build_routing_header_block(
         f"PROJECT: {project}",
         f"PHASE: {phase}",
         f"SUBJECT: {subject}",
-    ])
+    ]
+    role_key = (role or "").strip().lower()
+    if role_key:
+        lines.append(f"ROLE_ID: {role_key}")
+        role_doc = ROLE_DOC_ALIASES.get(role_key)
+        if role_doc:
+            lines.append(f"ROLE_DOC: {role_doc}")
+    agent = (assigned_agent or "").strip().lower()
+    if agent:
+        lines.append(f"assigned_agent: {agent}")
+    transport_value = (transport or "").strip()
+    if transport_value:
+        lines.append(f"transport: {transport_value}")
+    return "\n".join(lines)
 
 
 def ensure_explicit_routing_headers(
@@ -86,11 +149,12 @@ def ensure_explicit_routing_headers(
     subject: str = "session-handoff",
     mode: str = "session-handoff",
     from_source: str = "agentchattr-session-engine",
+    transport: str = "",
 ) -> str:
     """Prepend routing headers when the prompt lacks an explicit TO: line."""
     body = (text or "").strip()
     if has_explicit_to_header(body):
-        return body
+        return _normalize_first_to_line(body, role=role)
     to_target = resolve_routing_to_target(role=role, agent_base=agent_base)
     headers = build_routing_header_block(
         to_target=to_target,
@@ -100,6 +164,8 @@ def ensure_explicit_routing_headers(
         subject=subject,
         from_source=from_source,
         mode=mode,
+        assigned_agent=agent_base,
+        transport=transport,
     )
     return f"{headers}\n\n{body}" if body else headers
 
@@ -1024,6 +1090,7 @@ def build_coordinator_loop_ui_lead_prompt(
         project=session_name,
         phase=phase_name,
         subject=goal[:120] if goal else "ui-lead-review",
+        transport="store_exec",
     )
 
 

@@ -14,6 +14,7 @@ from coordinator_loop import (
     on_worker_output,
 )
 from session_relay import (
+    ROLE_DOC_ALIASES,
     build_coordinator_loop_prompt,
     build_coordinator_loop_ui_lead_prompt,
     build_relay_prompt,
@@ -33,32 +34,62 @@ def _next(state, role, body="do work"):
 
 
 class RoutingHeaderHelperTests(unittest.TestCase):
-    def test_resolve_targets_by_role(self):
-        self.assertEqual(resolve_routing_to_target(role="reviewer"), "Codex Reviewer")
-        self.assertEqual(resolve_routing_to_target(role="developer"), "Claude Developer")
-        self.assertEqual(resolve_routing_to_target(agent_base="codex_coordinator"), "Codex Coordinator")
+    def test_resolve_targets_by_role_first(self):
+        self.assertEqual(resolve_routing_to_target(role="reviewer"), "Reviewer")
+        self.assertEqual(resolve_routing_to_target(role="developer"), "Developer")
+        self.assertEqual(resolve_routing_to_target(role="ui_lead"), "UI Lead")
+        self.assertEqual(resolve_routing_to_target(role="coordinator"), "Coordinator")
+        self.assertEqual(resolve_routing_to_target(role="safety_gate"), "Safety Gate")
 
-    def test_ensure_adds_headers_when_missing(self):
+    def test_role_wins_over_agent_base(self):
+        self.assertEqual(
+            resolve_routing_to_target(role="reviewer", agent_base="claude"),
+            "Reviewer",
+        )
+        self.assertEqual(
+            resolve_routing_to_target(role="ui_lead", agent_base="codex"),
+            "UI Lead",
+        )
+
+    def test_agent_base_fallback_when_no_role(self):
+        self.assertEqual(
+            resolve_routing_to_target(agent_base="codex_coordinator"),
+            "Coordinator",
+        )
+
+    def test_ensure_adds_role_first_headers_when_missing(self):
         out = ensure_explicit_routing_headers(
             "Continue reviewing PaymentModal.",
             role="reviewer",
+            agent_base="codex_reviewer",
             project="twinpet-analysis",
         )
         self.assertTrue(has_explicit_to_header(out))
-        self.assertIn("TO: Codex Reviewer", out)
+        self.assertIn("TO: Reviewer", out)
+        self.assertNotIn("TO: Codex Reviewer", out)
         self.assertIn("ROLE: reviewer", out)
+        self.assertIn("ROLE_ID: reviewer", out)
+        self.assertIn(f"ROLE_DOC: {ROLE_DOC_ALIASES['reviewer']}", out)
+        self.assertIn("assigned_agent: codex_reviewer", out)
         self.assertIn("Continue reviewing PaymentModal.", out)
 
-    def test_ensure_idempotent_when_to_present(self):
+    def test_ensure_normalizes_stale_brand_mixed_to(self):
+        original = "TO: Codex Reviewer\n\nBody text"
+        out = ensure_explicit_routing_headers(original, role="reviewer")
+        self.assertIn("TO: Reviewer", out)
+        self.assertNotIn("TO: Codex Reviewer", out)
+        self.assertIn("Body text", out)
+
+    def test_ensure_idempotent_pure_to_unchanged(self):
         original = "TO: Codex\n\nBody text"
         self.assertEqual(
-            ensure_explicit_routing_headers(original, role="reviewer"),
+            ensure_explicit_routing_headers(original, role=""),
             original,
         )
 
 
 class CoordinatorPromptHeaderTests(unittest.TestCase):
-    def test_coordinator_loop_prompt_includes_to_codex_coordinator(self):
+    def test_coordinator_loop_prompt_includes_to_coordinator(self):
         prompt = build_coordinator_loop_prompt(
             session_name="Project Read-Only Coordinator Loop",
             goal="analysis",
@@ -76,10 +107,13 @@ class CoordinatorPromptHeaderTests(unittest.TestCase):
             project="twinpet-ui-09-c-read",
         )
         self.assertTrue(has_explicit_to_header(prompt))
-        self.assertIn("TO: Codex Coordinator", prompt)
+        self.assertIn("TO: Coordinator", prompt)
+        self.assertNotIn("TO: Codex Coordinator", prompt)
+        self.assertIn("ROLE_ID: coordinator", prompt)
+        self.assertIn("assigned_agent: codex_coordinator", prompt)
         self.assertIn("HANDOFF ROUTING", prompt)
 
-    def test_relay_prompt_reviewer_has_to_header(self):
+    def test_relay_prompt_reviewer_has_role_first_to_header(self):
         prompt = build_relay_prompt(
             session_name="sess",
             goal="analysis",
@@ -90,9 +124,11 @@ class CoordinatorPromptHeaderTests(unittest.TestCase):
             instruction="Review the developer analysis.",
             agent_base="codex_reviewer",
         )
-        self.assertIn("TO: Codex Reviewer", prompt)
+        self.assertIn("TO: Reviewer", prompt)
+        self.assertNotIn("TO: Codex Reviewer", prompt)
+        self.assertIn("assigned_agent: codex_reviewer", prompt)
 
-    def test_relay_prompt_developer_has_to_header(self):
+    def test_relay_prompt_developer_has_role_first_to_header(self):
         prompt = build_relay_prompt(
             session_name="sess",
             goal="analysis",
@@ -103,9 +139,11 @@ class CoordinatorPromptHeaderTests(unittest.TestCase):
             instruction="Produce revised blueprint.",
             agent_base="claude",
         )
-        self.assertIn("TO: Claude Developer", prompt)
+        self.assertIn("TO: Developer", prompt)
+        self.assertNotIn("TO: Claude Developer", prompt)
+        self.assertIn("assigned_agent: claude", prompt)
 
-    def test_ui_lead_prompt_has_to_header(self):
+    def test_ui_lead_prompt_has_role_first_to_header(self):
         prompt = build_coordinator_loop_ui_lead_prompt(
             session_name="sess",
             channel="ch",
@@ -115,9 +153,14 @@ class CoordinatorPromptHeaderTests(unittest.TestCase):
             total_phases=4,
             instruction="Review UX blueprint.",
         )
-        self.assertIn("TO: AGY UI Lead", prompt)
+        self.assertIn("TO: UI Lead", prompt)
+        self.assertNotIn("TO: AGY UI Lead", prompt)
+        self.assertIn("ROLE_ID: ui_lead", prompt)
+        self.assertIn(f"ROLE_DOC: {ROLE_DOC_ALIASES['ui_lead']}", prompt)
+        self.assertIn("assigned_agent: agy", prompt)
+        self.assertIn("transport: store_exec", prompt)
 
-    def test_safety_gate_prompt_has_to_header(self):
+    def test_safety_gate_prompt_has_role_first_to_header(self):
         prompt = build_safety_gate_prompt(
             session_name="sess",
             goal="analysis",
@@ -125,11 +168,13 @@ class CoordinatorPromptHeaderTests(unittest.TestCase):
             content_to_review="artifact",
             agent_base="codexsafe",
         )
-        self.assertIn("TO: CodexSafe Safety Gate", prompt)
+        self.assertIn("TO: Safety Gate", prompt)
+        self.assertNotIn("TO: CodexSafe Safety Gate", prompt)
+        self.assertIn("assigned_agent: codexsafe", prompt)
 
 
 class CoordinatorHandoffHeaderTests(unittest.TestCase):
-    def test_next_reviewer_wraps_body_with_to_header(self):
+    def test_next_reviewer_wraps_body_with_role_first_to_header(self):
         state, _ = on_session_start("task")
         _classify_ui(state)
         _next(state, "developer", "READY_FOR_COORDINATOR")
@@ -138,14 +183,16 @@ class CoordinatorHandoffHeaderTests(unittest.TestCase):
         on_worker_output(state, "ui_lead", "UX_APPROVED\n")
         action = _next(state, "reviewer", "Review package for consistency.")
         self.assertEqual(action.target_role, "reviewer")
-        self.assertIn("TO: Codex Reviewer", action.routing_body)
+        self.assertIn("TO: Reviewer", action.routing_body)
+        self.assertNotIn("TO: Codex Reviewer", action.routing_body)
         self.assertTrue(has_explicit_to_header(action.routing_body))
 
-    def test_next_developer_wraps_body_with_to_header(self):
+    def test_next_developer_wraps_body_with_role_first_to_header(self):
         state, _ = on_session_start("task")
         _classify_ui(state)
         action = _next(state, "developer", "Begin analysis.")
-        self.assertIn("TO: Claude Developer", action.routing_body)
+        self.assertIn("TO: Developer", action.routing_body)
+        self.assertNotIn("TO: Claude Developer", action.routing_body)
 
     def test_request_changes_routes_coordinator_without_missing_to_blocker(self):
         state, _ = on_session_start("read-only analysis", max_rounds=5)
@@ -179,7 +226,8 @@ class CoordinatorHandoffHeaderTests(unittest.TestCase):
             allowed_tokens=allowed,
             instruction=action.prompt_context,
         )
-        self.assertIn("TO: Codex Coordinator", coord_prompt)
+        self.assertIn("TO: Coordinator", coord_prompt)
+        self.assertNotIn("TO: Codex Coordinator", coord_prompt)
         self.assertNotIn("missing_explicit_TO_Codex_header", coord_prompt)
 
         dispatch = on_coordinator_output(
@@ -187,7 +235,7 @@ class CoordinatorHandoffHeaderTests(unittest.TestCase):
             "NEXT: developer\nRevise blueprint addressing reviewer findings.",
         )
         self.assertEqual(dispatch.target_role, "developer")
-        self.assertIn("TO: Claude Developer", dispatch.routing_body)
+        self.assertIn("TO: Developer", dispatch.routing_body)
         self.assertFalse(has_explicit_to_header("Continue reviewing..."))
 
     def test_bare_follow_up_gets_wrapped_not_emitted_raw(self):
@@ -227,7 +275,8 @@ class ReadOnlyAnalysisMemoTests(unittest.TestCase):
             ),
             project="twinpet-ui-09-c-analysis",
         )
-        self.assertIn("TO: Codex Coordinator", prompt)
+        self.assertIn("TO: Coordinator", prompt)
+        self.assertNotIn("TO: Codex Coordinator", prompt)
         self.assertIn("read-only", prompt.lower())
 
 
